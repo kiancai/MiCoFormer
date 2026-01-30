@@ -1,6 +1,7 @@
 import os
 import logging
 import pandas as pd
+import numpy as np
 import anndata
 from scipy import sparse
 
@@ -188,7 +189,32 @@ def build_anndata_from_files(
         logger.info("Converting data matrix to CSR sparse format (saving memory)...")
         adata.X = sparse.csr_matrix(adata.X)
 
-    # --- 9. 保存文件 ---
+    # --- 9. 归一化处理 (Normalization) ---
+    # 用户要求：保留 Raw Counts，但模型读取时使用相对丰度。
+    # 策略：将 Raw Counts 备份到 layers['counts']，将 X 归一化为相对丰度 (Sum=1)。
+    logger.info("Backing up raw counts to .layers['counts'] and normalizing .X to relative abundance (sum=1)...")
+    
+    # 1. 备份原始计数
+    adata.layers['counts'] = adata.X.copy()
+    
+    # 2. 计算相对丰度 (Total Sum Scaling)
+    # 无论稀疏还是稠密，scipy 操作都通用
+    # 计算每个样本的总 Count
+    row_sums = np.array(adata.X.sum(axis=1)).flatten()
+    
+    # 防止除以零 (虽然理论上样本不应全为0，但在清洗后可能出现)
+    row_sums[row_sums == 0] = 1.0
+    
+    # 归一化: X = X / row_sums
+    # 使用对角矩阵乘法进行广播除法，适用于稀疏矩阵
+    norm_factor = sparse.diags(1.0 / row_sums)
+    adata.X = norm_factor @ adata.X
+    
+    # 确保归一化后的数据也是稀疏格式 (如果是稀疏输入)
+    if sparse.issparse(adata.X) and not isinstance(adata.X, sparse.csr_matrix):
+        adata.X = adata.X.tocsr()
+
+    # --- 10. 保存文件 ---
     # 确保输出目录存在
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
@@ -197,7 +223,7 @@ def build_anndata_from_files(
     
     logger.info("Processing complete!")
     
-    # --- 10. 最终报告 (Final Report) ---
+    # --- 11. 最终报告 (Final Report) ---
     # Use print instead of logger to avoid timestamp prefix for table formatting
     print("="*50)
     print("【Final AnnData Summary】")
