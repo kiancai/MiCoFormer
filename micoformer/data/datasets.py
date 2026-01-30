@@ -33,17 +33,17 @@ class AnnDataDataset:
         # 配置参数
         self.abundance_mode = abundance_mode
 
+        self.num_real_bins = num_abundance_bins
+        self.min_abundance = min_abundance
+
         if abundance_mode == "abs_log_bins":
             self.abund_bin_edges = compute_log_bin_edges(
-                num_bins=num_abundance_bins,
+                num_bins=self.num_real_bins,
                 min_val=min_abundance,
                 max_val=1.0
             )
-            self.min_abundance = min_abundance
-            self.num_real_bins = num_abundance_bins
         elif abundance_mode == "rank_bins":
-            self.num_rank_bins = num_abundance_bins
-            self.num_real_bins = num_abundance_bins
+            pass
         else:
             raise ValueError(f"Unknown abundance_mode: {abundance_mode}")
         
@@ -89,7 +89,7 @@ class AnnDataDataset:
         # 使用相对丰度 rank 分 bin
         bins = bin_values_rank(
             num_items=len(values),
-            num_bins=self.num_rank_bins
+            num_bins=self.num_real_bins
         )
         return bins + 2
 
