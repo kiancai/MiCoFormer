@@ -50,7 +50,7 @@ class AnnDataDataset:
         # 总 Bin 数 = 真实 Bin + 2 (PAD=0, MASK=1)
         self.num_abund_bins_total = self.num_real_bins + 2
 
-        self.pad_token_id = 0
+        self.pad_taxon_id = 0
         self.sample_token_id = 1
         self.pad_bin_id = 0
         self.mask_bin_id = 1
@@ -138,7 +138,7 @@ class AnnDataDataset:
     @property
     def special_ids(self) -> Dict[str, int]:
         return {
-            "pad_token_id": self.pad_token_id,
+            "pad_taxon_id": self.pad_taxon_id,
             "sample_token_id": self.sample_token_id,
             "pad_bin_id": self.pad_bin_id,
             "mask_bin_id": self.mask_bin_id,

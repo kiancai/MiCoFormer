@@ -97,7 +97,7 @@ class MiCoDataModule(L.LightningDataModule):
     # DataLoaders 构建
     def _create_dataloader(self, dataset, shuffle: bool) -> DataLoader:
         collate_function = MiCoCollator(
-            pad_token_id=self.special_ids["pad_token_id"],
+            pad_taxon_id=self.special_ids["pad_taxon_id"],
             sample_token_id=self.special_ids["sample_token_id"],
             pad_bin_id=self.special_ids["pad_bin_id"],
             mask_bin_id=self.special_ids["mask_bin_id"],

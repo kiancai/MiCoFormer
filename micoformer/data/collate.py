@@ -24,13 +24,13 @@ class MiCoCollator:
     def __init__(
         self,
         *,
-        pad_token_id: int,
+        pad_taxon_id: int,
         sample_token_id: int,
         pad_bin_id: int,
         mask_bin_id: int,
         mask_prob: float = 0.15,
     ):
-        self.pad_token_id = pad_token_id
+        self.pad_taxon_id = pad_taxon_id
         self.sample_token_id = sample_token_id
         self.pad_bin_id = pad_bin_id
         self.mask_bin_id = mask_bin_id
@@ -50,11 +50,11 @@ class MiCoCollator:
         abund_seqs = [torch.cat([sample_bin, s], dim=0) for s in abund_seqs]
 
         # Padding：将序列补齐到当前 Batch 的最大长度
-        input_ids = pad_sequences(taxon_seqs, self.pad_token_id)
+        input_ids = pad_sequences(taxon_seqs, self.pad_taxon_id)
         abund_bins = pad_sequences(abund_seqs, self.pad_bin_id)
 
         # 构建 Attention Mask
-        attention_mask = (input_ids != self.pad_token_id).to(torch.bool)
+        attention_mask = (input_ids != self.pad_taxon_id).to(torch.bool)
 
         # 只对“真实的物种位置”进行 Mask，避开 Padding 和 [SAMPLE] Token
         B, L = input_ids.shape            # B:Batch Size; L:Length;
