@@ -60,7 +60,7 @@ class MiCoDataModule(L.LightningDataModule):
     def setup(self, stage: Optional[str] = None) -> None:
         # setup 方法在每个 GPU 进程上都会被调用，加载全量数据集
         base_dataset = AnnDataDataset(
-            self.h5ad_path,
+            h5ad_path=self.h5ad_path,
             backed=None,   # 强制全部加载到内存
             max_seq_len=self.max_seq_len,
             num_abundance_bins=self.cfg_num_abundance_bins,

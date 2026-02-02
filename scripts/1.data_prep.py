@@ -1,7 +1,7 @@
 import sys
 import os
 import logging
-from micoformer.utils.build_dataset import build_anndata_from_files
+from micoformer.utils import build_anndata_from_files
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
