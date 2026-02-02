@@ -3,6 +3,7 @@ import os
 import numpy as np
 import anndata as ad
 import lightning as L
+import torch
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
@@ -41,7 +42,8 @@ def build_argparser() -> argparse.ArgumentParser:
     # --- 训练控制参数 (Training Control) ---
     p.add_argument("--max_epochs", type=int, default=100, help="最大训练轮数")
     p.add_argument("--devices", type=int, default=1, help="使用的 GPU/设备 数量")
-    p.add_argument("--precision", type=str, default="16-mixed", help="训练精度 (推荐 16-mixed)")
+    p.add_argument("--precision", type=str, default="auto", help="训练精度: auto/32/16-mixed")
+    p.add_argument("--seed", type=int, default=42, help="随机种子，用于可复现")
     p.add_argument("--accumulate_grad_batches", type=int, default=1, help="梯度累积步数")
     p.add_argument("--gradient_clip_val", type=float, default=1.0, help="梯度裁剪阈值")
     p.add_argument("--limit_train_batches", type=float, default=1.0, help="每 Epoch 仅使用部分训练数据")
@@ -53,6 +55,14 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main():
     args = build_argparser().parse_args()
+    L.seed_everything(args.seed, workers=True)
+
+    # 自动根据设备选择精度，避免 CPU 下使用 16-mixed 报错
+    if args.precision == "auto":
+        chosen_precision = "16-mixed" if torch.cuda.is_available() else "32"
+    else:
+        chosen_precision = args.precision
+    print(f"Using precision={chosen_precision}")
 
     print(f"Reading metadata from {args.h5ad} to generate splits...")
     ada = ad.read_h5ad(args.h5ad, backed="r")
@@ -83,9 +93,6 @@ def main():
         abundance_mode=args.abundance_mode,
     )
     
-    # 手动调用 setup 以便获取 vocab_size 等信息用于初始化模型
-    dm.setup()
-
     # 2. 初始化模型
     print(f"Initializing Model with d_model={args.d_model}, layers={args.num_layers}")
     model = MiCoFormerModule(
@@ -121,7 +128,7 @@ def main():
         max_epochs=args.max_epochs,
         max_steps=args.max_steps, # 确保与 Scheduler 一致
         devices=args.devices,
-        precision=args.precision,
+        precision=chosen_precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=args.gradient_clip_val, # 梯度裁剪
         limit_train_batches=args.limit_train_batches,
@@ -138,4 +145,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

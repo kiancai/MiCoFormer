@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 import numpy as np
+import anndata as ad
 import lightning as L
 from torch.utils.data import DataLoader, Subset
 
@@ -49,16 +50,36 @@ class MiCoDataModule(L.LightningDataModule):
         self.persistent_workers = True
         self.pin_memory = True
 
+        self.special_ids = {
+            "pad_taxon_id": 0,
+            "sample_token_id": 1,
+            "pad_bin_id": 0,
+            "mask_bin_id": 1,
+        }
+        self.num_abundance_bins = self.cfg_num_abundance_bins + 2
+        self.vocab_size = self._peek_vocab_size()
+
         # 数据集占位符 (在 setup 阶段初始化)
         self.train_dataset: Optional[AnnDataDataset] = None
         self.val_dataset: Optional[AnnDataDataset] = None
         self.test_dataset: Optional[AnnDataDataset] = None
 
+    def _peek_vocab_size(self) -> int:
+        # 只读取 h5ad 的特征维度信息，避免为了拿 vocab_size 提前构建完整 dataset
+        adata = ad.read_h5ad(self.h5ad_path, backed="r")
+        try:
+            n_taxa = int(adata.n_vars)
+        finally:
+            # 及时关闭 backed 文件句柄，避免占用文件资源
+            if getattr(adata, "file", None) is not None:
+                adata.file.close()
+        return n_taxa + 2
+
     def prepare_data(self) -> None:
         pass
 
     def setup(self, stage: Optional[str] = None) -> None:
-        # setup 方法在每个 GPU 进程上都会被调用，加载全量数据集
+        # setup 方法在每个进程上都会被调用
         base_dataset = AnnDataDataset(
             h5ad_path=self.h5ad_path,
             backed=None,   # 强制全部加载到内存
@@ -89,10 +110,10 @@ class MiCoDataModule(L.LightningDataModule):
         if stats:
             rank_zero_info(f"Split stats: {', '.join(stats)}")
 
-        # 从底层 dataset 提取模型配置信息 
-        self.vocab_size = base_dataset.vocab_size                 # 物种总数 + 特殊Token
-        self.num_abundance_bins = base_dataset.num_abundance_bins # 丰度等级数 + 特殊Bin
-        self.special_ids = base_dataset.special_ids               # 特殊 ID 映射表
+        # 稳健起见，setup 后再与实际 dataset 对齐一次
+        self.vocab_size = base_dataset.vocab_size
+        self.num_abundance_bins = base_dataset.num_abundance_bins
+        self.special_ids = base_dataset.special_ids
 
     # DataLoaders 构建
     def _create_dataloader(self, dataset, shuffle: bool) -> DataLoader:

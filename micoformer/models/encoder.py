@@ -46,7 +46,7 @@ class MiCoFormerEncoder(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,  # [Batch, Length], True=Valid, False=Pad
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        # 嵌入层叠加后归一化
+        # 先将 taxon 与 abundance 两路嵌入做逐元素相加
         x = self.taxon_embed(input_ids) + self.abund_embed(abund_bins)
         
         # 构造 Padding Mask
@@ -59,7 +59,7 @@ class MiCoFormerEncoder(nn.Module):
         # 通过 Transformer
         h = self.encoder(x, src_key_padding_mask=key_padding_mask)
         
-        # 最终归一化（对于 Pre-Norm Transformer 是必须的）
+        # 对 Encoder 输出做一次最终归一化
         h = self.layer_norm(h)
 
         # 提取 [SAMPLE] Token 的特征

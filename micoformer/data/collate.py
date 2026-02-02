@@ -29,12 +29,15 @@ class MiCoCollator:
         pad_bin_id: int,
         mask_bin_id: int,
         mask_prob: float = 0.15,
+        ensure_one_mask_per_nonempty: bool = True,
     ):
         self.pad_taxon_id = pad_taxon_id
         self.sample_token_id = sample_token_id
         self.pad_bin_id = pad_bin_id
         self.mask_bin_id = mask_bin_id
         self.mask_prob = mask_prob
+        # 是否保证“每个非空样本至少有 1 个被 mask 的位置”
+        self.ensure_one_mask_per_nonempty = ensure_one_mask_per_nonempty
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
@@ -67,6 +70,18 @@ class MiCoCollator:
             mask_positions = (rand < self.mask_prob) & valid
         else:                        # 只在特殊测试时才会完全不 mask 任何位置
             mask_positions = torch.zeros(B, L, dtype=torch.bool)
+
+        # 可选：保证每个非空样本至少有一个监督信号，避免整条样本无 loss
+        if self.ensure_one_mask_per_nonempty:
+            for i in range(B):
+                valid_i = torch.where(valid[i])[0]
+                if valid_i.numel() == 0:
+                    # 空样本（仅 [SAMPLE] 或全 pad），跳过
+                    continue
+                if not mask_positions[i].any():
+                    # 若该样本没采到 mask，则强制随机补 1 个位置
+                    j = valid_i[torch.randint(0, valid_i.numel(), (1,)).item()]
+                    mask_positions[i, j] = True
         
         # 复制一份原始的 abund_bins 作为标签
         labels_abund = abund_bins.clone()     

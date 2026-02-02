@@ -6,6 +6,11 @@ def compute_log_bin_edges(
     min_val: float,
     max_val: float
 ) -> np.ndarray:
+    if num_bins <= 0:
+        raise ValueError(f"num_bins must be > 0, got {num_bins}")
+    if min_val <= 0 or max_val <= 0 or min_val >= max_val:
+        raise ValueError(f"min_val must be < max_val, got min_val={min_val}, max_val={max_val}")
+
     # 根据输入的相对丰度上限（1.0）、下限、分 bin 数目，计算 bin edges
     log_min = np.log10(min_val)
     log_max = np.log10(max_val)
@@ -20,6 +25,11 @@ def bin_values_log(
     max_val: float, 
     num_bins: int
 ) -> np.ndarray:
+    if num_bins <= 0:
+        raise ValueError(f"num_bins must be > 0, got {num_bins}")
+    if min_val <= 0 or max_val <= 0 or min_val >= max_val:
+        raise ValueError(f"min_val must be < max_val, got min_val={min_val}, max_val={max_val}")
+
     # 将数值映射到对数分 bin ID，且可以处理超出范围的数值
     values_clipped = np.clip(values, min_val, max_val)
     bins = np.digitize(values_clipped, edges, right=False)
@@ -32,6 +42,9 @@ def bin_values_rank(
     num_items: int,
     num_bins: int
 ) -> np.ndarray:
+    if num_bins <= 0:
+        raise ValueError(f"num_bins must be > 0, got {num_bins}")
+
     # 传入 num_items 个元素，将其分配到 num_bins 个 bin 中
     if num_items == 0:
         return np.array([], dtype=np.int64)
@@ -43,4 +56,3 @@ def bin_values_rank(
     bins = np.round(target_bin_float).astype(np.int64)
     bins = np.clip(bins, 0, num_bins - 1)
     return bins
-

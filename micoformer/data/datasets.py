@@ -21,6 +21,10 @@ class AnnDataDataset:
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
     ) -> None:
+        if max_seq_len is not None and max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be > 0 when set, got {max_seq_len}")
+        if abundance_mode not in {"abs_log_bins", "rank_bins"}:
+            raise ValueError(f"Unknown abundance_mode: {abundance_mode}")
 
         # 读取 .h5ad 文件
         self.adata = ad.read_h5ad(h5ad_path, backed=backed)
