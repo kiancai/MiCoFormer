@@ -9,13 +9,46 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def _get_sep(file_path: str) -> str:
-    """根据文件后缀推断分隔符"""
+    # 根据文件后缀推断分隔符
     if file_path.endswith('.tsv'):
         return '\t'
     elif file_path.endswith('.csv'):
         return ','
     else:
         raise ValueError(f"Unsupported file extension for '{file_path}'. Only .csv and .tsv are supported.")
+
+
+def _parse_taxonomy_strict(feature_ids: pd.Index) -> pd.DataFrame:
+    prefix_map = {
+        'k__': 'Kingdom', 'p__': 'Phylum', 'c__': 'Class', 'o__': 'Order',
+        'f__': 'Family', 'g__': 'Genus', 's__': 'Species'
+    }
+    def _parse_row(tax_str):
+        # 初始化当前行的所有层级为 None
+        row = {v: None for v in prefix_map.values()}
+        seen = set() # 用于检测重复前缀
+        # 1. str(tax_str).split(';') : 按分号分割
+        # 2. if p.strip() : 过滤掉空字符串 (如 "k__A;;p__B" 中的空项)
+        # 3. p.strip() : 去除首尾空格
+        for part in (p.strip() for p in str(tax_str).split(';') if p.strip()):
+            # 提取前3个字符作为前缀 (如 "k__")
+            prefix = part[:3] 
+            # 校验 1: 是否为已知标准前缀
+            if prefix not in prefix_map:
+                raise ValueError(
+                    f"Invalid taxonomy segment '{part}' found in Feature ID '{tax_str}'.\n"
+                    f"Expected strict prefixes: {list(prefix_map.keys())}."
+                )
+            # 校验 2: 该前缀是否已处理过 (防止重复)
+            if prefix in seen:
+                raise ValueError(f"Duplicate taxonomy level prefix '{prefix}' found in Feature ID '{tax_str}'")
+            # 记录并赋值
+            seen.add(prefix)
+            row[prefix_map[prefix]] = part
+        return row
+
+    # 使用列表推导式批量处理每一行 Feature ID
+    return pd.DataFrame([_parse_row(tid) for tid in feature_ids], index=feature_ids)
 
 def build_anndata_from_files(
     abundance_path: str,
@@ -24,19 +57,12 @@ def build_anndata_from_files(
     transpose_abundance: bool = True,
     sparse_format: bool = True
 ) -> None:
-    """
-    将原始丰度表和元数据表合并并转换为 AnnData (.h5ad) 格式。
-    参数:
-        abundance_path (str): 丰度表文件路径 (CSV/TSV)。
-        metadata_path (str): 元数据表文件路径 (CSV/TSV)。
-        output_path (str): 输出 .h5ad 文件的保存路径。
-        transpose_abundance (bool): 是否需要转置丰度表。
-                                    - True (默认): 假设输入为 [行=Taxa, 列=Samples]，转置为 [Samples, Taxa]。
-                                    - False: 假设输入已经是 [行=Samples, 列=Taxa]。
-        sparse_format (bool): 是否将数据矩阵压缩为稀疏矩阵 (CSR)。强烈建议 True，节省大量内存。
-    """
+    # 将原始丰度表和元数据表合并并转换为 AnnData (.h5ad) 格式。
+    #     transpose_abundance (bool): 是否需要转置丰度表。
+    #                                 - True (默认): 假设输入为 [行=Taxa, 列=Samples]，转置为 [Samples, Taxa]。
+    #                                 - False: 假设输入已经是 [行=Samples, 列=Taxa]。
+    #     sparse_format (bool): 是否将数据矩阵压缩为稀疏矩阵 (CSR)
     
-    # 自动推断分隔符
     try:
         abundance_sep = _get_sep(abundance_path)
         metadata_sep = _get_sep(metadata_path)
@@ -44,7 +70,7 @@ def build_anndata_from_files(
         logger.error(str(e))
         raise
 
-    # --- 1. 读取丰度表 (OTU Table / ASV Table) ---
+    # 读取丰度表
     logger.info(f"Reading abundance table: {abundance_path}")
     try:
         # index_col=0 表示第一列是索引 (通常是 Taxon ID 或 OTU ID)
@@ -54,7 +80,7 @@ def build_anndata_from_files(
         logger.error(f"Failed to read abundance table. Please check path or format. Error: {e}")
         raise
 
-    # --- 2. 转置与维度确认 ---
+    # 转置与维度确认
     # AnnData 要求：Rows=样本(Samples), Cols=特征(Taxa)
     if transpose_abundance:
         logger.info("Transposing abundance table (Rows=Taxa -> Rows=Samples)...")
@@ -64,7 +90,7 @@ def build_anndata_from_files(
     n_samples_abund, n_taxa = df_abund.shape
     logger.info(f"Abundance table loaded: {n_samples_abund} samples x {n_taxa} taxa/features.")
 
-    # --- 3. 读取 Metadata ---
+    # 读取 Metadata
     logger.info(f"Reading metadata: {metadata_path}")
     try:
         # 读取 Metadata，不指定 index_col，先读进来再找 'Run' 列
@@ -81,7 +107,7 @@ def build_anndata_from_files(
         n_samples_meta, n_features_meta = df_meta.shape
         logger.info(f"Metadata loaded: {n_samples_meta} samples x {n_features_meta} metadata features.")
 
-        # --- 4. 数据对齐 ---
+        # 数据对齐
         # 找出两个表中都存在的样本 ID（取交集）
         # df_abund.index 现在应该是样本 ID
         # df_meta.index 现在也应该是样本 ID
@@ -99,15 +125,21 @@ def build_anndata_from_files(
     
         logger.info(f"Data alignment successful: Found {n_common} common samples.")
         
-        # 如果样本数不一致，打印警告
+        # 如果样本数不一致，严格模式下直接报错，不允许静默丢样本
         if n_common < df_abund.shape[0] or n_common < df_meta.shape[0]:
-            logger.warning(f"Discarded some unmatched samples: Abundance table remaining {df_abund.shape[0]-n_common}, Metadata remaining {df_meta.shape[0]-n_common}")
+            error_msg = (
+                "Sample IDs are not perfectly matched between abundance table and metadata.\n"
+                f"Matched: {n_common}, Abundance total: {df_abund.shape[0]}, Metadata total: {df_meta.shape[0]}.\n"
+                "Strict mode does not allow automatic dropping of unmatched samples."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
     
         # 按照共同 ID 筛选并排序，确保一一对应
         df_abund = df_abund.loc[common_samples]
         df_meta = df_meta.loc[common_samples]
 
-        # --- 5. 统一清洗 Metadata (Uniform Cleaning) ---
+        # Metadata (Uniform Cleaning)
         logger.info("Cleaning metadata: Converting non-numeric columns to Categorical dtype...")
     
         # 统一策略：
@@ -129,41 +161,23 @@ def build_anndata_from_files(
         logger.error(f"Failed to read or process metadata. Error: {e}")
         raise
     
-    # --- 6. 解析物种分类层级 (Parse Taxonomy) ---
+    # 解析物种分类层级 (Parse Taxonomy)
     # Feature ID 示例: 'k__Bacteria;p__Proteobacteria;...'
     # 我们将其拆解并放入 .var 中
     logger.info("Parsing taxonomy information from Feature IDs...")
     
-    # 创建一个空的 DataFrame 用于存放拆解后的分类信息
-    taxonomy_df = pd.DataFrame(index=df_abund.columns)
-    
-    # 定义层级名称
-    tax_levels = ['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
-    
     # 尝试拆解
     try:
-        # 假设分隔符是分号 ';'
-        # expand=True 会把拆分结果变成多列
-        split_tax = taxonomy_df.index.to_series().str.split(';', expand=True)
-        
-        # 只有当拆出来的列数不超过预定义层级时，才赋值
-        # 如果列数不够，后面会自动填 None
-        # 如果列数多了，只取前几列
-        n_cols = min(len(tax_levels), split_tax.shape[1])
-        split_tax = split_tax.iloc[:, :n_cols]
-        split_tax.columns = tax_levels[:n_cols]
-        
-        # 用户要求保留前缀 (如 'k__'), 因此不进行 replace 操作
-        # for col in split_tax.columns:
-        #    split_tax[col] = split_tax[col].str.replace(r'^[kpcofgs]__', '', regex=True)
-            
-        taxonomy_df = split_tax
+        logger.info("Parsing taxonomy using STRICT mode (prefix-based check)...")
+        # 使用严格的前缀解析函数
+        taxonomy_df = _parse_taxonomy_strict(df_abund.columns)
         logger.info(f"Taxonomy parsed successfully. Added {taxonomy_df.shape[1]} levels to .var")
         
     except Exception as e:
-        logger.warning(f"Failed to parse taxonomy string. Keeping .var empty. Error: {e}")
+        logger.error(f"Failed to parse taxonomy string. Strict mode enforced. Error: {e}")
+        raise
 
-    # --- 7. 构建 AnnData 对象 ---
+    # 构建 AnnData 对象
     logger.info("Building AnnData object...")
     
     # 检查是否有非数值数据混入丰度表
@@ -184,12 +198,12 @@ def build_anndata_from_files(
     # 将 Sample ID 设置为 obs_names
     adata.obs_names = df_abund.index
 
-    # --- 8. 稀疏化处理 (Sparsity) ---
+    # 稀疏化处理 (Sparsity)
     if sparse_format:
         logger.info("Converting data matrix to CSR sparse format (saving memory)...")
         adata.X = sparse.csr_matrix(adata.X)
 
-    # --- 9. 归一化处理 (Normalization) ---
+    # 归一化处理 (Normalization)
     # 用户要求：保留 Raw Counts，但模型读取时使用相对丰度。
     # 策略：将 Raw Counts 备份到 layers['counts']，将 X 归一化为相对丰度 (Sum=1)。
     logger.info("Backing up raw counts to .layers['counts'] and normalizing .X to relative abundance (sum=1)...")
@@ -202,8 +216,18 @@ def build_anndata_from_files(
     # 计算每个样本的总 Count
     row_sums = np.array(adata.X.sum(axis=1)).flatten()
     
-    # 防止除以零 (虽然理论上样本不应全为0，但在清洗后可能出现)
-    row_sums[row_sums == 0] = 1.0
+    # 严格模式：若存在总和为 0 的样本，直接报错，不允许继续归一化
+    zero_sum_mask = (row_sums == 0)
+    if np.any(zero_sum_mask):
+        zero_indices = np.where(zero_sum_mask)[0]
+        example_ids = adata.obs_names[zero_indices[:10]].tolist()
+        error_msg = (
+            f"Found {len(zero_indices)} samples with zero total abundance. "
+            f"Example sample IDs: {example_ids}. "
+            "Strict mode does not allow zero-sum rows during normalization."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     
     # 归一化: X = X / row_sums
     # 使用对角矩阵乘法进行广播除法，适用于稀疏矩阵
@@ -214,7 +238,8 @@ def build_anndata_from_files(
     if sparse.issparse(adata.X) and not isinstance(adata.X, sparse.csr_matrix):
         adata.X = adata.X.tocsr()
 
-    # --- 10. 保存文件 ---
+    # 保存文件
+    logger.info("Saving AnnData object...")
     # 确保输出目录存在
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
@@ -223,8 +248,7 @@ def build_anndata_from_files(
     
     logger.info("Processing complete!")
     
-    # --- 11. 最终报告 (Final Report) ---
-    # Use print instead of logger to avoid timestamp prefix for table formatting
+    # 最终报告 (Final Report)
     print("="*50)
     print("【Final AnnData Summary】")
     print(f"Total Samples: {adata.n_obs}")

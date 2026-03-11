@@ -16,8 +16,8 @@ class MiCoFormerModule(L.LightningModule):
     def __init__(
         self,
         *,
-        vocab_size: int,
-        num_abundance_bins: int,
+        genus_vocab_size: Optional[int] = None,   # taxon 模式必须提供；taxon_path 模式不需要
+        total_abundance_bins: int,
         d_model: int = 256,
         nhead: int = 8,
         num_layers: int = 6,
@@ -25,6 +25,8 @@ class MiCoFormerModule(L.LightningModule):
         dropout: float = 0.1,
         pad_taxon_id: int = 0,
         pad_bin_id: int = 0,
+        token_embedding_mode: str = "taxon_path",
+        rank_vocab_sizes: Optional[Dict[str, int]] = None,  # taxon_path 模式必须提供
         lr: float = 3e-4,
         weight_decay: float = 1e-2,
         warmup_steps: int = 2000,
@@ -34,10 +36,10 @@ class MiCoFormerModule(L.LightningModule):
 
         # 保存所有 __init__ 参数到 self.hparams，便于 checkpoint 保存和恢复
         self.save_hyperparameters()
-        
+
         self.encoder = MiCoFormerEncoder(
-            vocab_size=vocab_size,
-            num_abundance_bins=num_abundance_bins,
+            genus_vocab_size=genus_vocab_size,
+            total_abundance_bins=total_abundance_bins,
             d_model=d_model,
             nhead=nhead,
             num_layers=num_layers,
@@ -45,18 +47,21 @@ class MiCoFormerModule(L.LightningModule):
             dropout=dropout,
             pad_taxon_id=pad_taxon_id,
             pad_bin_id=pad_bin_id,
+            token_embedding_mode=token_embedding_mode,
+            rank_vocab_sizes=rank_vocab_sizes,
         )
 
         # 预训练任务头
-        self.head = AbundanceBinHead(d_model=d_model, num_bins=num_abundance_bins)
+        self.head = AbundanceBinHead(d_model=d_model, num_bins=total_abundance_bins)
 
         # 损失函数 (不进行 reduce，保留每个样本/token的loss)
         self.criterion = nn.CrossEntropyLoss(reduction="none")
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         h, sample_repr = self.encoder(
-            input_ids=batch["input_ids"],
+            token_ids=batch["token_ids"],
             abund_bins=batch["abund_bins"],
+            taxon_path_ids=batch.get("taxon_path_ids", None),
             attention_mask=batch["attention_mask"],
         )
         logits = self.head(h)
@@ -70,6 +75,9 @@ class MiCoFormerModule(L.LightningModule):
         logits = out["abund_logits"]       # [B, L, Num_Bins]
         labels = batch["labels_abund"]     # [B, L]
         mask_pos = batch["mask_positions"] # [B, L]
+
+        # 同样需要对齐长度，去掉 logits 的第 0 位 (SAMPLE)
+        logits = logits[:, 1:, :]
 
         if mask_pos.any():
             # 取出 Mask 位置的预测 Logits 与真实 Labels (布尔索引筛选)
@@ -104,6 +112,12 @@ class MiCoFormerModule(L.LightningModule):
         labels = batch["labels_abund"]
         mask_pos = batch["mask_positions"]
         
+        # 注意：Encoder 输出的 h 现在包含了 [SAMPLE] 在第 0 位
+        # 而 logits 是对 h 进行投影得到的，所以 logits 也是 [Batch, Length+1, Num_Bins]
+        # 但是 labels 和 mask_pos 是原始数据的长度 [Batch, Length] (不含 SAMPLE)
+        # 所以我们需要把 logits 的第 0 位去掉，对齐长度
+        logits = logits[:, 1:, :]
+
         if mask_pos.any():
             masked_logits = logits[mask_pos]
             masked_labels = labels[mask_pos]
