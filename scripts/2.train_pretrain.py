@@ -32,6 +32,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_layers", type=int, default=6, help="Encoder 层数")
     p.add_argument("--ff", type=int, default=1024, help="FeedForward 层的中间维度")
     p.add_argument("--dropout", type=float, default=0.1, help="Dropout 概率")
+    p.add_argument(
+        "--token_embedding_mode",
+        type=str,
+        default="taxon_path",
+        choices=["taxon", "taxon_path"],
+        help="Token embedding 来源: taxon 或 taxon_path (默认 taxon_path)",
+    )
 
     # --- 优化器与 Scheduler 参数 (Optimizer) ---
     p.add_argument("--lr", type=float, default=3e-4, help="学习率 (Learning Rate)")
@@ -65,8 +72,14 @@ def main():
     print(f"Using precision={chosen_precision}")
 
     print(f"Reading metadata from {args.h5ad} to generate splits...")
-    ada = ad.read_h5ad(args.h5ad, backed="r")
-    n_samples = ada.n_obs
+    adata = ad.read_h5ad(args.h5ad, backed="r")
+
+    try:
+        n_samples = adata.n_obs
+    finally:
+        # 及时关闭 backed 文件句柄，避免占用文件资源
+        if getattr(adata, "file", None) is not None:
+            adata.file.close()
     all_indices = np.random.permutation(n_samples)
     
     # 95% 训练, 5% 验证
@@ -86,25 +99,29 @@ def main():
         test_indices=None,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        max_seq_len=args.max_seq_len,
-        mask_prob=args.mask_prob,
-        num_abundance_bins=args.num_abundance_bins,
-        min_abundance=args.min_abundance,
-        abundance_mode=args.abundance_mode,
+        max_seq_len=args.max_seq_len,               # 每个样本保留的最大物种数 (截断长度)，默认 1024
+        mask_prob=args.mask_prob,                   # 预训练 Mask 概率 (默认 15%)
+        num_abundance_bins=args.num_abundance_bins, # 丰度分箱数量
+        min_abundance=args.min_abundance,           # 最小丰度阈值
+        abundance_mode=args.abundance_mode,         # 丰度编码模式（"abs_log_bins" 或 "rank_bins"）
+        token_embedding_mode=args.token_embedding_mode,  # 选择 token embedding 方式
     )
     
     # 2. 初始化模型
     print(f"Initializing Model with d_model={args.d_model}, layers={args.num_layers}")
+    print(f"Token embedding mode: {args.token_embedding_mode}")
     model = MiCoFormerModule(
-        vocab_size=dm.vocab_size,             # 从数据中动态获取
-        num_abundance_bins=dm.num_abundance_bins, # 从数据中动态获取
+        genus_vocab_size=dm.genus_vocab_size,     # taxon 模式使用；taxon_path 模式传 None 亦可
+        total_abundance_bins=dm.total_abundance_bins,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,
         dim_feedforward=args.ff,
         dropout=args.dropout,
-        pad_taxon_id=dm.special_ids["pad_taxon_id"], # 修正参数名
-        pad_bin_id=dm.special_ids["pad_bin_id"],     # 新增参数
+        pad_taxon_id=dm.special_ids["pad_taxon_id"],
+        pad_bin_id=dm.special_ids["pad_bin_id"],
+        token_embedding_mode=args.token_embedding_mode,
+        rank_vocab_sizes=dm.rank_vocab_sizes,
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,

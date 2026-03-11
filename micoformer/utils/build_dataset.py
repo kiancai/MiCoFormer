@@ -125,9 +125,15 @@ def build_anndata_from_files(
     
         logger.info(f"Data alignment successful: Found {n_common} common samples.")
         
-        # 如果样本数不一致，打印警告
+        # 如果样本数不一致，严格模式下直接报错，不允许静默丢样本
         if n_common < df_abund.shape[0] or n_common < df_meta.shape[0]:
-            logger.warning(f"Discarded some unmatched samples: Abundance table remaining {df_abund.shape[0]-n_common}, Metadata remaining {df_meta.shape[0]-n_common}")
+            error_msg = (
+                "Sample IDs are not perfectly matched between abundance table and metadata.\n"
+                f"Matched: {n_common}, Abundance total: {df_abund.shape[0]}, Metadata total: {df_meta.shape[0]}.\n"
+                "Strict mode does not allow automatic dropping of unmatched samples."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
     
         # 按照共同 ID 筛选并排序，确保一一对应
         df_abund = df_abund.loc[common_samples]
@@ -210,8 +216,18 @@ def build_anndata_from_files(
     # 计算每个样本的总 Count
     row_sums = np.array(adata.X.sum(axis=1)).flatten()
     
-    # 防止除以零 (虽然理论上样本不应全为0，但在清洗后可能出现)
-    row_sums[row_sums == 0] = 1.0
+    # 严格模式：若存在总和为 0 的样本，直接报错，不允许继续归一化
+    zero_sum_mask = (row_sums == 0)
+    if np.any(zero_sum_mask):
+        zero_indices = np.where(zero_sum_mask)[0]
+        example_ids = adata.obs_names[zero_indices[:10]].tolist()
+        error_msg = (
+            f"Found {len(zero_indices)} samples with zero total abundance. "
+            f"Example sample IDs: {example_ids}. "
+            "Strict mode does not allow zero-sum rows during normalization."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
     
     # 归一化: X = X / row_sums
     # 使用对角矩阵乘法进行广播除法，适用于稀疏矩阵
