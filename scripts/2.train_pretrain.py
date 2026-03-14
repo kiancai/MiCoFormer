@@ -16,6 +16,11 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # --- 数据相关参数 (Data) ---
     p.add_argument("--h5ad", type=str, required=True, help="处理好的 AnnData (.h5ad) 文件路径")
+    p.add_argument(
+        "--splits", type=str, default=None,
+        help="预计算的分割索引 .npz 文件路径（由 scripts/1.make_splits.py 生成）。"
+             "若不提供则退回到内部硬编码的 1000/100 测试分割。",
+    )
     p.add_argument("--batch_size", type=int, default=32, help="批次大小")
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader 的并行加载进程数")
     p.add_argument("--max_seq_len", type=int, default=1024, help="每个样本保留的最大物种数 (截断长度)")
@@ -77,24 +82,28 @@ def main():
         chosen_precision = args.precision
     print(f"Using precision={chosen_precision}")
 
-    print(f"Reading metadata from {args.h5ad} to generate splits...")
-    adata = ad.read_h5ad(args.h5ad, backed="r")
-
-    try:
-        n_samples = adata.n_obs
-    finally:
-        # 及时关闭 backed 文件句柄，避免占用文件资源
-        if getattr(adata, "file", None) is not None:
-            adata.file.close()
-    all_indices = np.random.permutation(n_samples)
-    
-    # 95% 训练, 5% 验证
-    # n_val = int(n_samples * 0.05)
-    # train_indices = all_indices[:-n_val]
-    # val_indices = all_indices[-n_val:]
-    train_indices = all_indices[:1000]
-    val_indices = all_indices[1000:1100]
-    print(f"Total samples: {n_samples}. Train: {len(train_indices)}, Val: {len(val_indices)}")
+    # 加载分割索引：优先使用 --splits 指定的预计算文件，否则退回硬编码测试分割
+    if args.splits is not None:
+        print(f"Loading splits from {args.splits} ...")
+        splits_data = np.load(args.splits)
+        train_indices = splits_data["train_indices"]
+        val_indices   = splits_data["val_indices"]
+        # test_indices  = splits_data["test_indices"]  # 预训练不使用 test，仅在下游评估时用
+        print(f"Train: {len(train_indices)}, Val: {len(val_indices)}")
+    else:
+        # 临时测试用硬编码分割（正式训练请使用 --splits）
+        print(f"WARNING: --splits not provided, using hardcoded debug split (1000/100).")
+        print(f"Reading metadata from {args.h5ad} to generate splits...")
+        adata = ad.read_h5ad(args.h5ad, backed="r")
+        try:
+            n_samples = adata.n_obs
+        finally:
+            if getattr(adata, "file", None) is not None:
+                adata.file.close()
+        all_indices = np.random.permutation(n_samples)
+        train_indices = all_indices[:1000]
+        val_indices   = all_indices[1000:1100]
+        print(f"Train: {len(train_indices)}, Val: {len(val_indices)}")
 
     # 1. 初始化数据模块
     print(f"Initializing DataModule...")
