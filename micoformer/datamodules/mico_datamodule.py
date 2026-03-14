@@ -29,6 +29,7 @@ class MiCoDataModule(L.LightningDataModule):
         min_abundance: float = 4e-6,           # 最小丰度阈值 (低于此值归入第一箱)
         abundance_mode: str = "abs_log_bins",  # 丰度编码方式："abs_log_bins" 或 "rank_bins"
         token_embedding_mode: str = "taxon_path",  # token 嵌入方式："taxon" 或 "taxon_path"
+        use_taxonomy_bias: bool = False,  # R2：是否启用 taxonomy 距离注意力偏置
     ) -> None:
 
         super().__init__()
@@ -48,7 +49,8 @@ class MiCoDataModule(L.LightningDataModule):
                 "Expected 'taxon' or 'taxon_path'."
             )
         self.token_embedding_mode = token_embedding_mode
-        
+        self.use_taxonomy_bias = use_taxonomy_bias
+
         # 索引参数
         self.train_indices = train_indices
         self.val_indices = val_indices
@@ -96,6 +98,7 @@ class MiCoDataModule(L.LightningDataModule):
             min_abundance=self.min_abundance,
             abundance_mode=self.abundance_mode,
             token_embedding_mode=self.token_embedding_mode,
+            use_taxonomy_bias=self.use_taxonomy_bias,
         )
 
         # Subset：直接使用初始化时传入的索引划分数据集

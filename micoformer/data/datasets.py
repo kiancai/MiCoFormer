@@ -67,6 +67,7 @@ class AnnDataDataset:
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
         token_embedding_mode: str = "taxon_path",
+        use_taxonomy_bias: bool = False,  # R2：即使 baseline 模式也需要返回 taxon_path_ids
     ) -> None:
         if max_seq_len is not None and max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be > 0 when set, got {max_seq_len}")
@@ -81,6 +82,9 @@ class AnnDataDataset:
         # 读取 .h5ad 文件
         self.adata = ad.read_h5ad(h5ad_path, backed=None)
         self.token_embedding_mode = token_embedding_mode
+        self.use_taxonomy_bias = use_taxonomy_bias
+        # 是否需要返回 taxon_path_ids：R1（taxon_path 模式）或 R2（taxonomy bias）都需要
+        self._return_path_ids: bool = (token_embedding_mode == "taxon_path") or use_taxonomy_bias
 
         # 记录样本总数 (N) 和 特征/物种总数 (V)
         self.n_samples = int(self.adata.n_obs)
@@ -165,7 +169,7 @@ class AnnDataDataset:
             abund_bins = np.empty((0,), dtype=np.int64)
             taxon_path_ids = (
                 np.empty((0, len(RANK_COLUMNS)), dtype=np.int64)
-                if self.token_embedding_mode == "taxon_path"
+                if self._return_path_ids
                 else None
             )
         else:
@@ -182,8 +186,8 @@ class AnnDataDataset:
             # ID 约定：0=PAD，1=UNK（genus 无注释），2~=真实 genus
             _genus_idx = RANK_COLUMNS.index("Genus")
             taxon_ids = self._rank_ids[idx, _genus_idx]  # shape [L]
-            # taxon_path 模式额外返回完整的 5 列分类学路径
-            taxon_path_ids = self._rank_ids[idx] if self.token_embedding_mode == "taxon_path" else None
+            # taxon_path 模式或 R2 模式需要完整的 5 列分类学路径（用于 taxonomy bias 计算）
+            taxon_path_ids = self._rank_ids[idx] if self._return_path_ids else None
             
             if self.abundance_mode == "abs_log_bins":
                 abund_bins = self._bin_abundance_abs(vals).astype(np.int64)
@@ -197,7 +201,7 @@ class AnnDataDataset:
             "abund_bins": abund_bins,
             "length": int(taxon_ids.shape[0]),
         }
-        if self.token_embedding_mode == "taxon_path":
+        if self._return_path_ids:
             item["taxon_path_ids"] = taxon_path_ids  # [L, 5]
         
         return item

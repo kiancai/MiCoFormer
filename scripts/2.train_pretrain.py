@@ -39,6 +39,12 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["taxon", "taxon_path"],
         help="Token embedding 来源: taxon 或 taxon_path (默认 taxon_path)",
     )
+    p.add_argument(
+        "--use_taxonomy_bias",
+        action="store_true",
+        default=False,
+        help="R2: 启用 taxonomy 距离注意力偏置（Graphormer-style），默认关闭",
+    )
 
     # --- 优化器与 Scheduler 参数 (Optimizer) ---
     p.add_argument("--lr", type=float, default=3e-4, help="学习率 (Learning Rate)")
@@ -105,6 +111,7 @@ def main():
         min_abundance=args.min_abundance,           # 最小丰度阈值
         abundance_mode=args.abundance_mode,         # 丰度编码模式（"abs_log_bins" 或 "rank_bins"）
         token_embedding_mode=args.token_embedding_mode,  # 选择 token embedding 方式
+        use_taxonomy_bias=args.use_taxonomy_bias,         # R2：taxonomy 距离注意力偏置
     )
     
     # 2. 初始化模型
@@ -122,6 +129,7 @@ def main():
         pad_bin_id=dm.special_ids["pad_bin_id"],
         token_embedding_mode=args.token_embedding_mode,
         rank_vocab_sizes=dm.rank_vocab_sizes,
+        use_taxonomy_bias=args.use_taxonomy_bias,   # R2：taxonomy 距离注意力偏置
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
