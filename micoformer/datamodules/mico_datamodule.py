@@ -77,8 +77,8 @@ class MiCoDataModule(L.LightningDataModule):
         # 只读取 h5ad 的必要元信息，避免为了拿配置提前构建完整 dataset
         adata = ad.read_h5ad(self.h5ad_path, backed="r")
         try:
-            # 始终构建各 rank 词表，两种 embedding 模式均需要
-            _, rank_vocab_sizes = build_taxon_path_ids(adata.var)
+            # 始终构建各 rank 词表，两种 embedding 模式均需要；rank_mappings 此处不需要
+            _, rank_vocab_sizes, _ = build_taxon_path_ids(adata.var)
         finally:
             # 及时关闭 backed 文件句柄，避免占用文件资源
             if getattr(adata, "file", None) is not None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -21,15 +22,19 @@ def _normalize_tax_label(value: Any) -> str:
         return "__UNK__"
     return text
 
-def build_taxon_path_ids(var_df) -> Tuple[np.ndarray, Dict[str, int]]:
+def build_taxon_path_ids(
+    var_df,
+) -> Tuple[np.ndarray, Dict[str, int], Dict[str, Dict[str, int]]]:
     # 从 adata.var 构建 taxon 的 taxonomy-path id 矩阵。
     # 强制执行严格模式：必须包含所有标准层级列，否则直接报错。
     # 返回:
-    #   - path_ids: [n_taxa, 5]，顺序为 [Phylum, Class, Order, Family, Genus]
+    #   - path_ids:        [n_taxa, 5]，顺序为 [Phylum, Class, Order, Family, Genus]
     #   - rank_vocab_sizes: 每个 rank 的词表大小（0=PAD，1=UNK，2~=真实值）
+    #   - rank_mappings:   每个 rank 的完整 name→ID 字典（含 __PAD__ 和 __UNK__）
     n_taxa = len(var_df.index)
     path_ids = np.zeros((n_taxa, len(RANK_COLUMNS)), dtype=np.int64)
     rank_vocab_sizes: Dict[str, int] = {}
+    rank_mappings: Dict[str, Dict[str, int]] = {}
 
     for col_idx, col_name in enumerate(RANK_COLUMNS):
         if col_name not in var_df.columns:
@@ -52,8 +57,25 @@ def build_taxon_path_ids(var_df) -> Tuple[np.ndarray, Dict[str, int]]:
 
         path_ids[:, col_idx] = col_ids
         rank_vocab_sizes[col_name] = len(mapping)
+        rank_mappings[col_name] = mapping
 
-    return path_ids, rank_vocab_sizes
+    return path_ids, rank_vocab_sizes, rank_mappings
+
+
+def save_taxon_vocab(
+    rank_vocab_sizes: Dict[str, int],
+    rank_mappings: Dict[str, Dict[str, int]],
+    output_path: str,
+) -> None:
+    # 将词表（name→ID 映射 + 词表大小）保存为 JSON，供人类查阅及下游推理使用。
+    # 约定：0=PAD，1=UNK，2~=真实值（与训练时完全一致）。
+    vocab = {
+        "rank_vocab_sizes": rank_vocab_sizes,
+        "mappings": rank_mappings,
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(vocab, f, ensure_ascii=False, indent=2)
+    print(f"Taxon vocab saved to {output_path}")
 
 
 class AnnDataDataset:
@@ -92,7 +114,8 @@ class AnnDataDataset:
         # 始终构建所有 rank 的 ID 矩阵（两种 embedding 模式都依赖它）：
         # - taxon_path 模式：使用完整的 5 列路径
         # - taxon（baseline）模式：只取 Genus 列作为 taxon_ids
-        self._rank_ids, self._rank_vocab_sizes = build_taxon_path_ids(
+        # rank_mappings 在训练时不需要，忽略第三个返回值
+        self._rank_ids, self._rank_vocab_sizes, _ = build_taxon_path_ids(
             self.adata.var
         )
 
