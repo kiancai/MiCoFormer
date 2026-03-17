@@ -4,7 +4,7 @@ import numpy as np
 import anndata as ad
 import lightning as L
 import torch
-from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from micoformer.datamodules.mico_datamodule import MiCoDataModule
@@ -145,8 +145,9 @@ def main():
         max_steps=args.max_steps,
     )
 
-    # 3. 设置日志记录器与回调
-    logger = CSVLogger(save_dir=args.log_dir, name="pretrain_stage0")
+    # 3. 设置日志记录器与回调（CSV 用于离线查看，TensorBoard 用于实时监控）
+    csv_logger = CSVLogger(save_dir=args.log_dir, name="pretrain_stage0")
+    tb_logger  = TensorBoardLogger(save_dir=args.log_dir, name="pretrain_stage0")
     
     checkpoint_callback = ModelCheckpoint(
         monitor="val/loss",
@@ -167,7 +168,7 @@ def main():
         gradient_clip_val=args.gradient_clip_val, # 梯度裁剪
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
-        logger=logger,
+        logger=[csv_logger, tb_logger],
         callbacks=[checkpoint_callback, lr_monitor],
         default_root_dir=args.log_dir,
     )
