@@ -68,6 +68,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--limit_train_batches", type=float, default=1.0, help="每 Epoch 仅使用部分训练数据")
     p.add_argument("--limit_val_batches", type=float, default=1.0, help="每 Epoch 仅使用部分验证数据")
     p.add_argument("--log_dir", type=str, default="tmp/logs", help="日志保存目录")
+    p.add_argument(
+        "--no_progress_bar", action="store_true", default=False,
+        help="关闭进度条（远程服务器/nohup 运行时建议开启，避免刷屏）",
+    )
+    p.add_argument(
+        "--val_check_interval", type=int, default=None,
+        help="每多少步验证一次（默认每 epoch 验证）",
+    )
 
     return p
 
@@ -144,7 +152,7 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
     # 4. 初始化 Lightning Trainer
-    trainer = L.Trainer(
+    trainer_kwargs = dict(
         max_epochs=args.max_epochs,
         max_steps=args.max_steps, # 确保与 Scheduler 一致
         devices=args.devices,
@@ -157,6 +165,11 @@ def main():
         callbacks=[checkpoint_callback, lr_monitor],
         default_root_dir=args.log_dir,
     )
+    if args.no_progress_bar:
+        trainer_kwargs["enable_progress_bar"] = False
+    if args.val_check_interval is not None:
+        trainer_kwargs["val_check_interval"] = args.val_check_interval
+    trainer = L.Trainer(**trainer_kwargs)
 
     # 5. 开始训练
     print("Starting training...")
