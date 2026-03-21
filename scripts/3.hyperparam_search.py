@@ -527,7 +527,11 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--gpu_id", type=int, default=0,
-        help="指定使用哪张 GPU（默认 0）。多卡并行时启动多个进程各用不同 gpu_id",
+        help="单卡模式时指定 GPU（默认 0）",
+    )
+    p.add_argument(
+        "--num_gpus", type=int, default=1,
+        help="并行使用的 GPU 数量（默认 1 = 串行）。>1 时自动将 trial 分配到多张卡并行执行",
     )
     p.add_argument(
         "--retry_errors", action="store_true",
@@ -538,6 +542,103 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 # ---------------------------------------------------------------------------
+# 多 GPU 并行执行
+# ---------------------------------------------------------------------------
+
+def _gpu_worker(gpu_id, trials, args_dict, train_indices_path, val_indices_path, result_queue):
+    """
+    多 GPU 并行 worker（在 spawn 的子进程中运行）。
+
+    流程：设置 CUDA_VISIBLE_DEVICES → 加载数据 → 逐个执行分配到本 GPU 的 trial。
+    注意：import torch 在模块顶层已执行，但 CUDA 是惰性初始化的，
+    所以在首次 CUDA 调用前设置 CUDA_VISIBLE_DEVICES 即可生效。
+    """
+    import os
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    train_indices = np.load(train_indices_path)
+    val_indices = np.load(val_indices_path)
+
+    # 重建 args namespace，gpu_id=0 因为 CUDA_VISIBLE_DEVICES 已经映射
+    args = argparse.Namespace(**args_dict)
+    args.gpu_id = 0
+
+    for config, run_name in trials:
+        print(f"[GPU {gpu_id}] {run_name}")
+        result = run_single_trial(config, args, run_name, train_indices, val_indices)
+        result_queue.put(result)
+
+        val_loss = result.get("val_loss", float("inf"))
+        status = result.get("status", "?")
+        elapsed = result.get("elapsed", "?")
+        loss_str = "inf" if val_loss == float("inf") else f"{val_loss:.4f}"
+        print(f"[GPU {gpu_id}] {run_name} => {loss_str}  {status}  ({elapsed})")
+
+
+def _run_trials_parallel(trials, args, summary_path, ok_results):
+    """将 trial 列表分配到多张 GPU 并行执行"""
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+
+    num_gpus = args.num_gpus
+    # 轮询分配 trial 到各 GPU
+    chunks = [[] for _ in range(num_gpus)]
+    for i, trial in enumerate(trials):
+        chunks[i % num_gpus].append(trial)
+
+    for gpu_id, chunk in enumerate(chunks):
+        print(f"GPU {gpu_id}: {len(chunk)} trials assigned")
+
+    result_queue = ctx.Queue()
+    args_dict = {k: v for k, v in vars(args).items()}
+
+    processes = []
+    for gpu_id, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        p = ctx.Process(
+            target=_gpu_worker,
+            args=(gpu_id, chunk, args_dict, args.train_indices, args.val_indices, result_queue),
+        )
+        p.start()
+        processes.append(p)
+
+    # 主进程收集结果，每收到一个就增量保存
+    new_results = []
+    total = len(trials)
+    for _ in range(total):
+        result = result_queue.get()
+        new_results.append(result)
+        save_summary(ok_results + new_results, summary_path)
+        done = len(new_results)
+        print(f"  Progress: {done}/{total} trials completed")
+
+    for p in processes:
+        p.join()
+
+    return new_results
+
+
+def _run_trials_sequential(trials, args, summary_path, ok_results, train_indices, val_indices):
+    """串行执行 trial 列表"""
+    new_results = []
+    for i, (config, run_name) in enumerate(trials):
+        print(f"\n[{i+1}/{len(trials)}] {run_name}")
+        result = run_single_trial(config, args, run_name, train_indices, val_indices)
+        new_results.append(result)
+
+        val_loss = result.get("val_loss", float("inf"))
+        status = result.get("status", "?")
+        elapsed = result.get("elapsed", "?")
+        loss_str = "inf" if val_loss == float("inf") else f"{val_loss:.4f}"
+        print(f"  => val/loss={loss_str}  {status}  ({elapsed})")
+
+        save_summary(ok_results + new_results, summary_path)
+
+    return new_results
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -545,12 +646,13 @@ def main():
     args = build_argparser().parse_args()
 
     print(f"Hyperparameter search: group={args.group}, "
-          f"trials={args.num_trials}, max_steps={args.max_steps}")
+          f"trials={args.num_trials}, max_steps={args.max_steps}, "
+          f"num_gpus={args.num_gpus}")
 
     # 设置全局种子
     L.seed_everything(args.seed, workers=True)
 
-    # 加载分割索引
+    # 加载分割索引（串行模式直接用，并行模式各 worker 自行加载）
     train_indices = np.load(args.train_indices)
     val_indices = np.load(args.val_indices)
     print(f"Train: {len(train_indices)}, Val: {len(val_indices)}")
@@ -563,113 +665,79 @@ def main():
         for k, v in base_config.items():
             print(f"  {k}: {v}")
 
-    # 采样超参数配置
-    configs = sample_configs(
-        group=args.group,
-        num_trials=args.num_trials,
-        seed=args.seed,
-        base_config=base_config,
-    )
-    print(f"Sampled {len(configs)} unique configs")
-
     # 确保日志目录存在
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
-
     summary_path = str(Path(args.log_dir) / f"hpsearch_{args.group}_summary.csv")
 
-    # --retry_errors 模式：只重跑失败的 trial
+    # ---- 构建待执行的 trial 列表 + 已有 OK 结果 ----
+    trials_to_run: list = []   # [(config_dict, run_name), ...]
+    ok_results: List[Dict[str, Any]] = []
+
     if args.retry_errors:
+        # 重跑失败 trial 模式
         existing = load_existing_results(summary_path)
         if not existing:
             print(f"No existing results found at {summary_path}, nothing to retry.")
             return
 
-        ok_results = []
-        error_configs = []
         for r in existing:
             status = str(r.get("status", ""))
-            val_loss = r.get("val_loss", float("inf"))
             if status == "OK":
                 ok_results.append(r)
             else:
-                # 从结果行中重建 config
                 cfg = {k: r[k] for k in ALL_PARAM_NAMES if k in r}
                 run_name = r.get("run_name", make_run_name(args.group, cfg))
-                error_configs.append((cfg, run_name))
+                trials_to_run.append((cfg, run_name))
 
         print(f"Loaded {len(existing)} existing results: "
-              f"{len(ok_results)} OK, {len(error_configs)} to retry")
+              f"{len(ok_results)} OK, {len(trials_to_run)} to retry")
 
-        if not error_configs:
-            print("All trials succeeded, nothing to retry.")
-            return
+    else:
+        # 正常采样搜索模式
+        configs = sample_configs(
+            group=args.group,
+            num_trials=args.num_trials,
+            seed=args.seed,
+            base_config=base_config,
+        )
+        print(f"Sampled {len(configs)} unique configs")
 
-        results = list(ok_results)
-        for i, (cfg, run_name) in enumerate(error_configs):
-            print(f"\n[RETRY {i+1}/{len(error_configs)}] {run_name}")
-            result = run_single_trial(
-                config=cfg, args=args, run_name=run_name,
-                train_indices=train_indices, val_indices=val_indices,
-            )
-            results.append(result)
+        if args.resume_from_trial > 0:
+            existing = load_existing_results(summary_path)
+            if existing:
+                ok_results.extend(existing)
+                print(f"Loaded {len(existing)} existing results from {summary_path}")
 
-            val_loss = result.get("val_loss", float("inf"))
-            status = result.get("status", "?")
-            elapsed = result.get("elapsed", "?")
-            loss_str = "inf" if val_loss == float("inf") else f"{val_loss:.4f}"
-            print(f"  => val/loss={loss_str}  {status}  ({elapsed})")
+        for i, config in enumerate(configs):
+            if i < args.resume_from_trial:
+                print(f"[{i+1}/{len(configs)}] SKIPPED (resume)")
+                continue
+            run_name = make_run_name(args.group, config)
+            trials_to_run.append((config, run_name))
 
-            save_summary(results, summary_path)
-
-        print_results_table(results, args.group)
+    if not trials_to_run:
+        print("No trials to run.")
         return
 
-    # 正常搜索模式
-    results: List[Dict[str, Any]] = []
-    if args.resume_from_trial > 0:
-        existing = load_existing_results(summary_path)
-        if existing:
-            results.extend(existing)
-            print(f"Loaded {len(existing)} existing results from {summary_path}")
+    print(f"\n{'='*60}")
+    print(f"  {len(trials_to_run)} trials to execute on {args.num_gpus} GPU(s)")
+    print(f"{'='*60}")
 
-    # 执行试验
-    for i, config in enumerate(configs):
-        # 中断恢复：跳过前 N 个试验
-        if i < args.resume_from_trial:
-            print(f"[{i+1}/{len(configs)}] SKIPPED (resume_from_trial={args.resume_from_trial})")
-            continue
-
-        run_name = make_run_name(args.group, config)
-        print(f"\n[{i+1}/{len(configs)}] {run_name}")
-
-        result = run_single_trial(
-            config=config,
-            args=args,
-            run_name=run_name,
-            train_indices=train_indices,
-            val_indices=val_indices,
+    # ---- 执行 trial（串行 or 并行）----
+    if args.num_gpus > 1 and len(trials_to_run) > 1:
+        new_results = _run_trials_parallel(
+            trials_to_run, args, summary_path, ok_results,
+        )
+    else:
+        new_results = _run_trials_sequential(
+            trials_to_run, args, summary_path, ok_results,
+            train_indices, val_indices,
         )
 
-        results.append(result)
-
-        # 实时打印结果
-        val_loss = result.get("val_loss", float("inf"))
-        status = result.get("status", "?")
-        elapsed = result.get("elapsed", "?")
-        if val_loss == float("inf"):
-            print(f"  => val/loss=inf  {status}  ({elapsed})")
-        else:
-            print(f"  => val/loss={val_loss:.4f}  {status}  ({elapsed})")
-
-        # 每个 trial 结束后立即保存 summary（防止中途崩溃丢失所有结果）
-        save_summary(results, summary_path)
-
     # 最终汇总
-    if results:
-        save_summary(results, summary_path)
-        print_results_table(results, args.group)
-    else:
-        print("No trials were executed.")
+    all_results = ok_results + new_results
+    save_summary(all_results, summary_path)
+    print_results_table(all_results, args.group)
 
 
 if __name__ == "__main__":
