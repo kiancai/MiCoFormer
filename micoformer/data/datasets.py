@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -21,15 +22,19 @@ def _normalize_tax_label(value: Any) -> str:
         return "__UNK__"
     return text
 
-def build_taxon_path_ids(var_df) -> Tuple[np.ndarray, Dict[str, int]]:
+def build_taxon_path_ids(
+    var_df,
+) -> Tuple[np.ndarray, Dict[str, int], Dict[str, Dict[str, int]]]:
     # 从 adata.var 构建 taxon 的 taxonomy-path id 矩阵。
     # 强制执行严格模式：必须包含所有标准层级列，否则直接报错。
     # 返回:
-    #   - path_ids: [n_taxa, 5]，顺序为 [Phylum, Class, Order, Family, Genus]
+    #   - path_ids:        [n_taxa, 5]，顺序为 [Phylum, Class, Order, Family, Genus]
     #   - rank_vocab_sizes: 每个 rank 的词表大小（0=PAD，1=UNK，2~=真实值）
+    #   - rank_mappings:   每个 rank 的完整 name→ID 字典（含 __PAD__ 和 __UNK__）
     n_taxa = len(var_df.index)
     path_ids = np.zeros((n_taxa, len(RANK_COLUMNS)), dtype=np.int64)
     rank_vocab_sizes: Dict[str, int] = {}
+    rank_mappings: Dict[str, Dict[str, int]] = {}
 
     for col_idx, col_name in enumerate(RANK_COLUMNS):
         if col_name not in var_df.columns:
@@ -52,8 +57,25 @@ def build_taxon_path_ids(var_df) -> Tuple[np.ndarray, Dict[str, int]]:
 
         path_ids[:, col_idx] = col_ids
         rank_vocab_sizes[col_name] = len(mapping)
+        rank_mappings[col_name] = mapping
 
-    return path_ids, rank_vocab_sizes
+    return path_ids, rank_vocab_sizes, rank_mappings
+
+
+def save_taxon_vocab(
+    rank_vocab_sizes: Dict[str, int],
+    rank_mappings: Dict[str, Dict[str, int]],
+    output_path: str,
+) -> None:
+    # 将词表（name→ID 映射 + 词表大小）保存为 JSON，供人类查阅及下游推理使用。
+    # 约定：0=PAD，1=UNK，2~=真实值（与训练时完全一致）。
+    vocab = {
+        "rank_vocab_sizes": rank_vocab_sizes,
+        "mappings": rank_mappings,
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(vocab, f, ensure_ascii=False, indent=2)
+    print(f"Taxon vocab saved to {output_path}")
 
 
 class AnnDataDataset:
@@ -67,6 +89,7 @@ class AnnDataDataset:
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
         token_embedding_mode: str = "taxon_path",
+        use_taxonomy_bias: bool = False,  # R2：即使 baseline 模式也需要返回 taxon_path_ids
     ) -> None:
         if max_seq_len is not None and max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be > 0 when set, got {max_seq_len}")
@@ -81,6 +104,9 @@ class AnnDataDataset:
         # 读取 .h5ad 文件
         self.adata = ad.read_h5ad(h5ad_path, backed=None)
         self.token_embedding_mode = token_embedding_mode
+        self.use_taxonomy_bias = use_taxonomy_bias
+        # 是否需要返回 taxon_path_ids：R1（taxon_path 模式）或 R2（taxonomy bias）都需要
+        self._return_path_ids: bool = (token_embedding_mode == "taxon_path") or use_taxonomy_bias
 
         # 记录样本总数 (N) 和 特征/物种总数 (V)
         self.n_samples = int(self.adata.n_obs)
@@ -88,7 +114,8 @@ class AnnDataDataset:
         # 始终构建所有 rank 的 ID 矩阵（两种 embedding 模式都依赖它）：
         # - taxon_path 模式：使用完整的 5 列路径
         # - taxon（baseline）模式：只取 Genus 列作为 taxon_ids
-        self._rank_ids, self._rank_vocab_sizes = build_taxon_path_ids(
+        # rank_mappings 在训练时不需要，忽略第三个返回值
+        self._rank_ids, self._rank_vocab_sizes, _ = build_taxon_path_ids(
             self.adata.var
         )
 
@@ -165,7 +192,7 @@ class AnnDataDataset:
             abund_bins = np.empty((0,), dtype=np.int64)
             taxon_path_ids = (
                 np.empty((0, len(RANK_COLUMNS)), dtype=np.int64)
-                if self.token_embedding_mode == "taxon_path"
+                if self._return_path_ids
                 else None
             )
         else:
@@ -182,8 +209,8 @@ class AnnDataDataset:
             # ID 约定：0=PAD，1=UNK（genus 无注释），2~=真实 genus
             _genus_idx = RANK_COLUMNS.index("Genus")
             taxon_ids = self._rank_ids[idx, _genus_idx]  # shape [L]
-            # taxon_path 模式额外返回完整的 5 列分类学路径
-            taxon_path_ids = self._rank_ids[idx] if self.token_embedding_mode == "taxon_path" else None
+            # taxon_path 模式或 R2 模式需要完整的 5 列分类学路径（用于 taxonomy bias 计算）
+            taxon_path_ids = self._rank_ids[idx] if self._return_path_ids else None
             
             if self.abundance_mode == "abs_log_bins":
                 abund_bins = self._bin_abundance_abs(vals).astype(np.int64)
@@ -197,7 +224,7 @@ class AnnDataDataset:
             "abund_bins": abund_bins,
             "length": int(taxon_ids.shape[0]),
         }
-        if self.token_embedding_mode == "taxon_path":
+        if self._return_path_ids:
             item["taxon_path_ids"] = taxon_path_ids  # [L, 5]
         
         return item

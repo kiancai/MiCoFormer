@@ -242,7 +242,13 @@ def build_anndata_from_files(
     logger.info("Saving AnnData object...")
     # 确保输出目录存在
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    
+
+    # h5py 无法存储含 NaN（float）的字符串 categorical 列，需提前填充为空字符串
+    # 主要影响 adata.var 中的 taxonomy 列（缺失层级解析结果为 None → NaN）
+    for col in adata.var.columns:
+        if hasattr(adata.var[col], 'cat') or adata.var[col].dtype == object:
+            adata.var[col] = adata.var[col].fillna("").astype(str).astype("category")
+
     logger.info(f"Saving to: {output_path}")
     adata.write(output_path, compression="gzip") # 使用 gzip 压缩进一步减小体积
     

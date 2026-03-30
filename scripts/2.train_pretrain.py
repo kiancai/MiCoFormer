@@ -1,10 +1,8 @@
 import argparse
-import os
 import numpy as np
-import anndata as ad
 import lightning as L
 import torch
-from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from micoformer.datamodules.mico_datamodule import MiCoDataModule
@@ -16,6 +14,14 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # --- 数据相关参数 (Data) ---
     p.add_argument("--h5ad", type=str, required=True, help="处理好的 AnnData (.h5ad) 文件路径")
+    p.add_argument(
+        "--train_indices", type=str, required=True,
+        help="训练集索引 .npy 文件路径（由 scripts/1.make_splits.py 生成）",
+    )
+    p.add_argument(
+        "--val_indices", type=str, required=True,
+        help="验证集索引 .npy 文件路径（由 scripts/1.make_splits.py 生成）",
+    )
     p.add_argument("--batch_size", type=int, default=32, help="批次大小")
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader 的并行加载进程数")
     p.add_argument("--max_seq_len", type=int, default=1024, help="每个样本保留的最大物种数 (截断长度)")
@@ -39,6 +45,12 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["taxon", "taxon_path"],
         help="Token embedding 来源: taxon 或 taxon_path (默认 taxon_path)",
     )
+    p.add_argument(
+        "--use_taxonomy_bias",
+        action="store_true",
+        default=False,
+        help="R2: 启用 taxonomy 距离注意力偏置（Graphormer-style），默认关闭",
+    )
 
     # --- 优化器与 Scheduler 参数 (Optimizer) ---
     p.add_argument("--lr", type=float, default=3e-4, help="学习率 (Learning Rate)")
@@ -56,6 +68,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--limit_train_batches", type=float, default=1.0, help="每 Epoch 仅使用部分训练数据")
     p.add_argument("--limit_val_batches", type=float, default=1.0, help="每 Epoch 仅使用部分验证数据")
     p.add_argument("--log_dir", type=str, default="tmp/logs", help="日志保存目录")
+    p.add_argument(
+        "--no_progress_bar", action="store_true", default=False,
+        help="关闭进度条（远程服务器/nohup 运行时建议开启，避免刷屏）",
+    )
+    p.add_argument(
+        "--val_check_interval", type=int, default=None,
+        help="每多少步验证一次（默认每 epoch 验证）",
+    )
 
     return p
 
@@ -71,24 +91,12 @@ def main():
         chosen_precision = args.precision
     print(f"Using precision={chosen_precision}")
 
-    print(f"Reading metadata from {args.h5ad} to generate splits...")
-    adata = ad.read_h5ad(args.h5ad, backed="r")
-
-    try:
-        n_samples = adata.n_obs
-    finally:
-        # 及时关闭 backed 文件句柄，避免占用文件资源
-        if getattr(adata, "file", None) is not None:
-            adata.file.close()
-    all_indices = np.random.permutation(n_samples)
-    
-    # 95% 训练, 5% 验证
-    # n_val = int(n_samples * 0.05)
-    # train_indices = all_indices[:-n_val]
-    # val_indices = all_indices[-n_val:]
-    train_indices = all_indices[:1000]
-    val_indices = all_indices[1000:1100]
-    print(f"Total samples: {n_samples}. Train: {len(train_indices)}, Val: {len(val_indices)}")
+    # 加载分割索引（由 scripts/1.make_splits.py 分别生成的 .npy 文件）
+    print(f"Loading train indices from {args.train_indices} ...")
+    train_indices = np.load(args.train_indices)
+    print(f"Loading val indices from {args.val_indices} ...")
+    val_indices = np.load(args.val_indices)
+    print(f"Train: {len(train_indices)}, Val: {len(val_indices)}")
 
     # 1. 初始化数据模块
     print(f"Initializing DataModule...")
@@ -105,6 +113,7 @@ def main():
         min_abundance=args.min_abundance,           # 最小丰度阈值
         abundance_mode=args.abundance_mode,         # 丰度编码模式（"abs_log_bins" 或 "rank_bins"）
         token_embedding_mode=args.token_embedding_mode,  # 选择 token embedding 方式
+        use_taxonomy_bias=args.use_taxonomy_bias,         # R2：taxonomy 距离注意力偏置
     )
     
     # 2. 初始化模型
@@ -122,14 +131,16 @@ def main():
         pad_bin_id=dm.special_ids["pad_bin_id"],
         token_embedding_mode=args.token_embedding_mode,
         rank_vocab_sizes=dm.rank_vocab_sizes,
+        use_taxonomy_bias=args.use_taxonomy_bias,   # R2：taxonomy 距离注意力偏置
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         max_steps=args.max_steps,
     )
 
-    # 3. 设置日志记录器与回调
-    logger = CSVLogger(save_dir=args.log_dir, name="pretrain_stage0")
+    # 3. 设置日志记录器与回调（CSV 用于离线查看，TensorBoard 用于实时监控）
+    csv_logger = CSVLogger(save_dir=args.log_dir, name="pretrain_stage0")
+    tb_logger  = TensorBoardLogger(save_dir=args.log_dir, name="pretrain_stage0")
     
     checkpoint_callback = ModelCheckpoint(
         monitor="val/loss",
@@ -141,7 +152,7 @@ def main():
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
     # 4. 初始化 Lightning Trainer
-    trainer = L.Trainer(
+    trainer_kwargs = dict(
         max_epochs=args.max_epochs,
         max_steps=args.max_steps, # 确保与 Scheduler 一致
         devices=args.devices,
@@ -150,10 +161,15 @@ def main():
         gradient_clip_val=args.gradient_clip_val, # 梯度裁剪
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
-        logger=logger,
+        logger=[csv_logger, tb_logger],
         callbacks=[checkpoint_callback, lr_monitor],
         default_root_dir=args.log_dir,
     )
+    if args.no_progress_bar:
+        trainer_kwargs["enable_progress_bar"] = False
+    if args.val_check_interval is not None:
+        trainer_kwargs["val_check_interval"] = args.val_check_interval
+    trainer = L.Trainer(**trainer_kwargs)
 
     # 5. 开始训练
     print("Starting training...")

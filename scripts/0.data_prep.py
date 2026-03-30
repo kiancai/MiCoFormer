@@ -1,7 +1,9 @@
 import sys
 import os
 import logging
+import anndata as ad
 from micoformer.utils import build_anndata_from_files
+from micoformer.data.datasets import build_taxon_path_ids, save_taxon_vocab
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -37,6 +39,21 @@ def main():
         )
     except Exception as e:
         logger.error(f"\n❌ Execution failed: {e}")
+        sys.exit(1)
+
+    # 词表保存：从生成的 h5ad 中读取 adata.var，构建并保存 taxon 词表 JSON
+    # 词表是数据的属性（由 adata.var 完全决定），保存在数据旁边方便查阅和下游推理使用
+    vocab_output_file = os.path.join(project_root, "data/processed/taxon_vocab.json")
+    logger.info("Building and saving taxon vocabulary...")
+    try:
+        adata = ad.read_h5ad(output_file, backed="r")
+        _, rank_vocab_sizes, rank_mappings = build_taxon_path_ids(adata.var)
+        if getattr(adata, "file", None) is not None:
+            adata.file.close()
+        save_taxon_vocab(rank_vocab_sizes, rank_mappings, vocab_output_file)
+        logger.info(f"Vocab sizes: { {k: v for k, v in rank_vocab_sizes.items()} }")
+    except Exception as e:
+        logger.error(f"\n❌ Vocab saving failed: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":

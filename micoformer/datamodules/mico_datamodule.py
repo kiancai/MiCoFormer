@@ -29,6 +29,7 @@ class MiCoDataModule(L.LightningDataModule):
         min_abundance: float = 4e-6,           # 最小丰度阈值 (低于此值归入第一箱)
         abundance_mode: str = "abs_log_bins",  # 丰度编码方式："abs_log_bins" 或 "rank_bins"
         token_embedding_mode: str = "taxon_path",  # token 嵌入方式："taxon" 或 "taxon_path"
+        use_taxonomy_bias: bool = False,  # R2：是否启用 taxonomy 距离注意力偏置
     ) -> None:
 
         super().__init__()
@@ -48,7 +49,8 @@ class MiCoDataModule(L.LightningDataModule):
                 "Expected 'taxon' or 'taxon_path'."
             )
         self.token_embedding_mode = token_embedding_mode
-        
+        self.use_taxonomy_bias = use_taxonomy_bias
+
         # 索引参数
         self.train_indices = train_indices
         self.val_indices = val_indices
@@ -75,8 +77,8 @@ class MiCoDataModule(L.LightningDataModule):
         # 只读取 h5ad 的必要元信息，避免为了拿配置提前构建完整 dataset
         adata = ad.read_h5ad(self.h5ad_path, backed="r")
         try:
-            # 始终构建各 rank 词表，两种 embedding 模式均需要
-            _, rank_vocab_sizes = build_taxon_path_ids(adata.var)
+            # 始终构建各 rank 词表，两种 embedding 模式均需要；rank_mappings 此处不需要
+            _, rank_vocab_sizes, _ = build_taxon_path_ids(adata.var)
         finally:
             # 及时关闭 backed 文件句柄，避免占用文件资源
             if getattr(adata, "file", None) is not None:
@@ -96,6 +98,7 @@ class MiCoDataModule(L.LightningDataModule):
             min_abundance=self.min_abundance,
             abundance_mode=self.abundance_mode,
             token_embedding_mode=self.token_embedding_mode,
+            use_taxonomy_bias=self.use_taxonomy_bias,
         )
 
         # Subset：直接使用初始化时传入的索引划分数据集
