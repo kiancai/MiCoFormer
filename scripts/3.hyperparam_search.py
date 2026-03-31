@@ -29,8 +29,8 @@ import lightning as L
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor
 
-from micoformer.datamodules.mico_datamodule import MiCoDataModule
-from micoformer.models.module import MiCoFormerModule
+from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
+from micoformer.models.pretrain_module import MiCoFormerModule
 
 # ---------------------------------------------------------------------------
 # 搜索空间定义

@@ -34,8 +34,8 @@ from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 
 from micoformer.datamodules.classification_datamodule import ClassificationDataModule
-from micoformer.models.classifier_module import MiCoFormerClassifier
-from micoformer.models.module import MiCoFormerModule
+from micoformer.models.classification_module import MiCoFormerClassifier
+from micoformer.models.pretrain_module import MiCoFormerModule
 
 
 def build_argparser() -> argparse.ArgumentParser:

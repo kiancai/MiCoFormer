@@ -8,7 +8,7 @@ import lightning as L
 from torch.utils.data import DataLoader, Subset
 
 from micoformer.data.datasets import AnnDataDataset, build_taxon_path_ids
-from micoformer.data.collate import MiCoCollator
+from micoformer.data.pretrain_collate import MiCoCollator
 from lightning.pytorch.utilities import rank_zero_info
 
 

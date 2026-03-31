@@ -13,7 +13,7 @@ from torchmetrics.classification import (
     MulticlassAUROC,
 )
 
-from micoformer.models.module import MiCoFormerModule
+from micoformer.models.pretrain_module import MiCoFormerModule
 from micoformer.models.heads import ClassificationHead
 
 
