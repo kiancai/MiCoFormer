@@ -77,6 +77,17 @@ DEFAULTS: Dict[str, Any] = {
 ALL_PARAM_NAMES = list(DEFAULTS.keys())
 
 
+def resolve_nhead(d_model: int, preferred_nhead: int) -> int:
+    """确保 nhead 整除 d_model：优先保持 preferred_nhead，否则选最大合法值"""
+    if d_model % preferred_nhead == 0:
+        return preferred_nhead
+    valid = sorted(
+        [h for h in SEARCH_SPACES["arch"]["nhead"] if d_model % h == 0],
+        reverse=True,
+    )
+    return valid[0] if valid else 1
+
+
 # ---------------------------------------------------------------------------
 # 记录历史最佳 val/loss 的回调
 # ---------------------------------------------------------------------------
@@ -109,8 +120,32 @@ def _format_number(v: float) -> str:
     return s
 
 
+_PARAM_SHORT = {
+    "d_model": "d", "num_layers": "L", "nhead": "h",
+    "ff_ratio": "ff", "dropout": "dp",
+    "lr": "lr", "batch_size": "bs",
+    "weight_decay": "wd", "warmup_steps": "wu",
+    "num_abundance_bins": "bins", "mask_prob": "mp",
+    "min_abundance": "minab",
+}
+
+
 def make_run_name(group: str, config: Dict[str, Any]) -> str:
     """根据搜索组和超参数生成一目了然的 run_name"""
+    # OAT 模式：oat_{param_short}{value}
+    if config.get("_mode") == "oat":
+        param = config["_varied_param"]
+        short = _PARAM_SHORT.get(param, param)
+        return f"oat_{short}{_format_number(config[param])}"
+
+    # Grid 模式：grid_{p1_short}{v1}_{p2_short}{v2}
+    if config.get("_mode") == "grid":
+        p1, p2 = config["_grid_params"]
+        s1 = _PARAM_SHORT.get(p1, p1)
+        s2 = _PARAM_SHORT.get(p2, p2)
+        return f"grid_{s1}{_format_number(config[p1])}_{s2}{_format_number(config[p2])}"
+
+    # Random 模式（原始逻辑）
     if group == "arch":
         return (
             f"d{config['d_model']}"
@@ -137,23 +172,141 @@ def make_run_name(group: str, config: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 超参数采样
+# 超参数采样 — OAT / Grid / Random
 # ---------------------------------------------------------------------------
+
+def _find_param_candidates(param_name: str) -> List:
+    """在所有搜索空间中查找参数的候选值列表"""
+    for group_space in SEARCH_SPACES.values():
+        if param_name in group_space:
+            return group_space[param_name]
+    raise ValueError(f"Parameter '{param_name}' not found in any SEARCH_SPACES group")
+
+
+def sample_configs_oat(
+    group: str,
+    base_config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    One-at-a-time 扫描：固定 base_config，每次只变一个参数。
+    每个 config 带 _meta 字段标识变化的参数，供 make_run_name 使用。
+    """
+    space = SEARCH_SPACES[group]
+    fixed = dict(DEFAULTS)
+    fixed.update(base_config)
+
+    configs: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for param_name, values in space.items():
+        for v in values:
+            config = dict(fixed)
+            config[param_name] = v
+
+            # nhead 约束处理
+            if param_name == "d_model":
+                config["nhead"] = resolve_nhead(v, fixed["nhead"])
+            elif param_name == "nhead":
+                if fixed["d_model"] % v != 0:
+                    continue  # 跳过不合法的 nhead
+
+            # 去重
+            key = tuple(sorted((k, v) for k, v in config.items() if not k.startswith("_")))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # 元数据：标识变化的参数
+            config["_mode"] = "oat"
+            config["_varied_param"] = param_name
+            configs.append(config)
+
+    print(f"One-at-a-time ({group}): {len(configs)} unique configs")
+    return configs
+
+
+def sample_configs_grid_2d(
+    param1: str,
+    param2: str,
+    base_config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    2D 网格搜索：固定其他参数，对 param1 × param2 做笛卡尔积。
+    """
+    values1 = _find_param_candidates(param1)
+    values2 = _find_param_candidates(param2)
+
+    fixed = dict(DEFAULTS)
+    fixed.update(base_config)
+
+    configs: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for v1 in values1:
+        for v2 in values2:
+            config = dict(fixed)
+            config[param1] = v1
+            config[param2] = v2
+
+            # nhead 约束处理
+            if param1 == "d_model" and param2 == "nhead":
+                if v1 % v2 != 0:
+                    continue
+            elif param1 == "nhead" and param2 == "d_model":
+                if v2 % v1 != 0:
+                    continue
+            elif param1 == "d_model":
+                config["nhead"] = resolve_nhead(v1, fixed["nhead"])
+            elif param2 == "d_model":
+                config["nhead"] = resolve_nhead(v2, fixed["nhead"])
+
+            # 去重
+            key = tuple(sorted((k, v) for k, v in config.items() if not k.startswith("_")))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            config["_mode"] = "grid"
+            config["_grid_params"] = (param1, param2)
+            configs.append(config)
+
+    print(f"Grid 2D ({param1} × {param2}): {len(configs)} unique configs "
+          f"({len(values1)}×{len(values2)} candidates)")
+    return configs
+
 
 def sample_configs(
     group: str,
     num_trials: int,
     seed: int,
     base_config: Optional[Dict[str, Any]] = None,
+    mode: str = "random",
+    grid_params: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     从搜索空间中采样配置。
 
-    - arch / optim 组：随机采样 num_trials 个组合
-    - data 组：逐个参数扫描（one-at-a-time），忽略 num_trials
+    mode:
+    - "random": arch/optim 随机采样，data 自动走 one_at_a_time
+    - "one_at_a_time": 固定 base_config，逐参数扫描
+    - "grid_2d": 固定 base_config，对指定参数对做笛卡尔积
 
     base_config：从上一组搜索结果继承的固定参数（覆盖 DEFAULTS）。
     """
+    # 分发到结构化搜索模式
+    if mode == "one_at_a_time":
+        if not base_config:
+            raise ValueError("--base_config is required for one_at_a_time mode")
+        return sample_configs_oat(group, base_config)
+    elif mode == "grid_2d":
+        if not base_config:
+            raise ValueError("--base_config is required for grid_2d mode")
+        if not grid_params:
+            raise ValueError("--grid_params is required for grid_2d mode")
+        p1, p2 = [p.strip() for p in grid_params.split(",")]
+        return sample_configs_grid_2d(p1, p2, base_config)
+
+    # === 以下为 mode="random" 的原始逻辑 ===
     rng = random.Random(seed)
     space = SEARCH_SPACES[group]
 
@@ -162,7 +315,7 @@ def sample_configs(
     if base_config:
         fixed.update(base_config)
 
-    # data 组：逐个参数扫描，三个参数相互独立无需组合搜索
+    # data 组：自动走逐参数扫描（向后兼容）
     if group == "data":
         configs: List[Dict[str, Any]] = []
         seen: set = set()
@@ -357,16 +510,16 @@ def run_single_trial(
             max_steps=args.max_steps,
         )
 
-        # 日志目录：{log_dir}/hpsearch_{group}/{run_name}
-        group_log_dir = f"hpsearch_{args.group}"
+        # 日志目录：{log_dir}/{group_log_dir}/{run_name}
+        log_subdir = getattr(args, "group_log_dir", f"hpsearch_{args.group}")
         tb_logger = TensorBoardLogger(
             save_dir=args.log_dir,
-            name=group_log_dir,
+            name=log_subdir,
             version=run_name,
         )
         csv_logger = CSVLogger(
             save_dir=args.log_dir,
-            name=group_log_dir,
+            name=log_subdir,
             version=run_name,
         )
 
@@ -537,6 +690,15 @@ def build_argparser() -> argparse.ArgumentParser:
         "--retry_errors", action="store_true",
         help="重跑模式：只重跑 summary CSV 中状态为 ERROR 的 trial（保留已有 OK 结果）",
     )
+    p.add_argument(
+        "--mode", type=str, default="random",
+        choices=["random", "one_at_a_time", "grid_2d"],
+        help="搜索模式: random（随机采样）/ one_at_a_time（逐参数扫描）/ grid_2d（二维网格）",
+    )
+    p.add_argument(
+        "--grid_params", type=str, default=None,
+        help="grid_2d 模式的参数对，逗号分隔，如 'd_model,num_layers'",
+    )
 
     return p
 
@@ -645,7 +807,7 @@ def _run_trials_sequential(trials, args, summary_path, ok_results, train_indices
 def main():
     args = build_argparser().parse_args()
 
-    print(f"Hyperparameter search: group={args.group}, "
+    print(f"Hyperparameter search: group={args.group}, mode={args.mode}, "
           f"trials={args.num_trials}, max_steps={args.max_steps}, "
           f"num_gpus={args.num_gpus}")
 
@@ -665,9 +827,21 @@ def main():
         for k, v in base_config.items():
             print(f"  {k}: {v}")
 
+    # 根据 mode 计算日志子目录名
+    if args.mode == "one_at_a_time":
+        group_log_dir = f"hpsearch_{args.group}_oat"
+    elif args.mode == "grid_2d":
+        if not args.grid_params:
+            raise ValueError("--grid_params is required for grid_2d mode")
+        p1, p2 = [p.strip() for p in args.grid_params.split(",")]
+        group_log_dir = f"hpsearch_grid_{p1}_{p2}"
+    else:
+        group_log_dir = f"hpsearch_{args.group}"
+    args.group_log_dir = group_log_dir
+
     # 确保日志目录存在
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
-    summary_path = str(Path(args.log_dir) / f"hpsearch_{args.group}_summary.csv")
+    summary_path = str(Path(args.log_dir) / f"{group_log_dir}_summary.csv")
 
     # ---- 构建待执行的 trial 列表 + 已有 OK 结果 ----
     trials_to_run: list = []   # [(config_dict, run_name), ...]
@@ -699,8 +873,10 @@ def main():
             num_trials=args.num_trials,
             seed=args.seed,
             base_config=base_config,
+            mode=args.mode,
+            grid_params=args.grid_params,
         )
-        print(f"Sampled {len(configs)} unique configs")
+        print(f"Generated {len(configs)} unique configs")
 
         if args.resume_from_trial > 0:
             existing = load_existing_results(summary_path)
@@ -713,7 +889,9 @@ def main():
                 print(f"[{i+1}/{len(configs)}] SKIPPED (resume)")
                 continue
             run_name = make_run_name(args.group, config)
-            trials_to_run.append((config, run_name))
+            # 清除 _ 开头的元数据键，不传入训练/CSV
+            clean_config = {k: v for k, v in config.items() if not k.startswith("_")}
+            trials_to_run.append((clean_config, run_name))
 
     if not trials_to_run:
         print("No trials to run.")
