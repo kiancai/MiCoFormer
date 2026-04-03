@@ -10,72 +10,53 @@ from micoformer.models.pretrain_module import MiCoFormerModule
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="MiCoFormer Stage 0 Pretraining (预训练启动脚本)")
+    p = argparse.ArgumentParser()
 
-    # --- 数据相关参数 (Data) ---
-    p.add_argument("--h5ad", type=str, required=True, help="处理好的 AnnData (.h5ad) 文件路径")
-    p.add_argument(
-        "--train_indices", type=str, required=True,
-        help="训练集索引 .npy 文件路径（由 scripts/1.make_splits.py 生成）",
-    )
-    p.add_argument(
-        "--val_indices", type=str, required=True,
-        help="验证集索引 .npy 文件路径（由 scripts/1.make_splits.py 生成）",
-    )
-    p.add_argument("--batch_size", type=int, default=32, help="批次大小")
-    p.add_argument("--num_workers", type=int, default=4, help="DataLoader 的并行加载进程数")
-    p.add_argument("--max_seq_len", type=int, default=1024, help="每个样本保留的最大物种数 (截断长度)")
-    p.add_argument("--mask_prob", type=float, default=0.15, help="预训练 Mask 概率 (默认 15%)")
-    
-    # 丰度分箱参数
-    p.add_argument("--num_abundance_bins", type=int, default=40, help="丰度分箱数量")
-    p.add_argument("--min_abundance", type=float, default=4e-6, help="最小丰度阈值")
-    p.add_argument("--abundance_mode", type=str, default="abs_log_bins", choices=["abs_log_bins", "rank_bins"], help="丰度编码模式")
+    # 0.输入与切分参数
+    p.add_argument("--h5ad", type=str, required=True)
+    p.add_argument("--train_indices", type=str, required=True)
+    p.add_argument("--val_indices", type=str, required=True)
 
-    # --- 模型架构参数 (Model Architecture) ---
-    p.add_argument("--d_model", type=int, default=256, help="Transformer 隐层维度")
-    p.add_argument("--nhead", type=int, default=8, help="多头注意力的头数")
-    p.add_argument("--num_layers", type=int, default=6, help="Encoder 层数")
-    p.add_argument("--ff", type=int, default=1024, help="FeedForward 层的中间维度")
-    p.add_argument("--dropout", type=float, default=0.1, help="Dropout 概率")
-    p.add_argument(
-        "--token_embedding_mode",
-        type=str,
-        default="taxon_path",
-        choices=["taxon", "taxon_path"],
-        help="Token embedding 来源: taxon 或 taxon_path (默认 taxon_path)",
-    )
-    p.add_argument(
-        "--use_taxonomy_bias",
-        action="store_true",
-        default=False,
-        help="R2: 启用 taxonomy 距离注意力偏置（Graphormer-style），默认关闭",
-    )
+    # 1.模型版本开关
+    p.add_argument("--token_embedding_mode", type=str, default="taxon_path", choices=["taxon", "taxon_path"])
+    p.add_argument("--use_taxonomy_bias", action="store_true", default=False)
 
-    # --- 优化器与 Scheduler 参数 (Optimizer) ---
-    p.add_argument("--lr", type=float, default=3e-4, help="学习率 (Learning Rate)")
-    p.add_argument("--weight_decay", type=float, default=1e-2, help="权重衰减 (L2 正则化)")
-    p.add_argument("--warmup_steps", type=int, default=2000, help="Warmup 步数")
-    p.add_argument("--max_steps", type=int, default=100000, help="最大训练步数 (用于 Cosine Decay 计算)")
+    # 2.1.模型主体参数
+    p.add_argument("--d_model", type=int, default=256)                #token embedding 的维度，也是模型中间层的维度
+    p.add_argument("--nhead", type=int, default=8)                    # 多头注意力中的头数
+    p.add_argument("--num_layers", type=int, default=6)               # Transformer Encoder 层数
+    p.add_argument("--ff", type=int, default=1024)                    # FeedForward 层的中间维度
+    p.add_argument("--num_abundance_bins", type=int, default=40)      # 丰度分箱数量
 
-    # --- 训练控制参数 (Training Control) ---
-    p.add_argument("--max_epochs", type=int, default=100, help="最大训练轮数")
-    p.add_argument("--devices", type=int, default=1, help="使用的 GPU/设备 数量")
-    p.add_argument("--precision", type=str, default="auto", help="训练精度: auto/32/16-mixed")
-    p.add_argument("--seed", type=int, default=42, help="随机种子，用于可复现")
-    p.add_argument("--accumulate_grad_batches", type=int, default=1, help="梯度累积步数")
-    p.add_argument("--gradient_clip_val", type=float, default=1.0, help="梯度裁剪阈值")
-    p.add_argument("--limit_train_batches", type=float, default=1.0, help="每 Epoch 仅使用部分训练数据")
-    p.add_argument("--limit_val_batches", type=float, default=1.0, help="每 Epoch 仅使用部分验证数据")
-    p.add_argument("--log_dir", type=str, default="tmp/logs", help="日志保存目录")
-    p.add_argument(
-        "--no_progress_bar", action="store_true", default=False,
-        help="关闭进度条（远程服务器/nohup 运行时建议开启，避免刷屏）",
-    )
-    p.add_argument(
-        "--val_check_interval", type=int, default=None,
-        help="每多少步验证一次（默认每 epoch 验证）",
-    )
+    # 2.2.模型主体参数的协议参数
+    p.add_argument("--abundance_mode", type=str, default="abs_log_bins", choices=["abs_log_bins", "rank_bins"])
+    p.add_argument("--min_abundance", type=float, default=4e-6)       # 最小丰度阈值
+    p.add_argument("--max_seq_len", type=int, default=1024)           # 每个样本保留的最大物种数 (截断长度)
+
+    # 3.预训练中的训练参数
+    p.add_argument("--batch_size", type=int, default=32)              # 每个 batch 的样本数
+    p.add_argument("--mask_prob", type=float, default=0.15)           # 预训练 Mask 概率
+    p.add_argument("--dropout", type=float, default=0.1)              # Dropout 概率
+    p.add_argument("--lr", type=float, default=3e-4)                  # 学习率
+    p.add_argument("--weight_decay", type=float, default=1e-2)        # 权重衰减 (L2 正则化)
+    p.add_argument("--warmup_steps", type=int, default=2000)          # Warmup 步数
+
+    # 4. 预算与验证协议参数
+    p.add_argument("--max_steps", type=int, default=100000)           # 最大训练步数 (用于 Cosine Decay 计算)
+    p.add_argument("--max_epochs", type=int, default=100)             # 最大训练轮数
+    p.add_argument("--val_check_interval", type=int, default=None)    # 每多少步验证一次（默认每 epoch 验证）
+    p.add_argument("--limit_train_batches", type=float, default=1.0)  # 每 Epoch 仅使用部分训练数据
+    p.add_argument("--limit_val_batches", type=float, default=1.0)    # 每 Epoch 仅使用部分验证数据
+
+    # 5. 运行与工程参数
+    p.add_argument("--devices", type=int, default=1)                  # 使用的 GPU/设备 数量
+    p.add_argument("--precision", type=str, default="auto", choices=["auto", "16-mixed", "32"])  # 训练精度
+    p.add_argument("--seed", type=int, default=42)                    # 随机种子，用于可复现
+    p.add_argument("--accumulate_grad_batches", type=int, default=1)  # 梯度累积步数
+    p.add_argument("--gradient_clip_val", type=float, default=1.0)    # 梯度裁剪阈值
+    p.add_argument("--num_workers", type=int, default=4)              # DataLoader 的 num_workers，默认为 4
+    p.add_argument("--log_dir", type=str, default="tmp/logs")         # 日志保存目录
+    p.add_argument("--no_progress_bar", action="store_true", default=False)  # 关闭进度条（远程服务器/nohup 运行时避免刷屏）
 
     return p
 
