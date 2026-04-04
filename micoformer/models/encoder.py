@@ -19,7 +19,7 @@ class MiCoFormerEncoder(nn.Module):
     def __init__(
         self,
         *,
-        genus_vocab_size: Optional[int] = None,   # taxon 模式必须提供；taxon_path 模式不需要
+        genus_vocab_size: int,
         total_abundance_bins: int,
         d_model: int = 256,
         nhead: int = 8,
@@ -29,7 +29,7 @@ class MiCoFormerEncoder(nn.Module):
         pad_taxon_id: int = 0,
         pad_bin_id: int = 0,
         token_embedding_mode: str = "taxon_path",
-        rank_vocab_sizes: Optional[Dict[str, int]] = None,  # taxon_path 模式必须提供
+        rank_vocab_sizes: Dict[str, int],
         use_taxonomy_bias: bool = False,  # R2：启用 taxonomy 距离注意力偏置
     ) -> None:
         super().__init__()
@@ -50,17 +50,13 @@ class MiCoFormerEncoder(nn.Module):
         # taxon 模式：每个 genus 一个独立 embedding；taxon_path 模式：不需要此表
         self.taxon_embed: Optional[nn.Embedding] = None
         if self.token_embedding_mode == "taxon":
-            if genus_vocab_size is None:
-                raise ValueError("genus_vocab_size is required when token_embedding_mode='taxon'")
             self.taxon_embed = nn.Embedding(genus_vocab_size, d_model, padding_idx=pad_taxon_id)
 
         self.abund_embed = nn.Embedding(total_abundance_bins, d_model, padding_idx=pad_bin_id)
         self.rank_embeds = nn.ModuleDict()
 
-        # R1 taxon_path 模式：5 个 rank 各自独立的 embedding 表，相加得到 taxon embedding
+        # taxon_path 模式：5 个 rank 各自独立的 embedding 表，相加得到 taxon embedding
         if self.token_embedding_mode == "taxon_path":
-            if rank_vocab_sizes is None:
-                raise ValueError("rank_vocab_sizes is required when token_embedding_mode='taxon_path'")
             for rank_name in RANK_COLUMNS:
                 if rank_name not in rank_vocab_sizes:
                     raise ValueError(
@@ -100,20 +96,16 @@ class MiCoFormerEncoder(nn.Module):
     def _build_token_embedding(
         self,
         token_ids: torch.Tensor,
-        taxon_path_ids: Optional[torch.Tensor],
+        taxon_path_ids: torch.Tensor,
     ) -> torch.Tensor:
         # 统一生成 token embedding：
         # - Baseline: 使用 taxon_id embedding
         # - R1: 使用 taxon-path 各层级 embedding 相加
         if self.token_embedding_mode == "taxon_path":
-            if taxon_path_ids is None:
-                raise ValueError("taxon_path_ids is required when token_embedding_mode='taxon_path'")
             token_x = self.rank_embeds[RANK_COLUMNS[0]](taxon_path_ids[:, :, 0])
             for rank_idx, rank_name in enumerate(RANK_COLUMNS[1:], start=1):
                 token_x = token_x + self.rank_embeds[rank_name](taxon_path_ids[:, :, rank_idx])
         else:
-            if self.taxon_embed is None:
-                raise RuntimeError("taxon_embed is not initialized.")
             token_x = self.taxon_embed(token_ids)
         return token_x
 
@@ -121,8 +113,8 @@ class MiCoFormerEncoder(nn.Module):
         self,
         token_ids: torch.Tensor,        # [Batch, Length]
         abund_bins: torch.Tensor,       # [Batch, Length]
-        taxon_path_ids: Optional[torch.Tensor] = None,   # [Batch, Length, 5]
-        attention_mask: Optional[torch.Tensor] = None,  # [Batch, Length], True=Valid, False=Pad
+        taxon_path_ids: torch.Tensor,   # [Batch, Length, 5]
+        attention_mask: torch.Tensor,   # [Batch, Length], True=Valid, False=Pad
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B = token_ids.size(0)
 
@@ -131,10 +123,8 @@ class MiCoFormerEncoder(nn.Module):
 
         # 构造 key_padding_mask：PyTorch 约定 True=忽略，与我们的 attention_mask 语义相反
         # 扩展一位给 [SAMPLE]（始终有效）
-        key_padding_mask = None
-        if attention_mask is not None:
-            sample_mask = torch.ones((B, 1), dtype=torch.bool, device=token_ids.device)
-            key_padding_mask = ~torch.cat([sample_mask, attention_mask], dim=1)
+        sample_mask = torch.ones((B, 1), dtype=torch.bool, device=token_ids.device)
+        key_padding_mask = ~torch.cat([sample_mask, attention_mask], dim=1)
 
         # 拼接 [SAMPLE] token（不加丰度 embedding，保持语义纯粹性）
         sample_vec = self.sample_embed.weight.view(1, 1, -1).expand(B, -1, -1)
@@ -144,7 +134,7 @@ class MiCoFormerEncoder(nn.Module):
         # taxon-taxon 部分 [B, nhead, L, L] → 扩展为 [B, nhead, L+1, L+1]
         # [SAMPLE] 行/列（index 0）保持 0（中性偏置，不偏向任何进化谱系）
         attn_bias = None
-        if self.use_taxonomy_bias and taxon_path_ids is not None:
+        if self.use_taxonomy_bias:
             bucket_matrix = compute_taxonomy_bucket_matrix(taxon_path_ids)  # [B, L, L]
             taxon_bias = self.taxonomy_bias_params(bucket_matrix)            # [B, nhead, L, L]
             L_seq = taxon_bias.shape[2]

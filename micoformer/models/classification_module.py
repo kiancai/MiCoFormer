@@ -13,7 +13,7 @@ from torchmetrics.classification import (
     MulticlassAUROC,
 )
 
-from micoformer.models.module import MiCoFormerModule
+from micoformer.models.pretrain_module import MiCoFormerModule
 from micoformer.models.heads import ClassificationHead
 
 
@@ -117,7 +117,7 @@ class MiCoFormerClassifier(L.LightningModule):
         h, _ = self.encoder(
             token_ids=batch["token_ids"],
             abund_bins=batch["abund_bins"],
-            taxon_path_ids=batch.get("taxon_path_ids", None),
+            taxon_path_ids=batch["taxon_path_ids"],
             attention_mask=batch["attention_mask"],
         )
         pooled = self._pool(h, batch["attention_mask"])

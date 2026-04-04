@@ -1,1 +1,1 @@
-from .mico_datamodule import MiCoDataModule
+from .pretrain_datamodule import MiCoDataModule

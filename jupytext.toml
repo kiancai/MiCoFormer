@@ -1,0 +1,5 @@
+# jupytext.toml
+
+comment_magics = true
+
+formats = "notebooks///ipynb,notebooks///py:percent"

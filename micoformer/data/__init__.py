@@ -1,2 +1,2 @@
 from .datasets import AnnDataDataset
-from .collate import MiCoCollator
+from .pretrain_collate import MiCoCollator

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
 import lightning as L
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 
 from micoformer.models.encoder import MiCoFormerEncoder
 from micoformer.models.heads import AbundanceBinHead
@@ -16,7 +16,7 @@ class MiCoFormerModule(L.LightningModule):
     def __init__(
         self,
         *,
-        genus_vocab_size: Optional[int] = None,   # taxon 模式必须提供；taxon_path 模式不需要
+        genus_vocab_size: int,
         total_abundance_bins: int,
         d_model: int = 256,
         nhead: int = 8,
@@ -26,12 +26,15 @@ class MiCoFormerModule(L.LightningModule):
         pad_taxon_id: int = 0,
         pad_bin_id: int = 0,
         token_embedding_mode: str = "taxon_path",
-        rank_vocab_sizes: Optional[Dict[str, int]] = None,  # taxon_path 模式必须提供
+        rank_vocab_sizes: Dict[str, int],
         use_taxonomy_bias: bool = False,  # R2：启用 taxonomy 距离注意力偏置
         lr: float = 3e-4,
         weight_decay: float = 1e-2,
-        warmup_steps: int = 2000,
-        max_steps: int = 100000,
+        warmup_ratio: float = 0.02,
+        lr_scheduler: str = "cosine",
+        plateau_factor: float = 0.5,
+        plateau_patience: int = 2,
+        plateau_min_lr: float = 1e-6,
     ) -> None:
         super().__init__()
 
@@ -63,7 +66,7 @@ class MiCoFormerModule(L.LightningModule):
         h, sample_repr = self.encoder(
             token_ids=batch["token_ids"],
             abund_bins=batch["abund_bins"],
-            taxon_path_ids=batch.get("taxon_path_ids", None),
+            taxon_path_ids=batch["taxon_path_ids"],
             attention_mask=batch["attention_mask"],
         )
         logits = self.head(h)
@@ -148,45 +151,45 @@ class MiCoFormerModule(L.LightningModule):
             else:
                 decay_params.append(param)
 
-        optimizer_grouped_parameters = [
-            {
-                "params": decay_params,
-                "weight_decay": self.hparams.weight_decay,
-            },
-            {
-                "params": no_decay_params,
-                "weight_decay": 0.0,
-            },
-        ]
-
         optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters, lr=self.hparams.lr
+            [
+                {"params": decay_params, "weight_decay": self.hparams.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=self.hparams.lr,
         )
 
-        # Learning Rate Scheduler: Warmup + Cosine Decay
-        # 前 warmup_steps 步线性增加 LR，之后 Cosine 衰减
-        # 注意：这里假设总步数为 max_steps，如果实际训练步数更少，Cosine 可能不会降到最低
-        warmup_scheduler = LinearLR(
-            optimizer, start_factor=0.01, end_factor=1.0, total_iters=self.hparams.warmup_steps
-        )
-        
-        # 计算剩余步数用于 Cosine Decay
-        decay_steps = max(1, self.hparams.max_steps - self.hparams.warmup_steps)
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer, T_max=decay_steps, eta_min=1e-6
-        )
-        
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[self.hparams.warmup_steps]
-        )
+        if self.hparams.lr_scheduler == "cosine":
+            total_steps = int(self.trainer.estimated_stepping_batches)
+            warmup_steps = int(float(self.hparams.warmup_ratio) * total_steps)
+            decay_steps = max(1, total_steps - warmup_steps)
+            warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+            cosine = CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=1e-6)
+            scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step", # 每个 step 更新一次 LR
-                "frequency": 1,
-            },
-        }
+        if self.hparams.lr_scheduler == "plateau":
+            # Lightning 原生支持：通过 monitor 字段自动将 val/loss 传给 scheduler
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": ReduceLROnPlateau(
+                        optimizer,
+                        mode="min",
+                        factor=float(self.hparams.plateau_factor),
+                        patience=int(self.hparams.plateau_patience),
+                        min_lr=float(self.hparams.plateau_min_lr),
+                    ),
+                    "interval": "epoch",
+                    "monitor": "val/loss",
+                },
+            }
+
+        raise ValueError(f"Unknown lr_scheduler: {self.hparams.lr_scheduler}")

@@ -42,10 +42,11 @@ class MiCoCollator:
         ensure_one_mask_per_nonempty: bool = True,
     ):
         self.pad_taxon_id = pad_taxon_id
-        # self.sample_token_id = sample_token_id
         self.pad_bin_id = pad_bin_id
         self.mask_bin_id = mask_bin_id
         self.mask_prob = mask_prob
+
+        # 下面这个参数不接受从外部传入
         # 是否保证“每个非空样本至少有 1 个被 mask 的位置”
         self.ensure_one_mask_per_nonempty = ensure_one_mask_per_nonempty
 
@@ -77,7 +78,6 @@ class MiCoCollator:
         B, L = token_ids.shape            # B:Batch Size; L:Length;
         # 候选 Mask 区域
         valid = attention_mask.clone()  # 先复制 attention_mask (排除 Pad)
-        # valid[:, 0] = False             # <-- 不再需要排除第 0 位，因为没有 [SAMPLE] 了
         # 在 valid 为 True 的位置，且随机数 < mask_prob 时，才 Mask
         if self.mask_prob > 0:
             rand = torch.rand(B, L)  # 在 (B, L) 大小矩阵中生成 [0, 1) 随机数
@@ -90,7 +90,7 @@ class MiCoCollator:
             for i in range(B):
                 valid_i = torch.where(valid[i])[0]
                 if valid_i.numel() == 0:
-                    # 空样本（仅 [SAMPLE] 或全 pad），跳过
+                    # 空样本（全 pad），跳过
                     continue
                 if not mask_positions[i].any():
                     # 若该样本没采到 mask，则强制随机补 1 个位置

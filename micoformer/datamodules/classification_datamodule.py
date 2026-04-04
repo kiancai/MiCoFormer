@@ -39,6 +39,9 @@ class _LabelWrappedSubset:
         return item
 
 
+TAG = "[cls_datamodule]"
+
+
 class ClassificationDataModule(L.LightningDataModule):
     """下游分类任务的数据管道。复用 AnnDataDataset，在 collator 层附加标签。"""
 
@@ -58,8 +61,6 @@ class ClassificationDataModule(L.LightningDataModule):
         num_abundance_bins: int = 40,
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
-        token_embedding_mode: str = "taxon_path",
-        use_taxonomy_bias: bool = False,
     ) -> None:
         super().__init__()
         self.h5ad_path = h5ad_path
@@ -73,8 +74,6 @@ class ClassificationDataModule(L.LightningDataModule):
         self.num_abundance_bins = num_abundance_bins
         self.min_abundance = min_abundance
         self.abundance_mode = abundance_mode
-        self.token_embedding_mode = token_embedding_mode
-        self.use_taxonomy_bias = use_taxonomy_bias
 
         self.persistent_workers = True
         self.pin_memory = True
@@ -161,8 +160,6 @@ class ClassificationDataModule(L.LightningDataModule):
             num_abundance_bins=self.num_abundance_bins,
             min_abundance=self.min_abundance,
             abundance_mode=self.abundance_mode,
-            token_embedding_mode=self.token_embedding_mode,
-            use_taxonomy_bias=self.use_taxonomy_bias,
         )
 
         assert self._labels_array is not None
@@ -186,7 +183,7 @@ class ClassificationDataModule(L.LightningDataModule):
         if self.test_dataset:
             stats.append(f"Test={len(self.test_dataset)}")
         if stats:
-            rank_zero_info(f"Classification split stats: {', '.join(stats)}")
+            rank_zero_info(f"{TAG} Split stats: {', '.join(stats)}")
 
         # 打印标签分布
         for ti, cfg in enumerate(self.task_configs):
@@ -206,7 +203,7 @@ class ClassificationDataModule(L.LightningDataModule):
                 for lid in range(cfg["num_classes"]):
                     counts[id_to_label.get(lid, str(lid))] = int((split_labels == lid).sum())
                 rank_zero_info(
-                    f"  {field} [{split_name}]: {n_valid} valid / {len(indices)} total, "
+                    f"{TAG}   {field} [{split_name}]: {n_valid} valid / {len(indices)} total, "
                     f"distribution={counts}"
                 )
 

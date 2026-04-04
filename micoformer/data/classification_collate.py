@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 import torch
 
-from micoformer.data.collate import pad_sequences, pad_matrix_sequences
+from micoformer.data.pretrain_collate import pad_sequences, pad_matrix_sequences
 
 
 class ClassificationCollator:
