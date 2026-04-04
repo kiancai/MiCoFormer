@@ -4,6 +4,7 @@ import lightning as L
 import torch
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.utilities import rank_zero_info
 
 from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
 from micoformer.models.pretrain_module import MiCoFormerModule
@@ -124,27 +125,27 @@ def main():
         chosen_precision = args.precision
 
     TAG = "[train_pretrain]"
-    print(f"{TAG} Using precision={chosen_precision}")
+    rank_zero_info(f"{TAG} Using precision={chosen_precision}")
 
     # 加载分割索引（由 scripts/1.make_splits.py 分别生成的 .npy 文件）
-    print(f"{TAG} Loading train indices from {args.train_indices_path} ...")
+    rank_zero_info(f"{TAG} Loading train indices from {args.train_indices_path} ...")
     train_indices = np.load(args.train_indices_path)
-    print(f"{TAG} Loading val indices from {args.val_indices_path} ...")
+    rank_zero_info(f"{TAG} Loading val indices from {args.val_indices_path} ...")
     val_indices = np.load(args.val_indices_path)
-    print(f"{TAG} Train: {len(train_indices)}, Val: {len(val_indices)}")
+    rank_zero_info(f"{TAG} Train: {len(train_indices)}, Val: {len(val_indices)}")
 
     # 打印当前训练协议，便于日志中快速确认：
     # 这次实验到底是按 epoch 预算还是按 step 预算，
     # 学习率又是按 cosine 还是 plateau 下降
-    print(f"{TAG} Budget mode: {args.budget_mode}")
+    rank_zero_info(f"{TAG} Budget mode: {args.budget_mode}")
     if args.budget_mode == "epoch":
-        print(f"{TAG} Max epochs: {args.max_epochs}, val_interval_epochs={args.val_interval_epochs}")
+        rank_zero_info(f"{TAG} Max epochs: {args.max_epochs}, val_interval_epochs={args.val_interval_epochs}")
     else:
-        print(f"{TAG} Max steps: {args.max_steps}, val_interval_steps={args.val_interval_steps}")
-    print(f"{TAG} LR scheduler: {args.lr_scheduler_type}, warmup_ratio={args.warmup_ratio}")
+        rank_zero_info(f"{TAG} Max steps: {args.max_steps}, val_interval_steps={args.val_interval_steps}")
+    rank_zero_info(f"{TAG} LR scheduler: {args.lr_scheduler_type}, warmup_ratio={args.warmup_ratio}")
 
     # 1. 初始化数据模块
-    print(f"{TAG} Initializing DataModule...")
+    rank_zero_info(f"{TAG} Initializing DataModule...")
     dm = MiCoDataModule(
         h5ad_path=args.h5ad_path,
         train_indices=train_indices,
@@ -157,13 +158,11 @@ def main():
         num_abundance_bins=args.num_abundance_bins,
         min_abundance=args.min_abundance,
         abundance_mode=args.abundance_mode,
-        token_embedding_mode=args.token_embedding_mode,
-        use_taxonomy_bias=args.use_taxonomy_bias,
     )
-    
+
     # 2. 初始化模型
-    print(f"{TAG} Initializing Model with d_model={args.d_model}, layers={args.num_layers}")
-    print(f"{TAG} Token embedding mode: {args.token_embedding_mode}")
+    rank_zero_info(f"{TAG} Initializing Model with d_model={args.d_model}, layers={args.num_layers}")
+    rank_zero_info(f"{TAG} Token embedding mode: {args.token_embedding_mode}")
     model = MiCoFormerModule(
         genus_vocab_size=dm.genus_vocab_size,     # taxon 模式使用；taxon_path 模式传 None 亦可
         total_abundance_bins=dm.total_abundance_bins,
@@ -227,7 +226,7 @@ def main():
     trainer = L.Trainer(**trainer_kwargs)
 
     # 5. 开始训练
-    print(f"{TAG} Starting training...")
+    rank_zero_info(f"{TAG} Starting training...")
     trainer.fit(model, datamodule=dm)
 
 

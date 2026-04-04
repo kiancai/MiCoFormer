@@ -112,12 +112,11 @@ class BestValLossTracker(Callback):
 # ---------------------------------------------------------------------------
 
 def _format_number(v: float) -> str:
-    """将数值格式化为紧凑字符串，用于 run_name"""
-    if isinstance(v, int) or (isinstance(v, float) and v == int(v)):
+    """将数值格式化为紧凑且稳定的字符串，用于 run_name"""
+    if isinstance(v, int) or (isinstance(v, float) and v.is_integer()):
         return str(int(v))
-    # 科学记数法格式
-    s = f"{v:.0e}"
-    return s
+    # 采用足够精确的通用格式，避免 0.1 和 0.15 之类的不同配置被压成同一名字
+    return format(v, ".15g")
 
 
 _PARAM_SHORT = {
@@ -486,8 +485,6 @@ def run_single_trial(
             num_abundance_bins=config["num_abundance_bins"],
             min_abundance=config["min_abundance"],
             abundance_mode="abs_log_bins",
-            token_embedding_mode="taxon",       # baseline: R1=off
-            use_taxonomy_bias=False,             # baseline: R2=off
         )
 
         # 创建模型

@@ -7,11 +7,17 @@ import numpy as np
 import anndata as ad
 from scipy import sparse as sp
 
+from lightning.pytorch.utilities import rank_zero_info
+
 from micoformer.data.binning import compute_log_bin_edges, bin_values_log, bin_values_rank
+
+
+TAG = "[dataset]"
 
 
 # taxonomy path 中使用的标准层级顺序
 RANK_COLUMNS = ("Phylum", "Class", "Order", "Family", "Genus")
+_GENUS_COL_IDX = RANK_COLUMNS.index("Genus")
 
 
 def _normalize_tax_label(value: Any) -> str:
@@ -75,7 +81,7 @@ def save_taxon_vocab(
     }
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(vocab, f, ensure_ascii=False, indent=2)
-    print(f"Taxon vocab saved to {output_path}")
+    rank_zero_info(f"{TAG} Taxon vocab saved to {output_path}")
 
 
 class AnnDataDataset:
@@ -88,25 +94,14 @@ class AnnDataDataset:
         num_abundance_bins: int = 40,
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
-        token_embedding_mode: str = "taxon_path",
-        use_taxonomy_bias: bool = False,  # R2：即使 baseline 模式也需要返回 taxon_path_ids
     ) -> None:
         if max_seq_len is not None and max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be > 0 when set, got {max_seq_len}")
         if abundance_mode not in {"abs_log_bins", "rank_bins"}:
             raise ValueError(f"Unknown abundance_mode: {abundance_mode}")
-        if token_embedding_mode not in {"taxon", "taxon_path"}:
-            raise ValueError(
-                f"Unknown token_embedding_mode: {token_embedding_mode}. "
-                "Expected 'taxon' or 'taxon_path'."
-            )
 
         # 读取 .h5ad 文件
         self.adata = ad.read_h5ad(h5ad_path, backed=None)
-        self.token_embedding_mode = token_embedding_mode
-        self.use_taxonomy_bias = use_taxonomy_bias
-        # 是否需要返回 taxon_path_ids：R1（taxon_path 模式）或 R2（taxonomy bias）都需要
-        self._return_path_ids: bool = (token_embedding_mode == "taxon_path") or use_taxonomy_bias
 
         # 记录样本总数 (N) 和 特征/物种总数 (V)
         self.n_samples = int(self.adata.n_obs)
@@ -131,10 +126,6 @@ class AnnDataDataset:
                 min_val=min_abundance,
                 max_val=1.0
             )
-        elif abundance_mode == "rank_bins":
-            pass
-        else:
-            raise ValueError(f"Unknown abundance_mode: {abundance_mode}")
 
         # 总 bin 数 = 真实 bin 数 + 2（PAD=0, MASK=1）
         self.total_abundance_bins = self.num_abundance_bins + 2
@@ -190,16 +181,12 @@ class AnnDataDataset:
         if idx.size == 0:
             taxon_ids = np.empty((0,), dtype=np.int64)
             abund_bins = np.empty((0,), dtype=np.int64)
-            taxon_path_ids = (
-                np.empty((0, len(RANK_COLUMNS)), dtype=np.int64)
-                if self._return_path_ids
-                else None
-            )
+            taxon_path_ids = np.empty((0, len(RANK_COLUMNS)), dtype=np.int64)
         else:
             order = np.argsort(-vals)  # 按丰度值降序排列
             idx = idx[order]
             vals = vals[order]
-            
+
             # 截断序列到最大长度
             if self.max_seq_len is not None:
                 idx = idx[: self.max_seq_len]
@@ -207,27 +194,20 @@ class AnnDataDataset:
 
             # 两种模式统一用 Genus 列作为 taxon_ids（内容型 ID，语义稳定）
             # ID 约定：0=PAD，1=UNK（genus 无注释），2~=真实 genus
-            _genus_idx = RANK_COLUMNS.index("Genus")
-            taxon_ids = self._rank_ids[idx, _genus_idx]  # shape [L]
-            # taxon_path 模式或 R2 模式需要完整的 5 列分类学路径（用于 taxonomy bias 计算）
-            taxon_path_ids = self._rank_ids[idx] if self._return_path_ids else None
-            
+            taxon_ids = self._rank_ids[idx, _GENUS_COL_IDX]  # shape [L]
+            taxon_path_ids = self._rank_ids[idx]              # shape [L, 5]
+
             if self.abundance_mode == "abs_log_bins":
                 abund_bins = self._bin_abundance_abs(vals).astype(np.int64)
-            elif self.abundance_mode == "rank_bins":
-                abund_bins = self._bin_abundance_rank(vals).astype(np.int64)
             else:
-                raise RuntimeError(f"Unsupported abundance_mode in __getitem__: {self.abundance_mode}")
+                abund_bins = self._bin_abundance_rank(vals).astype(np.int64)
 
-        item = {  # 组装返回字典（taxon_ids 不含 [SAMPLE]）
+        return {
             "taxon_ids": taxon_ids,
             "abund_bins": abund_bins,
+            "taxon_path_ids": taxon_path_ids,  # [L, 5]
             "length": int(taxon_ids.shape[0]),
         }
-        if self._return_path_ids:
-            item["taxon_path_ids"] = taxon_path_ids  # [L, 5]
-        
-        return item
 
 
     @property

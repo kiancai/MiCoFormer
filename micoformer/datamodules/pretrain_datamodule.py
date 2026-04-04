@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Sequence, Tuple
 
-import numpy as np
 import anndata as ad
 import lightning as L
 from torch.utils.data import DataLoader, Subset
@@ -10,6 +9,9 @@ from torch.utils.data import DataLoader, Subset
 from micoformer.data.datasets import AnnDataDataset, build_taxon_path_ids
 from micoformer.data.pretrain_collate import MiCoCollator
 from lightning.pytorch.utilities import rank_zero_info
+
+
+TAG = "[datamodule]"
 
 
 class MiCoDataModule(L.LightningDataModule):
@@ -21,15 +23,13 @@ class MiCoDataModule(L.LightningDataModule):
         train_indices: Optional[Sequence[int]] = None, 
         val_indices: Optional[Sequence[int]] = None,   
         test_indices: Optional[Sequence[int]] = None,  
-        batch_size: int = 32,                  # 批次大小 
+        batch_size: int = 32,
         num_workers: int = 4,                  # 数据加载线程数
-        max_seq_len: Optional[int] = 1024,     # 最大序列长度
-        mask_prob: float = 0.15,               # 预训练时 token 被掩码的概率（MLM 任务）
+        max_seq_len: Optional[int] = 1024,
+        mask_prob: float = 0.15,
         num_abundance_bins: int = 40,          # 丰度分箱数量 (不含 PAD/MASK)
         min_abundance: float = 4e-6,           # 最小丰度阈值 (低于此值归入第一箱)
         abundance_mode: str = "abs_log_bins",  # 丰度编码方式："abs_log_bins" 或 "rank_bins"
-        token_embedding_mode: str = "taxon_path",  # token 嵌入方式："taxon" 或 "taxon_path"
-        use_taxonomy_bias: bool = False,  # R2：是否启用 taxonomy 距离注意力偏置
     ) -> None:
 
         super().__init__()
@@ -38,24 +38,17 @@ class MiCoDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.max_seq_len = max_seq_len
         self.mask_prob = mask_prob
-        
+
         # 丰度分箱配置
-        self.num_abundance_bins = num_abundance_bins    # 用户指定的真实 bin 数（不含 PAD/MASK）
+        self.num_abundance_bins = num_abundance_bins    # 指定的真实 bin 数（不含 PAD/MASK）
         self.min_abundance = min_abundance
         self.abundance_mode = abundance_mode
-        if token_embedding_mode not in {"taxon", "taxon_path"}:
-            raise ValueError(
-                f"Unknown token_embedding_mode: {token_embedding_mode}. "
-                "Expected 'taxon' or 'taxon_path'."
-            )
-        self.token_embedding_mode = token_embedding_mode
-        self.use_taxonomy_bias = use_taxonomy_bias
 
-        # 索引参数
         self.train_indices = train_indices
         self.val_indices = val_indices
         self.test_indices = test_indices
         
+        # 下面这两个参数是不接受从外部传入的，但是保持现有就行
         self.persistent_workers = True  # 保持 worker 进程 alive，避免重复加载数据
         self.pin_memory = True          # 启用内存锁页，加速数据传输到 GPU
 
@@ -77,7 +70,7 @@ class MiCoDataModule(L.LightningDataModule):
         # 只读取 h5ad 的必要元信息，避免为了拿配置提前构建完整 dataset
         adata = ad.read_h5ad(self.h5ad_path, backed="r")
         try:
-            # 始终构建各 rank 词表，两种 embedding 模式均需要；rank_mappings 此处不需要
+            # 构建 rank 词表，两种 embedding 模式均需要；rank_mappings 此处不需要
             _, rank_vocab_sizes, _ = build_taxon_path_ids(adata.var)
         finally:
             # 及时关闭 backed 文件句柄，避免占用文件资源
@@ -97,8 +90,6 @@ class MiCoDataModule(L.LightningDataModule):
             num_abundance_bins=self.num_abundance_bins,
             min_abundance=self.min_abundance,
             abundance_mode=self.abundance_mode,
-            token_embedding_mode=self.token_embedding_mode,
-            use_taxonomy_bias=self.use_taxonomy_bias,
         )
 
         # Subset：直接使用初始化时传入的索引划分数据集
@@ -112,7 +103,7 @@ class MiCoDataModule(L.LightningDataModule):
         if self.val_dataset: stats.append(f"Val={len(self.val_dataset)}")
         if self.test_dataset: stats.append(f"Test={len(self.test_dataset)}")
         if stats:
-            rank_zero_info(f"Split stats: {', '.join(stats)}")
+            rank_zero_info(f"{TAG} Split stats: {', '.join(stats)}")
 
     # DataLoaders 构建
     def _create_dataloader(self, dataset, shuffle: bool) -> DataLoader:

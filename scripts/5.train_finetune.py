@@ -98,16 +98,6 @@ def _parse_label_values(label_values_str: str | None) -> dict[str, list[str]] | 
     return json.loads(label_values_str)
 
 
-def _get_data_params_from_ckpt(ckpt_path: str) -> dict:
-    """从预训练 checkpoint 的 hparams 中读取数据参数，确保下游与预训练一致。"""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    hp = ckpt["hyper_parameters"]
-    return {
-        "token_embedding_mode": hp.get("token_embedding_mode", "taxon_path"),
-        "use_taxonomy_bias": hp.get("use_taxonomy_bias", False),
-    }
-
-
 def run_single(
     args,
     train_indices: np.ndarray,
@@ -127,9 +117,6 @@ def run_single(
             cfg["values"] = label_values_map[field]
         label_configs.append(cfg)
 
-    # 从 checkpoint 读数据配置
-    ckpt_data_params = _get_data_params_from_ckpt(args.pretrained_ckpt)
-
     # 数据模块
     dm = ClassificationDataModule(
         h5ad_path=args.h5ad,
@@ -140,8 +127,6 @@ def run_single(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_seq_len=args.max_seq_len,
-        token_embedding_mode=ckpt_data_params["token_embedding_mode"],
-        use_taxonomy_bias=ckpt_data_params["use_taxonomy_bias"],
     )
 
     # 构建任务配置

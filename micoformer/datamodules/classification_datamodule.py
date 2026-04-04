@@ -58,8 +58,6 @@ class ClassificationDataModule(L.LightningDataModule):
         num_abundance_bins: int = 40,
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
-        token_embedding_mode: str = "taxon_path",
-        use_taxonomy_bias: bool = False,
     ) -> None:
         super().__init__()
         self.h5ad_path = h5ad_path
@@ -73,8 +71,6 @@ class ClassificationDataModule(L.LightningDataModule):
         self.num_abundance_bins = num_abundance_bins
         self.min_abundance = min_abundance
         self.abundance_mode = abundance_mode
-        self.token_embedding_mode = token_embedding_mode
-        self.use_taxonomy_bias = use_taxonomy_bias
 
         self.persistent_workers = True
         self.pin_memory = True
@@ -161,8 +157,6 @@ class ClassificationDataModule(L.LightningDataModule):
             num_abundance_bins=self.num_abundance_bins,
             min_abundance=self.min_abundance,
             abundance_mode=self.abundance_mode,
-            token_embedding_mode=self.token_embedding_mode,
-            use_taxonomy_bias=self.use_taxonomy_bias,
         )
 
         assert self._labels_array is not None
