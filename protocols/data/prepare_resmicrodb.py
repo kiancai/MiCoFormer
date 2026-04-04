@@ -1,6 +1,13 @@
-import sys
 import os
 import logging
+import sys
+from pathlib import Path
+
+# 允许从工作区根目录直接执行 `python MiCoFormer/protocols/...`
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import anndata as ad
 from micoformer.utils import build_anndata_from_files
 from micoformer.data.datasets import build_taxon_path_ids, save_taxon_vocab
@@ -11,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     # Define project root
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_root = str(PROJECT_ROOT)
 
     # 1. 物种丰度表，与 metadata 表的路径位置
     raw_abundance_file = os.path.join(project_root, "data/ResMicroDb_90338/abundance_all_90338.csv")

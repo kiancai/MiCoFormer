@@ -44,7 +44,7 @@
 #
 # **前置条件：**
 #
-# - 已完成数据预处理（`scripts/0.data_prep.py`），`data/processed/microbiome_dataset.h5ad` 存在
+# - 已完成数据预处理（`protocols/data/prepare_resmicrodb.py`），`data/processed/microbiome_dataset.h5ad` 存在
 # - conda 环境已激活（`conda activate MiCoFormerV2`）
 # - 项目已安装（`pip install -e .`）
 
@@ -73,7 +73,7 @@ H5AD = PROJECT_DIR / "data" / "processed" / "microbiome_dataset.h5ad"
 SPLITS_DIR = PROJECT_DIR / "data" / "processed" / "splits"
 
 # 日志输出目录（TensorBoard 事件、CSV 汇总表都在这里）
-LOG_DIR = PROJECT_DIR / "tmp" / "logs"
+LOG_DIR = PROJECT_DIR / "outputs" / "protocols" / "pretrain_hparam"
 
 # 确保目录存在
 SPLITS_DIR.mkdir(parents=True, exist_ok=True)
@@ -90,7 +90,7 @@ print(f"Python      : {sys.executable}")
 print("=" * 60)
 
 if not H5AD.exists():
-    print("\n[WARNING] .h5ad 文件不存在！请先运行 scripts/0.data_prep.py")
+    print("\n[WARNING] .h5ad 文件不存在！请先运行 protocols/data/prepare_resmicrodb.py")
 
 # %%
 # 检查关键依赖是否可用
@@ -143,7 +143,7 @@ for value, output_path in splits:
         continue
 
     cmd = [
-        sys.executable, str(PROJECT_DIR / "scripts" / "1.make_splits.py"),
+        sys.executable, str(PROJECT_DIR / "scripts" / "1.make_pretrain_splits.py"),
         "--h5ad", str(H5AD),
         "--field", "Split_Group",
         "--values", value,
@@ -174,7 +174,7 @@ import subprocess
 dryrun_log_dir = LOG_DIR / "dryrun"
 
 cmd = [
-    sys.executable, str(PROJECT_DIR / "scripts" / "3.hyperparam_search.py"),
+    sys.executable, str(PROJECT_DIR / "protocols" / "pretrain" / "run_hparam_search.py"),
     "--h5ad", str(H5AD),
     "--train_indices", str(SPLITS_DIR / "split_group_A.npy"),
     "--val_indices",   str(SPLITS_DIR / "split_group_B.npy"),
@@ -291,7 +291,7 @@ def build_search_cmd(
     retry_errors: bool = False,
 ) -> str:
     """
-    构建 scripts/3.hyperparam_search.py 的完整终端命令字符串。
+    构建 protocols/pretrain/run_hparam_search.py 的完整终端命令字符串。
 
     Parameters
     ----------
@@ -317,7 +317,7 @@ def build_search_cmd(
         是否只重跑 ERROR 的 trial（默认 False）
     """
     parts = [
-        f"python {PROJECT_DIR / 'scripts' / '3.hyperparam_search.py'}",
+        f"python {PROJECT_DIR / 'protocols' / 'pretrain' / 'run_hparam_search.py'}",
         f"    --h5ad {H5AD}",
         f"    --train_indices {SPLITS_DIR / 'split_group_A.npy'}",
         f"    --val_indices   {SPLITS_DIR / 'split_group_B.npy'}",
@@ -556,7 +556,7 @@ df_data = show_search_results("data")
 # ### Step 3.4 Round 2 精搜（可选）
 #
 # 如果 Round 1 的结果显示某些参数区间特别有希望，
-# 可以手动修改 `scripts/3.hyperparam_search.py` 中的 `SEARCH_SPACES` 缩小范围，
+# 可以手动修改 `protocols/pretrain/run_hparam_search.py` 中的 `SEARCH_SPACES` 缩小范围，
 # 然后用更长步数（50k）重新搜索。
 #
 # 注意换一个 `seed`，避免和 Round 1 采样到完全相同的配置。

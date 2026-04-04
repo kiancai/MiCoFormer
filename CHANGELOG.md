@@ -7,7 +7,10 @@ The format is based on Keep a Changelog, adapted for the current research workfl
 ## [Unreleased]
 
 ### Changed
-- Reserved for post-`v0.2` development on the `dev` branch.
+- Reorganized the repository into `micoformer/` library code, thin top-level `scripts/`, and `protocols/` for project-specific orchestration.
+- Added reusable `micoformer.runners` and `micoformer.cli` layers so training and protocol entrypoints share the same Python interfaces.
+- Reduced `scripts/` to the main workflow surface: pretrain split, pretrain train, finetune split, finetune train, and finetune protocol.
+- Moved ResMicroDb-specific data ingestion and pretraining hyperparameter search out of `scripts/` into `protocols/`.
 
 ## [0.2.0] - 2026-04-05
 

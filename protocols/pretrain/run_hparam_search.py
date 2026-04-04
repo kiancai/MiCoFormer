@@ -5,7 +5,7 @@
 每组使用 random search，前一组最优结果作为下一组的固定参数。
 
 用法：
-    python scripts/3.hyperparam_search.py \
+    python protocols/pretrain/run_hparam_search.py \
         --h5ad data/processed/microbiome_dataset.h5ad \
         --train_indices data/processed/splits/split_group_A.npy \
         --val_indices data/processed/splits/split_group_B.npy \
@@ -22,12 +22,19 @@ import random
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import sys
 
 import numpy as np
 import torch
 import lightning as L
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor
+
+
+# 允许从工作区根目录直接执行 `python MiCoFormer/protocols/...`
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
 from micoformer.models.pretrain_module import MiCoFormerModule
@@ -453,6 +460,7 @@ def run_single_trial(
 
     # 计算 dim_feedforward（绝对值）
     dim_feedforward = config["d_model"] * config["ff_ratio"]
+    warmup_ratio = min(float(config["warmup_steps"]) / float(args.max_steps), 0.99)
 
     # 自动精度选择
     precision = "16-mixed" if torch.cuda.is_available() else "32"
@@ -503,8 +511,8 @@ def run_single_trial(
             use_taxonomy_bias=False,
             lr=config["lr"],
             weight_decay=config["weight_decay"],
-            warmup_steps=config["warmup_steps"],
-            max_steps=args.max_steps,
+            warmup_ratio=warmup_ratio,
+            lr_scheduler="cosine",
         )
 
         # 日志目录：{log_dir}/{group_log_dir}/{run_name}
@@ -660,7 +668,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--num_trials", type=int, default=80, help="随机采样试验数")
     p.add_argument("--max_steps", type=int, default=15000, help="每次试验的训练步数")
-    p.add_argument("--log_dir", type=str, default="tmp/logs", help="日志根目录")
+    p.add_argument("--log_dir", type=str, default="outputs/protocols/pretrain_hparam", help="日志根目录")
     p.add_argument("--seed", type=int, default=42, help="随机种子")
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader 进程数")
     p.add_argument(
