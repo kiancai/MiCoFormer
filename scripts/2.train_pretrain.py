@@ -10,6 +10,9 @@ from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
 from micoformer.models.pretrain_module import MiCoFormerModule
 
 
+TAG = "[train_pretrain]"
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="MiCoFormer Stage 0 Pretraining")
 
@@ -124,7 +127,6 @@ def main():
     else:
         chosen_precision = args.precision
 
-    TAG = "[train_pretrain]"
     rank_zero_info(f"{TAG} Using precision={chosen_precision}")
 
     # 加载分割索引（由 scripts/1.make_splits.py 分别生成的 .npy 文件）
@@ -164,7 +166,7 @@ def main():
     rank_zero_info(f"{TAG} Initializing Model with d_model={args.d_model}, layers={args.num_layers}")
     rank_zero_info(f"{TAG} Token embedding mode: {args.token_embedding_mode}")
     model = MiCoFormerModule(
-        genus_vocab_size=dm.genus_vocab_size,     # taxon 模式使用；taxon_path 模式传 None 亦可
+        genus_vocab_size=dm.genus_vocab_size,
         total_abundance_bins=dm.total_abundance_bins,
         d_model=args.d_model,
         nhead=args.nhead,
@@ -183,7 +185,6 @@ def main():
         plateau_factor=args.lr_plateau_factor,
         plateau_patience=args.lr_plateau_patience,
         plateau_min_lr=args.lr_plateau_min_lr,
-        budget_mode=args.budget_mode,
     )
 
     # 3. 设置日志记录器与回调（CSV 用于离线查看，TensorBoard 用于实时监控）

@@ -39,6 +39,9 @@ class _LabelWrappedSubset:
         return item
 
 
+TAG = "[cls_datamodule]"
+
+
 class ClassificationDataModule(L.LightningDataModule):
     """下游分类任务的数据管道。复用 AnnDataDataset，在 collator 层附加标签。"""
 
@@ -180,7 +183,7 @@ class ClassificationDataModule(L.LightningDataModule):
         if self.test_dataset:
             stats.append(f"Test={len(self.test_dataset)}")
         if stats:
-            rank_zero_info(f"Classification split stats: {', '.join(stats)}")
+            rank_zero_info(f"{TAG} Split stats: {', '.join(stats)}")
 
         # 打印标签分布
         for ti, cfg in enumerate(self.task_configs):
@@ -200,7 +203,7 @@ class ClassificationDataModule(L.LightningDataModule):
                 for lid in range(cfg["num_classes"]):
                     counts[id_to_label.get(lid, str(lid))] = int((split_labels == lid).sum())
                 rank_zero_info(
-                    f"  {field} [{split_name}]: {n_valid} valid / {len(indices)} total, "
+                    f"{TAG}   {field} [{split_name}]: {n_valid} valid / {len(indices)} total, "
                     f"distribution={counts}"
                 )
 

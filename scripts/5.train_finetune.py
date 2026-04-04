@@ -33,9 +33,14 @@ import torch
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 
+from lightning.pytorch.utilities import rank_zero_info
+
 from micoformer.datamodules.classification_datamodule import ClassificationDataModule
 from micoformer.models.classification_module import MiCoFormerClassifier
 from micoformer.models.pretrain_module import MiCoFormerModule
+
+
+TAG = "[train_finetune]"
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -197,7 +202,7 @@ def run_single(
     trainer = L.Trainer(**trainer_kwargs)
 
     # 训练
-    print(f"Starting fine-tuning (log_subdir={log_subdir}) ...")
+    rank_zero_info(f"{TAG} Starting fine-tuning (log_subdir={log_subdir}) ...")
     trainer.fit(model, datamodule=dm)
 
     # 测试（如果有 test 集）
@@ -228,16 +233,16 @@ def run_kfold(args) -> None:
         if m:
             fold_indices.append(int(m.group(1)))
     fold_indices.sort()
-    print(f"Detected {len(fold_indices)} folds: {fold_indices}")
+    rank_zero_info(f"{TAG} Detected {len(fold_indices)} folds: {fold_indices}")
 
     all_results = []
     for fold_i in fold_indices:
         train_path = os.path.join(args.kfold_dir, f"fold_{fold_i}_train.npy")
         val_path = os.path.join(args.kfold_dir, f"fold_{fold_i}_val.npy")
 
-        print(f"\n{'='*60}")
-        print(f"Fold {fold_i}")
-        print(f"{'='*60}")
+        rank_zero_info(f"{TAG} {'='*50}")
+        rank_zero_info(f"{TAG} Fold {fold_i}")
+        rank_zero_info(f"{TAG} {'='*50}")
 
         train_idx = np.load(train_path)
         val_idx = np.load(val_path)
@@ -252,9 +257,9 @@ def run_kfold(args) -> None:
         all_results.append(results)
 
     # 汇总各 fold 的 val 指标
-    print(f"\n{'='*60}")
-    print("K-fold Summary")
-    print(f"{'='*60}")
+    rank_zero_info(f"{TAG} {'='*50}")
+    rank_zero_info(f"{TAG} K-fold Summary")
+    rank_zero_info(f"{TAG} {'='*50}")
 
     # 收集所有 val 指标的 key
     val_keys = set()
@@ -273,7 +278,7 @@ def run_kfold(args) -> None:
         if values:
             mean = np.mean(values)
             std = np.std(values)
-            print(f"  {key}: {mean:.4f} +/- {std:.4f}")
+            rank_zero_info(f"{TAG}   {key}: {mean:.4f} +/- {std:.4f}")
 
 
 def main():
@@ -294,12 +299,12 @@ def main():
             test_indices=test_idx,
             log_subdir="finetune",
         )
-        print("\nResults:")
+        rank_zero_info(f"{TAG} Results:")
         for split, metrics in results.items():
-            print(f"  [{split}]")
+            rank_zero_info(f"{TAG}   [{split}]")
             if isinstance(metrics, dict):
                 for k, v in sorted(metrics.items()):
-                    print(f"    {k}: {v}")
+                    rank_zero_info(f"{TAG}     {k}: {v}")
     else:
         raise ValueError("Must provide either --kfold_dir or --train_indices + --val_indices")
 
