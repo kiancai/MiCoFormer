@@ -1,7 +1,7 @@
 """
-scripts/5.run_finetune_protocol.py — MiCoFormer 微调协议编排脚本
+scripts/4.run_finetune_protocol.py — MiCoFormer 微调协议编排脚本
 
-在 scripts/4.train_finetune.py 的基础上提供更高层的���议编排：
+在 scripts/3.train_finetune.py 的基础上提供更高层的协议编排：
   - kfold: 自动检测 fold 文件，循环训练并汇总
   - holdout: 显式 train/val 切分，可选 test
   - ood: 显式 train/val/test 切分，test 评估由协议统一负责
@@ -9,7 +9,7 @@ scripts/5.run_finetune_protocol.py — MiCoFormer 微调协议编排脚本
 使用示例：
 
   # K-fold 协议
-  python scripts/5.run_finetune_protocol.py \
+  python scripts/4.run_finetune_protocol.py \
       --protocol kfold \
       --kfold_dir data/processed/splits/finetune/kfold/ \
       --h5ad_path data/processed/microbiome_dataset.h5ad \
@@ -17,7 +17,7 @@ scripts/5.run_finetune_protocol.py — MiCoFormer 微调协议编排脚本
       --label_fields Phenotype
 
   # OOD 协议
-  python scripts/5.run_finetune_protocol.py \
+  python scripts/4.run_finetune_protocol.py \
       --protocol ood \
       --h5ad_path data/processed/microbiome_dataset.h5ad \
       --pretrained_ckpt outputs/pretrain/checkpoints/best.ckpt \

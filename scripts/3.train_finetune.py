@@ -1,5 +1,5 @@
 """
-scripts/4.train_finetune.py — MiCoFormer 下游分类微调入口脚本
+scripts/3.train_finetune.py — MiCoFormer 下游分类微调入口脚本
 
 支持两种模式：
   - 单次模式：显式提供 --train_indices_path 和 --val_indices_path
@@ -8,7 +8,7 @@ scripts/4.train_finetune.py — MiCoFormer 下游分类微调入口脚本
 使用示例：
 
   # 单次微调
-  python scripts/4.train_finetune.py \
+  python scripts/3.train_finetune.py \
       --h5ad_path data/processed/microbiome_dataset.h5ad \
       --pretrained_ckpt outputs/pretrain/checkpoints/best.ckpt \
       --train_indices_path data/processed/splits/finetune/fold_0_train.npy \
@@ -16,7 +16,7 @@ scripts/4.train_finetune.py — MiCoFormer 下游分类微调入口脚本
       --label_fields Phenotype
 
   # K-fold 微调
-  python scripts/4.train_finetune.py \
+  python scripts/3.train_finetune.py \
       --h5ad_path data/processed/microbiome_dataset.h5ad \
       --pretrained_ckpt outputs/pretrain/checkpoints/best.ckpt \
       --kfold_dir data/processed/splits/finetune/ \

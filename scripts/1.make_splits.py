@@ -1,5 +1,5 @@
 """
-scripts/make_splits.py — 统一的数据切分 CLI
+scripts/1.make_splits.py — 统一的数据切分 CLI
 
 三种分配策略（--strategy）：
   - single : 按 filters 筛选 → 单个 .npy（pretrain 单 split / finetune holdout 均可）
@@ -13,13 +13,13 @@ scripts/make_splits.py — 统一的数据切分 CLI
 使用示例：
 
   # 1) pretrain 单 split：选 Split_Group=A 做训练集
-  python scripts/make_splits.py --strategy single \\
+  python scripts/1.make_splits.py --strategy single \\
       --h5ad data/processed/microbiome_dataset.h5ad \\
       --filters "Split_Group=A" \\
       --output data/processed/splits/pretrain_train.npy
 
   # 2) finetune 单 study 内 5-fold
-  python scripts/make_splits.py --strategy kfold \\
+  python scripts/1.make_splits.py --strategy kfold \\
       --h5ad data/processed/microbiome_dataset.h5ad \\
       --filters "Project_ID=PRJNA123456" \\
       --label-field Phenotype --label-values Health Disease \\
@@ -27,21 +27,21 @@ scripts/make_splits.py — 统一的数据切分 CLI
       --output data/processed/splits/finetune/kfold_PRJNA123456/
 
   # 3) OOD 跨 group 评估
-  python scripts/make_splits.py --strategy ood \\
+  python scripts/1.make_splits.py --strategy ood \\
       --h5ad data/processed/microbiome_dataset.h5ad \\
       --subset-filters train:"Split_Group=A" val:"Split_Group=B" test:"Split_Group=C" \\
       --label-field Phenotype --label-values Health Disease \\
       --output data/processed/splits/finetune/ood_ABC/
 
   # 4) finetune holdout（新增能力）：单次 train/val 切分
-  python scripts/make_splits.py --strategy single \\
+  python scripts/1.make_splits.py --strategy single \\
       --h5ad data/processed/microbiome_dataset.h5ad \\
       --filters "Project_ID=PRJNA123456" \\
       --label-field Phenotype --label-values Health Disease \\
       --output data/processed/splits/finetune/holdout_train.npy
 
   # 5) pretrain 时加 label 过滤（新增能力）：只用健康样本做预训练
-  python scripts/make_splits.py --strategy single \\
+  python scripts/1.make_splits.py --strategy single \\
       --h5ad data/processed/microbiome_dataset.h5ad \\
       --filters "Split_Group=A" \\
       --label-field Phenotype --label-values Health \\
