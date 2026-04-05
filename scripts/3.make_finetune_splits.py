@@ -1,5 +1,5 @@
 """
-scripts/4.make_finetune_splits.py — 生成下游分类任务的分割索引
+scripts/3.make_finetune_splits.py — 生成下游分类任务的分割索引
 
 两种模式：
   - kfold: 单 study 内 Stratified K-fold
@@ -8,7 +8,7 @@ scripts/4.make_finetune_splits.py — 生成下游分类任务的分割索引
 使用示例：
 
   # K-fold（单 study 内 5 折交叉验证）
-  python scripts/4.make_finetune_splits.py \
+  python scripts/3.make_finetune_splits.py \
       --h5ad data/processed/microbiome_dataset.h5ad \
       --mode kfold \
       --filter_field Project_ID --filter_values PRJNA123456 \
@@ -17,7 +17,7 @@ scripts/4.make_finetune_splits.py — 生成下游分类任务的分割索引
       --output_dir data/processed/splits/finetune/kfold_PRJNA123456/
 
   # OOD（跨 study 泛化评估）
-  python scripts/4.make_finetune_splits.py \
+  python scripts/3.make_finetune_splits.py \
       --h5ad data/processed/microbiome_dataset.h5ad \
       --mode ood \
       --train_field Split_Group --train_values A \
@@ -30,11 +30,8 @@ scripts/4.make_finetune_splits.py — 生成下游分类任务的分割索引
 from __future__ import annotations
 
 import argparse
-import os
 
-import anndata as ad
-import numpy as np
-from sklearn.model_selection import StratifiedKFold
+from micoformer.workflows.splits import make_finetune_kfold, make_finetune_ood
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -70,129 +67,33 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def _filter_by_label(
-    obs_col: np.ndarray,
-    indices: np.ndarray,
-    label_values: list[str] | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """过滤有效标签样本，返回 (filtered_indices, labels_for_filtered)。"""
-    col_str = np.array([str(v).strip() for v in obs_col[indices]])
-
-    if label_values is not None:
-        valid_set = set(label_values)
-        mask = np.array([v in valid_set for v in col_str])
-    else:
-        # 排除 NaN/None 等
-        mask = np.array([v.lower() not in ("nan", "none", "<na>", "") for v in col_str])
-
-    filtered = indices[mask]
-    labels = col_str[mask]
-    return filtered, labels
-
-
-def run_kfold(args) -> None:
-    print(f"Reading obs from {args.h5ad} ...")
-    adata = ad.read_h5ad(args.h5ad, backed="r")
-    try:
-        obs = adata.obs
-        n_total = len(obs)
-
-        # Step 1: 按 filter_field 筛选样本
-        if args.filter_field is not None:
-            if args.filter_field not in obs.columns:
-                raise ValueError(f"filter_field '{args.filter_field}' not in obs")
-            field_vals = obs[args.filter_field].to_numpy()
-            candidate_mask = np.isin(np.array([str(v) for v in field_vals]), args.filter_values)
-            candidate_indices = np.where(candidate_mask)[0]
-            print(f"Filtered by {args.filter_field}={args.filter_values}: {len(candidate_indices)} / {n_total}")
-        else:
-            candidate_indices = np.arange(n_total)
-
-        # Step 2: 按 label_field 筛选有效标签
-        label_col = obs[args.label_field].to_numpy()
-        indices, labels = _filter_by_label(label_col, candidate_indices, args.label_values)
-        print(f"After label filtering ({args.label_field}): {len(indices)} samples")
-
-        if len(indices) == 0:
-            raise ValueError("No valid samples after filtering.")
-
-        # 打印类别分布
-        unique, counts = np.unique(labels, return_counts=True)
-        for u, c in zip(unique, counts):
-            print(f"  {u}: {c}")
-    finally:
-        if getattr(adata, "file", None) is not None:
-            adata.file.close()
-
-    # Step 3: Stratified K-fold
-    skf = StratifiedKFold(n_splits=args.num_folds, shuffle=True, random_state=args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    for fold_i, (train_idx, val_idx) in enumerate(skf.split(indices, labels)):
-        train_global = indices[train_idx]
-        val_global = indices[val_idx]
-
-        train_path = os.path.join(args.output_dir, f"fold_{fold_i}_train.npy")
-        val_path = os.path.join(args.output_dir, f"fold_{fold_i}_val.npy")
-        np.save(train_path, train_global)
-        np.save(val_path, val_global)
-        print(f"Fold {fold_i}: train={len(train_global)}, val={len(val_global)} -> {train_path}")
-
-    print(f"Done. {args.num_folds} folds saved to {args.output_dir}")
-
-
-def run_ood(args) -> None:
-    print(f"Reading obs from {args.h5ad} ...")
-    adata = ad.read_h5ad(args.h5ad, backed="r")
-    try:
-        obs = adata.obs
-        label_col = obs[args.label_field].to_numpy()
-
-        splits = {}
-        for split_name, field, values in [
-            ("train", args.train_field, args.train_values),
-            ("val", args.val_field, args.val_values),
-            ("test", args.test_field, args.test_values),
-        ]:
-            if field is None or values is None:
-                if split_name in ("train", "val"):
-                    raise ValueError(f"--{split_name}_field and --{split_name}_values are required for OOD mode")
-                continue
-
-            if field not in obs.columns:
-                raise ValueError(f"{split_name}_field '{field}' not in obs")
-
-            field_vals = obs[field].to_numpy()
-            candidate_mask = np.isin(np.array([str(v) for v in field_vals]), values)
-            candidate_indices = np.where(candidate_mask)[0]
-
-            # 过滤有效标签
-            filtered, labels = _filter_by_label(label_col, candidate_indices, args.label_values)
-            splits[split_name] = filtered
-
-            unique, counts = np.unique(labels, return_counts=True)
-            dist_str = ", ".join(f"{u}={c}" for u, c in zip(unique, counts))
-            print(f"{split_name}: {len(filtered)} samples ({dist_str})")
-    finally:
-        if getattr(adata, "file", None) is not None:
-            adata.file.close()
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    for split_name, indices in splits.items():
-        path = os.path.join(args.output_dir, f"{split_name}.npy")
-        np.save(path, indices)
-        print(f"Saved {split_name} ({len(indices)}) -> {path}")
-
-    print(f"Done. OOD splits saved to {args.output_dir}")
-
-
 def main():
     args = build_argparser().parse_args()
 
     if args.mode == "kfold":
-        run_kfold(args)
+        make_finetune_kfold(
+            h5ad=args.h5ad,
+            label_field=args.label_field,
+            label_values=args.label_values,
+            output_dir=args.output_dir,
+            filter_field=args.filter_field,
+            filter_values=args.filter_values,
+            num_folds=args.num_folds,
+            seed=args.seed,
+        )
     elif args.mode == "ood":
-        run_ood(args)
+        make_finetune_ood(
+            h5ad=args.h5ad,
+            label_field=args.label_field,
+            label_values=args.label_values,
+            output_dir=args.output_dir,
+            train_field=args.train_field,
+            train_values=args.train_values,
+            val_field=args.val_field,
+            val_values=args.val_values,
+            test_field=args.test_field,
+            test_values=args.test_values,
+        )
 
 
 if __name__ == "__main__":
