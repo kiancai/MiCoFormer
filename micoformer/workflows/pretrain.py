@@ -20,26 +20,26 @@ TAG = "[train_pretrain]"
 
 @dataclass
 class PretrainRunConfig:
-    # 数据路径
+    # 0. 输入与切分参数
     h5ad_path: str
 
-    # 模型版本开关
+    # 1. 模型版本开关
     token_embedding_mode: str = "taxon_path"
     use_taxonomy_bias: bool = False
 
-    # 模型主体参数
+    # 2.1. 模型主体参数
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 6
     ff_dim: int = 1024
     num_abundance_bins: int = 40
 
-    # 数据协议参数
+    # 2.2. 模型主体参数的协议参数
     abundance_mode: str = "abs_log_bins"
     min_abundance: float = 4e-6
     max_seq_len: int = 1024
 
-    # 训练参数
+    # 3.1. 预训练中的训练主体参数
     batch_size: int = 32
     mask_prob: float = 0.15
     dropout: float = 0.1
@@ -47,13 +47,13 @@ class PretrainRunConfig:
     weight_decay: float = 1e-2
     warmup_ratio: float = 0.02
 
-    # 学习率调度
+    # 3.2. 预训练中的协议参数
     lr_scheduler_type: str = "cosine"
     lr_plateau_factor: float = 0.5
     lr_plateau_patience: int = 2
     lr_plateau_min_lr: float = 1e-6
 
-    # 预算与验证
+    # 4. 预算与验证协议参数
     budget_mode: str = "epoch"
     max_epochs: int | None = None
     max_steps: int | None = None
@@ -62,7 +62,7 @@ class PretrainRunConfig:
     limit_train_batches: float = 1.0
     limit_val_batches: float = 1.0
 
-    # 运行参数
+    # 5. 运行与工程参数
     devices: int = 1
     precision: str = "auto"
     seed: int = 42
@@ -107,12 +107,13 @@ def validate_pretrain_config(config: PretrainRunConfig) -> None:
 
 
 def _choose_precision(precision: str) -> str:
-    """自动根据设备选择精度"""
+    # 自动根据设备选择精度
     if precision == "auto":
         return "16-mixed" if torch.cuda.is_available() else "32"
     return precision
 
 
+# 执行一次完整的预训练流程，返回结果字典
 def run_pretrain_once(
     config: PretrainRunConfig,
     train_indices: np.ndarray,
@@ -120,7 +121,6 @@ def run_pretrain_once(
     *,
     log_subdir: str = "pretrain_stage0",
 ) -> dict[str, object]:
-    """执行一次完整的预训练流程，返回结果字典"""
     validate_pretrain_config(config)
     L.seed_everything(config.seed, workers=True)
 

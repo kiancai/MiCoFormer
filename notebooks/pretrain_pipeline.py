@@ -145,8 +145,7 @@ for value, output_path in splits:
     cmd = [
         sys.executable, str(PROJECT_DIR / "scripts" / "1.make_splits.py"),
         "--h5ad", str(H5AD),
-        "--field", "Split_Group",
-        "--values", value,
+        "--filters", f"Split_Group={value}",
         "--output", str(output_path),
     ]
     print(f"Generating {output_path.name} ...")
