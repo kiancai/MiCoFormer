@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import glob
 import json
 import os
-import re
+import time
 from dataclasses import dataclass
 
 import lightning as L
@@ -22,74 +21,136 @@ from micoformer.models.classification_module import MiCoFormerClassifier
 TAG = "[train_finetune]"
 
 
+_VALID_POOLING_MODES = {"sample", "mean_pool", "sample_and_mean"}
+
+
 @dataclass
 class FinetuneRunConfig:
-    # 数据路径
+    # 0. 输入与切分参数
     h5ad_path: str
     pretrained_ckpt: str
 
-    # 分类模型参数
+    # 1. 分类头 / pooling 参数
     pooling_mode: str = "mean_pool"
     head_hidden_dim: int = 0
     head_dropout: float = 0.1
     freeze_encoder: bool = False
 
-    # 训练参数
+    # 2.1. 数据协议参数
+    batch_size: int = 32
+    max_seq_len: int = 1024
+
+    # 3.1. 微调训练主体参数
     lr_head: float = 1e-3
     lr_encoder: float = 1e-5
     weight_decay: float = 1e-2
-    warmup_steps: int = 200
-    max_steps: int = 10000
-    max_epochs: int = 100
+    warmup_ratio: float = 0.1
 
-    # 验证与早停
-    patience: int = 10
-    val_check_interval: int | None = None
-    gradient_clip_val: float = 1.0
+    # 3.2. 微调协议参数
+    # lr_scheduler_type 决定学习率下降方式：
+    # - cosine：warmup 后按 cosine 平滑衰减
+    # - plateau：warmup 后根据监控指标（默认 val/{task}/f1_macro）是否停滞来自动降 LR
+    lr_scheduler_type: str = "cosine"
+    lr_plateau_factor: float = 0.5
+    lr_plateau_patience: int = 2
+    lr_plateau_min_lr: float = 1e-6
 
-    # 运行参数
-    batch_size: int = 32
-    num_workers: int = 4
-    max_seq_len: int = 1024
+    # 4. 预算与验证协议参数
+    # budget_mode 决定"训练预算"的单位：
+    # - epoch：更适合当前这种数据规模不算特别大的实验
+    # - step：更适合超大数据集或只想固定 optimizer 更新次数的场景
+    budget_mode: str = "epoch"
+    max_epochs: int | None = None
+    max_steps: int | None = None
+    val_interval_epochs: int | None = None
+    val_interval_steps: int | None = None
+    early_stopping_patience: int = 10
+    early_stopping_min_delta: float = 0.0
+
+    # 5. 运行与工程参数
     devices: int = 1
     precision: str = "auto"
     seed: int = 42
+    num_workers: int = 4
     log_dir: str = "tmp/logs/finetune"
     no_progress_bar: bool = False
 
 
 def validate_finetune_config(config: FinetuneRunConfig) -> None:
     """检验微调配置的合法性"""
+    # 分类头参数：基础正整性
+    if config.pooling_mode not in _VALID_POOLING_MODES:
+        raise ValueError(
+            f"pooling_mode must be one of {sorted(_VALID_POOLING_MODES)}, "
+            f"got {config.pooling_mode!r}."
+        )
     if config.head_hidden_dim < 0:
-        raise ValueError("head_hidden_dim must be >= 0.")
+        raise ValueError(f"head_hidden_dim must be >= 0, got {config.head_hidden_dim}.")
     if not 0.0 <= config.head_dropout < 1.0:
         raise ValueError("head_dropout must satisfy 0 <= head_dropout < 1.")
+
+    # 数据协议参数
+    if config.batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {config.batch_size}.")
+    if config.max_seq_len < 1:
+        raise ValueError(f"max_seq_len must be >= 1, got {config.max_seq_len}.")
+
+    # 训练协议参数
     if config.lr_head <= 0:
-        raise ValueError("lr_head must be > 0.")
+        raise ValueError(f"lr_head must be > 0, got {config.lr_head}.")
     if config.lr_encoder <= 0:
-        raise ValueError("lr_encoder must be > 0.")
+        raise ValueError(f"lr_encoder must be > 0, got {config.lr_encoder}.")
     if config.weight_decay < 0:
-        raise ValueError("weight_decay must be >= 0.")
-    if config.warmup_steps < 0:
-        raise ValueError("warmup_steps must be >= 0.")
-    if config.max_steps <= 0:
-        raise ValueError("max_steps must be > 0.")
-    if config.max_epochs <= 0:
-        raise ValueError("max_epochs must be > 0.")
-    if config.patience < 0:
-        raise ValueError("patience must be >= 0.")
-    if config.val_check_interval is not None and config.val_check_interval <= 0:
-        raise ValueError("val_check_interval must be > 0 when provided.")
-    if config.gradient_clip_val < 0:
-        raise ValueError("gradient_clip_val must be >= 0.")
-    if config.batch_size <= 0:
-        raise ValueError("batch_size must be > 0.")
-    if config.num_workers < 0:
-        raise ValueError("num_workers must be >= 0.")
-    if config.max_seq_len <= 0:
-        raise ValueError("max_seq_len must be > 0.")
-    if config.devices <= 0:
-        raise ValueError("devices must be > 0.")
+        raise ValueError(f"weight_decay must be >= 0, got {config.weight_decay}.")
+    if not 0.0 <= config.warmup_ratio < 1.0:
+        raise ValueError("warmup_ratio must satisfy 0 <= warmup_ratio < 1.")
+
+    if not 0.0 < config.lr_plateau_factor < 1.0:
+        raise ValueError("lr_plateau_factor must satisfy 0 < lr_plateau_factor < 1.")
+    if config.lr_plateau_patience < 0:
+        raise ValueError("lr_plateau_patience must be >= 0.")
+    if config.lr_plateau_min_lr < 0:
+        raise ValueError("lr_plateau_min_lr must be >= 0.")
+
+    # 预算模式互斥
+    if config.budget_mode not in ("epoch", "step"):
+        raise ValueError(
+            f"budget_mode must be 'epoch' or 'step', got {config.budget_mode!r}."
+        )
+
+    # plateau scheduler 与 step 预算不兼容：plateau 按 epoch 触发，
+    # step 模式下验证可能跨 epoch 触发，调度时机会错位
+    if config.lr_scheduler_type == "plateau" and config.budget_mode == "step":
+        raise ValueError(
+            "lr_scheduler_type='plateau' is incompatible with budget_mode='step' "
+            "(plateau steps per epoch, step-budget validates mid-epoch). "
+            "Use budget_mode='epoch' with plateau, or use lr_scheduler_type='cosine' with step budget."
+        )
+
+    if config.budget_mode == "epoch":
+        if config.max_epochs is None or config.max_epochs <= 0:
+            raise ValueError("max_epochs must be provided and > 0 when budget_mode=epoch.")
+        if config.val_interval_epochs is None or config.val_interval_epochs <= 0:
+            raise ValueError("val_interval_epochs must be provided and > 0 when budget_mode=epoch.")
+        if config.max_steps is not None:
+            raise ValueError("max_steps is step-mode only. Do not pass it when budget_mode=epoch.")
+        if config.val_interval_steps is not None:
+            raise ValueError("val_interval_steps is step-mode only. Do not pass it when budget_mode=epoch.")
+    else:
+        if config.max_steps is None or config.max_steps <= 0:
+            raise ValueError("max_steps must be provided and > 0 when budget_mode=step.")
+        if config.val_interval_steps is None or config.val_interval_steps <= 0:
+            raise ValueError("val_interval_steps must be provided and > 0 when budget_mode=step.")
+        if config.max_epochs is not None:
+            raise ValueError("max_epochs is epoch-mode only. Do not pass it when budget_mode=step.")
+        if config.val_interval_epochs is not None:
+            raise ValueError("val_interval_epochs is epoch-mode only. Do not pass it when budget_mode=step.")
+
+    # Early stopping 协议参数
+    if config.early_stopping_patience < 0:
+        raise ValueError("early_stopping_patience must be >= 0 (0 disables early stopping).")
+    if config.early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be >= 0.")
 
 
 def parse_label_values(label_values_str: str | None) -> dict[str, list[str]] | None:
@@ -132,14 +193,10 @@ def build_label_configs(
 
 
 def _choose_precision(precision: str) -> str:
+    # 自动根据设备选择精度
     if precision == "auto":
         return "16-mixed" if torch.cuda.is_available() else "32"
     return precision
-
-
-def _load_indices(indices_path: str, split_name: str) -> np.ndarray:
-    rank_zero_info(f"{TAG} Loading {split_name} indices from {indices_path} ...")
-    return np.load(indices_path)
 
 
 def _extract_scalar_metrics(metrics: dict) -> dict[str, float | int]:
@@ -151,6 +208,7 @@ def _extract_scalar_metrics(metrics: dict) -> dict[str, float | int]:
     return extracted
 
 
+# 执行一次完整的微调流程，返回结果字典
 def run_finetune_once(
     config: FinetuneRunConfig,
     train_indices: np.ndarray,
@@ -158,17 +216,72 @@ def run_finetune_once(
     test_indices: np.ndarray | None,
     label_configs: list[dict[str, object]],
     *,
-    log_subdir: str = "finetune",
+    log_subdir: str = "finetune_stage0",
 ) -> dict[str, dict[str, float | int]]:
-    """执行一次完整的微调流程，返回结果字典"""
     validate_finetune_config(config)
     L.seed_everything(config.seed, workers=True)
 
+    # 索引越界 sanity check：避免使用了和 h5ad 不匹配的 splits 文件
+    # （读元信息只用 backed 模式，不把 X 加载进内存）
+    import anndata as ad
+    _peek_adata = ad.read_h5ad(config.h5ad_path, backed="r")
+    try:
+        n_obs = int(_peek_adata.n_obs)
+    finally:
+        if getattr(_peek_adata, "file", None) is not None:
+            _peek_adata.file.close()
+
+    train_arr = np.asarray(train_indices)
+    val_arr = np.asarray(val_indices)
+    if train_arr.size == 0:
+        raise ValueError("train_indices is empty.")
+    if val_arr.size == 0:
+        raise ValueError("val_indices is empty.")
+    if int(train_arr.min()) < 0 or int(train_arr.max()) >= n_obs:
+        raise ValueError(
+            f"train_indices out of range [0, {n_obs}): "
+            f"min={int(train_arr.min())}, max={int(train_arr.max())}. "
+            f"Splits .npy probably comes from a different h5ad."
+        )
+    if int(val_arr.min()) < 0 or int(val_arr.max()) >= n_obs:
+        raise ValueError(
+            f"val_indices out of range [0, {n_obs}): "
+            f"min={int(val_arr.min())}, max={int(val_arr.max())}. "
+            f"Splits .npy probably comes from a different h5ad."
+        )
+    if test_indices is not None:
+        test_arr = np.asarray(test_indices)
+        if test_arr.size == 0:
+            raise ValueError("test_indices is empty.")
+        if int(test_arr.min()) < 0 or int(test_arr.max()) >= n_obs:
+            raise ValueError(
+                f"test_indices out of range [0, {n_obs}): "
+                f"min={int(test_arr.min())}, max={int(test_arr.max())}. "
+                f"Splits .npy probably comes from a different h5ad."
+            )
+
     chosen_precision = _choose_precision(config.precision)
     rank_zero_info(f"{TAG} Using precision={chosen_precision}")
-    rank_zero_info(f"{TAG} Train: {len(train_indices)}, Val: {len(val_indices)}")
-    if test_indices is not None:
-        rank_zero_info(f"{TAG} Test: {len(test_indices)}")
+    rank_zero_info(
+        f"{TAG} Train: {len(train_indices)}, Val: {len(val_indices)}"
+        + (f", Test: {len(test_indices)}" if test_indices is not None else "")
+        + f" (n_obs={n_obs})"
+    )
+    rank_zero_info(f"{TAG} Budget mode: {config.budget_mode}")
+    if config.budget_mode == "epoch":
+        rank_zero_info(
+            f"{TAG} Max epochs: {config.max_epochs}, "
+            f"val_interval_epochs={config.val_interval_epochs}"
+        )
+    else:
+        rank_zero_info(
+            f"{TAG} Max steps: {config.max_steps}, "
+            f"val_interval_steps={config.val_interval_steps}"
+        )
+    rank_zero_info(
+        f"{TAG} LR scheduler: {config.lr_scheduler_type}, "
+        f"warmup_ratio={config.warmup_ratio}"
+    )
 
     # 1. 初始化数据模块
     rank_zero_info(f"{TAG} Initializing DataModule...")
@@ -188,12 +301,15 @@ def run_finetune_once(
         {"name": cfg["field"], "num_classes": cfg["num_classes"]}
         for cfg in dm.task_configs
     ]
+    primary_task = task_configs[0]["name"]
+    monitor_metric = f"val/{primary_task}/f1_macro"
 
     # 3. 初始化分类模型
     rank_zero_info(
         f"{TAG} Initializing classifier with pooling={config.pooling_mode}, "
         f"freeze_encoder={config.freeze_encoder}"
     )
+    rank_zero_info(f"{TAG} Monitor metric: {monitor_metric}")
     model = MiCoFormerClassifier(
         pretrained_ckpt_path=config.pretrained_ckpt,
         task_configs=task_configs,
@@ -204,54 +320,63 @@ def run_finetune_once(
         lr_head=config.lr_head,
         lr_encoder=config.lr_encoder,
         weight_decay=config.weight_decay,
-        warmup_steps=config.warmup_steps,
-        max_steps=config.max_steps,
+        warmup_ratio=config.warmup_ratio,
+        lr_scheduler=config.lr_scheduler_type,
+        plateau_factor=config.lr_plateau_factor,
+        plateau_patience=config.lr_plateau_patience,
+        plateau_min_lr=config.lr_plateau_min_lr,
+        monitor_metric=monitor_metric,
     )
 
     # 4. 设置日志记录器与回调
-    csv_logger = CSVLogger(save_dir=config.log_dir, name=log_subdir)
-    tb_logger = TensorBoardLogger(save_dir=config.log_dir, name=log_subdir)
+    # 显式锁定 version：让 CSVLogger 与 TensorBoardLogger 共享同一个 version 字符串，
+    # 避免两者各自自增、出现 version_3 / version_5 错位
+    run_version = time.strftime("run_%Y%m%d_%H%M%S")
+    csv_logger = CSVLogger(save_dir=config.log_dir, name=log_subdir, version=run_version)
+    tb_logger = TensorBoardLogger(save_dir=config.log_dir, name=log_subdir, version=run_version)
 
-    primary_task = task_configs[0]["name"]
-    monitor_metric = f"val/{primary_task}/f1_macro"
-    rank_zero_info(f"{TAG} Monitor metric: {monitor_metric}")
-
+    # 显式指定 dirpath，避免依赖 "第一个 logger 的 save_dir" 这种隐式行为
+    ckpt_dir = os.path.join(config.log_dir, log_subdir, run_version, "checkpoints")
+    # 注意：filename 中不能包含 monitor 的 'val/{task}/f1_macro'，否则斜杠会被当作子目录创建
     checkpoint_callback = ModelCheckpoint(
+        dirpath=ckpt_dir,
         monitor=monitor_metric,
         mode="max",
-        save_top_k=1,
-        filename="best-{epoch:02d}",
+        save_top_k=3,
+        save_last=True,
+        auto_insert_metric_name=False,
+        filename="micoformer-epoch{epoch:02d}",
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
     callbacks = [checkpoint_callback, lr_monitor]
-    if config.patience > 0:
+    if config.early_stopping_patience > 0:
         callbacks.append(
-            EarlyStopping(monitor=monitor_metric, mode="max", patience=config.patience)
+            EarlyStopping(
+                monitor=monitor_metric,
+                mode="max",
+                patience=config.early_stopping_patience,
+                min_delta=config.early_stopping_min_delta,
+            )
         )
 
     # 5. 初始化 Trainer
-    rank_zero_info(
-        f"{TAG} Training budget: max_epochs={config.max_epochs}, "
-        f"max_steps={config.max_steps}"
-    )
-    if config.val_check_interval is not None:
-        rank_zero_info(f"{TAG} Validation interval (steps): {config.val_check_interval}")
-
     trainer_kwargs = dict(
-        max_epochs=config.max_epochs,
-        max_steps=config.max_steps,
         devices=config.devices,
         precision=chosen_precision,
-        gradient_clip_val=config.gradient_clip_val,
         logger=[csv_logger, tb_logger],
         callbacks=callbacks,
         default_root_dir=config.log_dir,
     )
+    if config.budget_mode == "epoch":
+        trainer_kwargs["max_epochs"] = config.max_epochs
+        trainer_kwargs["check_val_every_n_epoch"] = config.val_interval_epochs
+    else:
+        trainer_kwargs["max_epochs"] = -1
+        trainer_kwargs["max_steps"] = config.max_steps
+        trainer_kwargs["val_check_interval"] = config.val_interval_steps
     if config.no_progress_bar:
         trainer_kwargs["enable_progress_bar"] = False
-    if config.val_check_interval is not None:
-        trainer_kwargs["val_check_interval"] = config.val_check_interval
 
     trainer = L.Trainer(**trainer_kwargs)
 
@@ -269,69 +394,9 @@ def run_finetune_once(
     if trainer.callback_metrics:
         results["val"] = _extract_scalar_metrics(trainer.callback_metrics)
 
-    return results
-
-
-def run_kfold(
-    config: FinetuneRunConfig,
-    kfold_dir: str,
-    label_configs: list[dict[str, object]],
-) -> list[dict[str, dict[str, float | int]]]:
-    """自动检测 kfold_dir 中的 fold 文件并循环训练，返回各 fold 结果"""
-    pattern = os.path.join(kfold_dir, "fold_*_train.npy")
-    train_files = sorted(glob.glob(pattern))
-    if not train_files:
-        raise FileNotFoundError(f"No fold files found matching {pattern}")
-
-    fold_indices = []
-    for train_file in train_files:
-        match = re.search(r"fold_(\d+)_train\.npy", os.path.basename(train_file))
-        if match:
-            fold_indices.append(int(match.group(1)))
-    fold_indices.sort()
-
-    rank_zero_info(f"{TAG} Detected {len(fold_indices)} folds: {fold_indices}")
-
-    all_results = []
-    for fold_i in fold_indices:
-        train_path = os.path.join(kfold_dir, f"fold_{fold_i}_train.npy")
-        val_path = os.path.join(kfold_dir, f"fold_{fold_i}_val.npy")
-
-        rank_zero_info(f"{TAG} {'=' * 50}")
-        rank_zero_info(f"{TAG} Fold {fold_i}")
-        rank_zero_info(f"{TAG} {'=' * 50}")
-
-        train_indices = _load_indices(train_path, f"fold_{fold_i} train")
-        val_indices = _load_indices(val_path, f"fold_{fold_i} val")
-
-        results = run_finetune_once(
-            config,
-            train_indices=train_indices,
-            val_indices=val_indices,
-            test_indices=None,
-            label_configs=label_configs,
-            log_subdir=f"fold_{fold_i}",
+    rank_zero_info(f"{TAG} Best checkpoint: {checkpoint_callback.best_model_path}")
+    if checkpoint_callback.best_model_score is not None:
+        rank_zero_info(
+            f"{TAG} Best {monitor_metric}: {checkpoint_callback.best_model_score.item():.6f}"
         )
-        all_results.append(results)
-
-    # 汇总各 fold 的验证指标
-    rank_zero_info(f"{TAG} {'=' * 50}")
-    rank_zero_info(f"{TAG} K-fold Summary")
-    rank_zero_info(f"{TAG} {'=' * 50}")
-
-    val_keys: set[str] = set()
-    for result in all_results:
-        if "val" in result:
-            val_keys.update(result["val"].keys())
-
-    for key in sorted(val_keys):
-        values = []
-        for result in all_results:
-            if "val" in result and key in result["val"]:
-                values.append(result["val"][key])
-        if values:
-            mean = np.mean(values)
-            std = np.std(values)
-            rank_zero_info(f"{TAG}   {key}: {mean:.4f} +/- {std:.4f}")
-
-    return all_results
+    return results

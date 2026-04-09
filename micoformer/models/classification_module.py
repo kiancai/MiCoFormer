@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import lightning as L
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 from torchmetrics import MetricCollection
 from torchmetrics.classification import (
     MulticlassAccuracy,
@@ -33,8 +33,12 @@ class MiCoFormerClassifier(L.LightningModule):
         lr_head: float = 1e-3,
         lr_encoder: float = 1e-5,
         weight_decay: float = 1e-2,
-        warmup_steps: int = 200,
-        max_steps: int = 10000,
+        warmup_ratio: float = 0.1,
+        lr_scheduler: str = "cosine",
+        plateau_factor: float = 0.5,
+        plateau_patience: int = 2,
+        plateau_min_lr: float = 1e-6,
+        monitor_metric: str = "val/loss",
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -151,7 +155,15 @@ class MiCoFormerClassifier(L.LightningModule):
             if n_valid > 0:
                 has_loss = True
                 total_loss = total_loss + loss
-                self.log(f"{split}/{name}/loss", loss, prog_bar=True, on_epoch=True, batch_size=int(n_valid))
+                # sync_dist=True：多 GPU 时跨 rank 聚合 val/test 指标
+                self.log(
+                    f"{split}/{name}/loss",
+                    loss,
+                    prog_bar=True,
+                    on_epoch=True,
+                    batch_size=int(n_valid),
+                    sync_dist=(split in ("val", "test")),
+                )
 
                 # 更新 torchmetrics（只在 val/test 时）
                 if split in ("val", "test"):
@@ -171,7 +183,13 @@ class MiCoFormerClassifier(L.LightningModule):
             # 极端情况：batch 中所有任务都无有效标签
             total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
-        self.log(f"{split}/loss_total", total_loss, prog_bar=(split == "train"), on_epoch=True)
+        self.log(
+            f"{split}/loss_total",
+            total_loss,
+            prog_bar=(split == "train"),
+            on_epoch=True,
+            sync_dist=(split in ("val", "test")),
+        )
         return total_loss
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
@@ -194,7 +212,15 @@ class MiCoFormerClassifier(L.LightningModule):
             metrics = self._get_metrics(split, name)
             computed = metrics.compute()
             for metric_name, value in computed.items():
-                self.log(f"{split}/{name}/{metric_name}", value, prog_bar=True)
+                # torchmetrics 内部已跨 rank 聚合，这里 sync_dist 主要是保证
+                # log 出来的标量在每个 rank 上一致，避免 ModelCheckpoint / EarlyStopping
+                # 在各 rank 观察到不同值
+                self.log(
+                    f"{split}/{name}/{metric_name}",
+                    value,
+                    prog_bar=True,
+                    sync_dist=True,
+                )
             metrics.reset()
 
     def on_validation_epoch_end(self) -> None:
@@ -239,28 +265,50 @@ class MiCoFormerClassifier(L.LightningModule):
 
         optimizer = torch.optim.AdamW(param_groups)
 
-        # Warmup + Cosine Decay（与预训练一致）
-        warmup_scheduler = LinearLR(
-            optimizer,
-            start_factor=0.01,
-            end_factor=1.0,
-            total_iters=self.hparams["warmup_steps"],
-        )
-        decay_steps = max(1, self.hparams["max_steps"] - self.hparams["warmup_steps"])
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer, T_max=decay_steps, eta_min=1e-6
-        )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[self.hparams["warmup_steps"]],
-        )
+        if self.hparams["lr_scheduler"] == "cosine":
+            total_steps = int(self.trainer.estimated_stepping_batches)
+            warmup_steps = int(float(self.hparams["warmup_ratio"]) * total_steps)
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-        }
+            if warmup_steps <= 0:
+                # warmup_ratio=0：直接走 cosine，避免 LinearLR(total_iters=0) 的边界问题
+                scheduler = CosineAnnealingLR(
+                    optimizer, T_max=max(1, total_steps), eta_min=1e-6
+                )
+            else:
+                decay_steps = max(1, total_steps - warmup_steps)
+                warmup = LinearLR(
+                    optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+                )
+                cosine = CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=1e-6)
+                scheduler = SequentialLR(
+                    optimizer, [warmup, cosine], milestones=[warmup_steps]
+                )
+
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+
+        if self.hparams["lr_scheduler"] == "plateau":
+            # Lightning 原生支持：通过 monitor 字段自动将主指标传给 scheduler
+            # 下游主指标是向上的（f1_macro），所以 mode="max"
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": ReduceLROnPlateau(
+                        optimizer,
+                        mode="max",
+                        factor=float(self.hparams["plateau_factor"]),
+                        patience=int(self.hparams["plateau_patience"]),
+                        min_lr=float(self.hparams["plateau_min_lr"]),
+                    ),
+                    "interval": "epoch",
+                    "monitor": self.hparams["monitor_metric"],
+                },
+            }
+
+        raise ValueError(f"Unknown lr_scheduler: {self.hparams['lr_scheduler']}")
