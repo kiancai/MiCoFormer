@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import anndata as ad
 import numpy as np
+from lightning.pytorch.utilities import rank_zero_info
 
 
 TAG = "[splits]"
@@ -28,10 +29,10 @@ def _select_indices(
     total = len(obs)
     # 如果没有 filters，则表示“全选”
     if not filters:
-        print(f"{TAG} Applying filters: (no filter) -> {total} samples")
+        rank_zero_info(f"{TAG} Applying filters: (no filter) -> {total} samples")
         return np.arange(total)
-    
-    print(f"{TAG} Applying filters:")
+
+    rank_zero_info(f"{TAG} Applying filters:")
 
     # `mask` 是布尔数组，长度等于样本总数。
     # 一开始设成全 True，后面每处理一个 filter，就用 AND 逐步剔除不符合条件的样本
@@ -59,7 +60,7 @@ def _select_indices(
 
         # 整理输出日志
         values_str = ",".join(str(v) for v in values)
-        print(
+        rank_zero_info(
             f"{TAG}   [{i}] {field}={values_str:<32} -> "
             f"{survived} / {total} survive"
         )
@@ -75,7 +76,7 @@ def make_split(
     output: str,
 ) -> np.ndarray:
     
-    print(f"{TAG} Reading obs from {h5ad} ...")
+    rank_zero_info(f"{TAG} Reading obs from {h5ad} ...")
     adata = ad.read_h5ad(h5ad, backed="r")  # `backed="r"` 表示只读
 
     try:
@@ -86,13 +87,13 @@ def make_split(
         if adata.file is not None:
             adata.file.close()
 
-    print(f"{TAG} Final: {len(indices)} samples")
+    rank_zero_info(f"{TAG} Final: {len(indices)} samples")
 
     if len(indices) == 0:
         raise ValueError("No samples matched the given filters.")
 
     os.makedirs(os.path.dirname(os.path.abspath(output)) or ".", exist_ok=True)
     np.save(output, indices)
-    print(f"{TAG} Saved {len(indices)} indices -> {output}")
+    rank_zero_info(f"{TAG} Saved {len(indices)} indices -> {output}")
 
     return indices

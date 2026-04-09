@@ -127,15 +127,15 @@ class MiCoFormerModule(L.LightningModule):
             masked_logits = logits[mask_pos]
             masked_labels = labels[mask_pos]
             loss = self.criterion(masked_logits, masked_labels).mean()
-            
+
             pred = masked_logits.argmax(dim=-1)
             acc = (pred == masked_labels).float().mean()
-            
-            self.log("val/loss", loss, prog_bar=True, on_epoch=True)
-            self.log("val/acc_mask", acc, prog_bar=True, on_epoch=True)
-        else:
-            self.log("val/loss", torch.tensor(0.0, device=logits.device), prog_bar=True, on_epoch=True)
-            self.log("val/acc_mask", torch.tensor(0.0, device=logits.device), prog_bar=True, on_epoch=True)
+
+            # sync_dist=True：多 GPU 时跨 rank 聚合 val 指标
+            self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
+            self.log("val/acc_mask", acc, prog_bar=True, on_epoch=True, sync_dist=True)
+        # 没有 mask 位置时（理论上 ensure_one_mask_per_nonempty 已经避免），
+        # 直接 skip log；不再记录 0.0 以免污染 epoch 平均值
 
     def configure_optimizers(self):
         # 分离参数组：对 bias 和 LayerNorm 不使用 weight_decay，防止过度正则化
@@ -162,10 +162,22 @@ class MiCoFormerModule(L.LightningModule):
         if self.hparams.lr_scheduler == "cosine":
             total_steps = int(self.trainer.estimated_stepping_batches)
             warmup_steps = int(float(self.hparams.warmup_ratio) * total_steps)
-            decay_steps = max(1, total_steps - warmup_steps)
-            warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-            cosine = CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=1e-6)
-            scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
+
+            if warmup_steps <= 0:
+                # warmup_ratio=0：直接走 cosine，避免 LinearLR(total_iters=0) 的边界问题
+                scheduler = CosineAnnealingLR(
+                    optimizer, T_max=max(1, total_steps), eta_min=1e-6
+                )
+            else:
+                decay_steps = max(1, total_steps - warmup_steps)
+                warmup = LinearLR(
+                    optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+                )
+                cosine = CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=1e-6)
+                scheduler = SequentialLR(
+                    optimizer, [warmup, cosine], milestones=[warmup_steps]
+                )
+
             return {
                 "optimizer": optimizer,
                 "lr_scheduler": {

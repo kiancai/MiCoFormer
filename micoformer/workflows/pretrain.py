@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 
 import lightning as L
@@ -75,6 +77,31 @@ class PretrainRunConfig:
 
 def validate_pretrain_config(config: PretrainRunConfig) -> None:
     """检验预训练配置的合法性"""
+    # 模型主体参数：基础正整性
+    if config.d_model <= 0:
+        raise ValueError(f"d_model must be > 0, got {config.d_model}.")
+    if config.nhead <= 0:
+        raise ValueError(f"nhead must be > 0, got {config.nhead}.")
+    if config.num_layers <= 0:
+        raise ValueError(f"num_layers must be > 0, got {config.num_layers}.")
+    if config.ff_dim <= 0:
+        raise ValueError(f"ff_dim must be > 0, got {config.ff_dim}.")
+    if config.d_model % config.nhead != 0:
+        raise ValueError(
+            f"d_model ({config.d_model}) must be divisible by nhead ({config.nhead})."
+        )
+    if config.num_abundance_bins < 1:
+        raise ValueError(
+            f"num_abundance_bins must be >= 1, got {config.num_abundance_bins}."
+        )
+    if config.min_abundance <= 0:
+        raise ValueError(
+            f"min_abundance must be > 0 (used as log-bin lower bound), got {config.min_abundance}."
+        )
+    if config.batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {config.batch_size}.")
+
+    # 训练协议参数
     if not 0.0 <= config.warmup_ratio < 1.0:
         raise ValueError("warmup_ratio must satisfy 0 <= warmup_ratio < 1.")
 
@@ -86,6 +113,20 @@ def validate_pretrain_config(config: PretrainRunConfig) -> None:
         raise ValueError("lr_plateau_min_lr must be >= 0.")
 
     # 预算模式互斥
+    if config.budget_mode not in ("epoch", "step"):
+        raise ValueError(
+            f"budget_mode must be 'epoch' or 'step', got {config.budget_mode!r}."
+        )
+
+    # plateau scheduler 与 step 预算不兼容：plateau 按 epoch 触发，
+    # step 模式下验证可能跨 epoch 触发，调度时机会错位
+    if config.lr_scheduler_type == "plateau" and config.budget_mode == "step":
+        raise ValueError(
+            "lr_scheduler_type='plateau' is incompatible with budget_mode='step' "
+            "(plateau steps per epoch, step-budget validates mid-epoch). "
+            "Use budget_mode='epoch' with plateau, or use lr_scheduler_type='cosine' with step budget."
+        )
+
     if config.budget_mode == "epoch":
         if config.max_epochs is None or config.max_epochs <= 0:
             raise ValueError("max_epochs must be provided and > 0 when budget_mode=epoch.")
@@ -124,9 +165,38 @@ def run_pretrain_once(
     validate_pretrain_config(config)
     L.seed_everything(config.seed, workers=True)
 
+    # 索引越界 sanity check：避免使用了和 h5ad 不匹配的 splits 文件
+    # （读元信息只用 backed 模式，不把 X 加载进内存）
+    import anndata as ad
+    _peek_adata = ad.read_h5ad(config.h5ad_path, backed="r")
+    try:
+        n_obs = int(_peek_adata.n_obs)
+    finally:
+        if getattr(_peek_adata, "file", None) is not None:
+            _peek_adata.file.close()
+
+    train_arr = np.asarray(train_indices)
+    val_arr = np.asarray(val_indices)
+    if train_arr.size == 0:
+        raise ValueError("train_indices is empty.")
+    if val_arr.size == 0:
+        raise ValueError("val_indices is empty.")
+    if int(train_arr.min()) < 0 or int(train_arr.max()) >= n_obs:
+        raise ValueError(
+            f"train_indices out of range [0, {n_obs}): "
+            f"min={int(train_arr.min())}, max={int(train_arr.max())}. "
+            f"Splits .npy probably comes from a different h5ad."
+        )
+    if int(val_arr.min()) < 0 or int(val_arr.max()) >= n_obs:
+        raise ValueError(
+            f"val_indices out of range [0, {n_obs}): "
+            f"min={int(val_arr.min())}, max={int(val_arr.max())}. "
+            f"Splits .npy probably comes from a different h5ad."
+        )
+
     chosen_precision = _choose_precision(config.precision)
     rank_zero_info(f"{TAG} Using precision={chosen_precision}")
-    rank_zero_info(f"{TAG} Train: {len(train_indices)}, Val: {len(val_indices)}")
+    rank_zero_info(f"{TAG} Train: {len(train_indices)}, Val: {len(val_indices)} (n_obs={n_obs})")
     rank_zero_info(f"{TAG} Budget mode: {config.budget_mode}")
     if config.budget_mode == "epoch":
         rank_zero_info(
@@ -188,13 +258,23 @@ def run_pretrain_once(
     )
 
     # 3. 设置日志记录器与回调
-    csv_logger = CSVLogger(save_dir=config.log_dir, name=log_subdir)
-    tb_logger = TensorBoardLogger(save_dir=config.log_dir, name=log_subdir)
+    # 显式锁定 version：让 CSVLogger 与 TensorBoardLogger 共享同一个 version 字符串，
+    # 避免两者各自自增、出现 version_3 / version_5 错位
+    run_version = time.strftime("run_%Y%m%d_%H%M%S")
+    csv_logger = CSVLogger(save_dir=config.log_dir, name=log_subdir, version=run_version)
+    tb_logger = TensorBoardLogger(save_dir=config.log_dir, name=log_subdir, version=run_version)
+
+    # 显式指定 dirpath，避免依赖 "第一个 logger 的 save_dir" 这种隐式行为
+    ckpt_dir = os.path.join(config.log_dir, log_subdir, run_version, "checkpoints")
+    # 注意：filename 中不能包含 monitor 的 'val/loss'，否则斜杠会被当作子目录创建
     checkpoint_callback = ModelCheckpoint(
+        dirpath=ckpt_dir,
         monitor="val/loss",
         mode="min",
         save_top_k=3,
-        filename="micoformer-{epoch:02d}-{val/loss:.4f}",
+        save_last=True,
+        auto_insert_metric_name=False,
+        filename="micoformer-epoch{epoch:02d}",
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
 

@@ -29,6 +29,22 @@ from micoformer.workflows.pretrain import PretrainRunConfig, run_pretrain_once
 TAG = "[train_pretrain]"
 
 
+def _int_or_float(s: str):
+    """Lightning 的 limit_*_batches 既接受 float（比例 [0,1]）也接受 int（绝对 batch 数）。
+
+    解析规则：
+    - 若字符串能解析成 int 且 > 1，则返回 int（视为绝对 batch 数）
+    - 否则返回 float（视为比例）
+    """
+    try:
+        ival = int(s)
+        if str(ival) == s.strip() and ival > 1:
+            return ival
+    except ValueError:
+        pass
+    return float(s)
+
+
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="MiCoFormer Stage 0 Pretraining")
 
@@ -79,8 +95,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max_steps", type=int, default=None)              # step 模式下的最大训练步数
     p.add_argument("--val_interval_epochs", type=int, default=None)    # epoch 模式下每多少个 epoch 验证一次
     p.add_argument("--val_interval_steps", type=int, default=None)     # step 模式下每多少步验证一次
-    p.add_argument("--limit_train_batches", type=float, default=1.0)   # 每 Epoch 仅使用部分训练数据
-    p.add_argument("--limit_val_batches", type=float, default=1.0)     # 每 Epoch 仅使用部分验证数据
+    p.add_argument("--limit_train_batches", type=_int_or_float, default=1.0)   # 每 Epoch 仅使用部分训练数据 (float=比例 / int=绝对 batch 数)
+    p.add_argument("--limit_val_batches", type=_int_or_float, default=1.0)     # 每 Epoch 仅使用部分验证数据 (float=比例 / int=绝对 batch 数)
 
     # 5. 运行与工程参数
     p.add_argument("--devices", type=int, default=1)                   # 使用的 GPU/设备 数量
@@ -90,6 +106,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--gradient_clip_val", type=float, default=1.0)     # 梯度裁剪阈值
     p.add_argument("--num_workers", type=int, default=4)               # DataLoader 的 num_workers
     p.add_argument("--log_dir", type=str, default="tmp/logs")          # 日志保存目录
+    p.add_argument(
+        "--run_name",
+        type=str,
+        default="pretrain_stage0",
+        help="日志/checkpoint 子目录名，对应 run_pretrain_once 的 log_subdir。",
+    )
     p.add_argument("--no_progress_bar", action="store_true", default=False)
 
     return p
@@ -145,7 +167,7 @@ def main():
     rank_zero_info(f"{TAG} Loading val indices from {args.val_indices_path} ...")
     val_indices = np.load(args.val_indices_path)
 
-    run_pretrain_once(config, train_indices, val_indices)
+    run_pretrain_once(config, train_indices, val_indices, log_subdir=args.run_name)
 
 
 if __name__ == "__main__":
