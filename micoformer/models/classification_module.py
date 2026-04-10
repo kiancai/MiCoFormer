@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import lightning as L
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 from torchmetrics import MetricCollection
 from torchmetrics.classification import (
     MulticlassAccuracy,
@@ -14,7 +13,9 @@ from torchmetrics.classification import (
 )
 
 from micoformer.models.pretrain_module import MiCoFormerModule
+from micoformer.models.encoder import MiCoFormerEncoder
 from micoformer.models.heads import ClassificationHead
+from micoformer.utils.train_utils import build_lr_scheduler
 
 
 class MiCoFormerClassifier(L.LightningModule):
@@ -23,7 +24,7 @@ class MiCoFormerClassifier(L.LightningModule):
     def __init__(
         self,
         *,
-        pretrained_ckpt_path: str,
+        pretrained_ckpt_path: Optional[str] = None,
         task_configs: List[Dict[str, Any]],
         # 每项形如 {"name": "Phenotype", "num_classes": 2}
         pooling_mode: str = "mean_pool",
@@ -38,20 +39,58 @@ class MiCoFormerClassifier(L.LightningModule):
         plateau_factor: float = 0.5,
         plateau_patience: int = 2,
         plateau_min_lr: float = 1e-6,
-        monitor_metric: str = "val/loss",
+        monitor_metric: str = "val/loss_total",
+        # 从预训练 ckpt 提取的 encoder 架构参数（首次创建时自动填充，存入 hparams 以支持
+        # 从微调 ckpt 直接恢复而无需预训练 ckpt 仍在原路径）
+        _encoder_hparams: Optional[Dict] = None,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters()
+
+        if pretrained_ckpt_path is not None:
+            # 首次创建：从预训练 ckpt 提取 encoder 架构参数和权重
+            pretrained_module = MiCoFormerModule.load_from_checkpoint(
+                pretrained_ckpt_path, map_location="cpu"
+            )
+            _encoder_hparams = dict(pretrained_module.hparams)
+            _pretrained_encoder = pretrained_module.encoder
+        elif _encoder_hparams is not None:
+            # 从微调 ckpt 恢复：_encoder_hparams 来自已保存的 hparams，
+            # Lightning 将从 state_dict 恢复 encoder 权重
+            _pretrained_encoder = None
+        else:
+            raise RuntimeError(
+                "Cannot create MiCoFormerClassifier: provide pretrained_ckpt_path or _encoder_hparams. "
+                "Old checkpoints (before P1-1 fix) require the pretrain ckpt to still be accessible."
+            )
+
+        # 保存 hparams（忽略 pretrained_ckpt_path，保留 _encoder_hparams 以支持独立恢复）
+        self.save_hyperparameters(ignore=["pretrained_ckpt_path"])
+
+        d_model = _encoder_hparams["d_model"]
 
         if pooling_mode not in {"sample", "mean_pool", "sample_and_mean"}:
             raise ValueError(f"Unknown pooling_mode: {pooling_mode}")
 
-        # 从预训练 checkpoint 加载 encoder
-        pretrained_module = MiCoFormerModule.load_from_checkpoint(
-            pretrained_ckpt_path, map_location="cpu"
+        # 从架构参数重建 encoder（无论是首次创建还是从微调 ckpt 恢复）
+        self.encoder = MiCoFormerEncoder(
+            genus_vocab_size=_encoder_hparams["genus_vocab_size"],
+            total_abundance_bins=_encoder_hparams["total_abundance_bins"],
+            d_model=d_model,
+            nhead=_encoder_hparams["nhead"],
+            num_layers=_encoder_hparams["num_layers"],
+            dim_feedforward=_encoder_hparams["dim_feedforward"],
+            dropout=_encoder_hparams.get("dropout", 0.1),
+            pad_taxon_id=_encoder_hparams.get("pad_taxon_id", 0),
+            pad_bin_id=_encoder_hparams.get("pad_bin_id", 0),
+            token_embedding_mode=_encoder_hparams["token_embedding_mode"],
+            rank_vocab_sizes=dict(_encoder_hparams["rank_vocab_sizes"]),
+            use_taxonomy_bias=_encoder_hparams.get("use_taxonomy_bias", False),
         )
-        self.encoder = pretrained_module.encoder
-        d_model = pretrained_module.hparams["d_model"]
+
+        if _pretrained_encoder is not None:
+            # 首次创建：加载预训练权重
+            self.encoder.load_state_dict(_pretrained_encoder.state_dict())
+        # else: Lightning 从微调 ckpt 的 state_dict 恢复 encoder 权重
 
         # 冻结 encoder
         if freeze_encoder:
@@ -74,11 +113,11 @@ class MiCoFormerClassifier(L.LightningModule):
                 dropout=head_dropout,
             )
 
-        # 每个任务单独的 loss 函数，ignore_index=-1 跳过无标签样本
-        self.criteria = {
+        # 每个任务单独的 loss 函数（nn.ModuleDict 确保正确注册为子模块）
+        self.criteria = nn.ModuleDict({
             cfg["name"]: nn.CrossEntropyLoss(ignore_index=-1)
             for cfg in task_configs
-        }
+        })
 
         # torchmetrics：每个任务、每个 split 独立维护
         self._task_configs = task_configs
@@ -100,6 +139,11 @@ class MiCoFormerClassifier(L.LightningModule):
 
     def _get_metrics(self, split: str, task_name: str) -> MetricCollection:
         return getattr(self, f"_metrics_{split}_{task_name}")
+
+    def on_train_epoch_start(self) -> None:
+        # 冻结模式下 encoder 始终保持 eval（禁止 BN/Dropout 更新统计量）
+        if self.hparams["freeze_encoder"]:
+            self.encoder.eval()
 
     def _pool(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """根据 pooling_mode 从 encoder 输出中提取样本表示。"""
@@ -193,11 +237,7 @@ class MiCoFormerClassifier(L.LightningModule):
         return total_loss
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int) -> torch.Tensor:
-        loss = self._compute_loss_and_log(batch, "train")
-        # 记录学习率
-        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-        self.log("train/lr", current_lr, prog_bar=True, on_step=True, on_epoch=False)
-        return loss
+        return self._compute_loss_and_log(batch, "train")
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> None:
         self._compute_loss_and_log(batch, "val")
@@ -265,50 +305,16 @@ class MiCoFormerClassifier(L.LightningModule):
 
         optimizer = torch.optim.AdamW(param_groups)
 
-        if self.hparams["lr_scheduler"] == "cosine":
-            total_steps = int(self.trainer.estimated_stepping_batches)
-            warmup_steps = int(float(self.hparams["warmup_ratio"]) * total_steps)
-
-            if warmup_steps <= 0:
-                # warmup_ratio=0：直接走 cosine，避免 LinearLR(total_iters=0) 的边界问题
-                scheduler = CosineAnnealingLR(
-                    optimizer, T_max=max(1, total_steps), eta_min=1e-6
-                )
-            else:
-                decay_steps = max(1, total_steps - warmup_steps)
-                warmup = LinearLR(
-                    optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
-                )
-                cosine = CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=1e-6)
-                scheduler = SequentialLR(
-                    optimizer, [warmup, cosine], milestones=[warmup_steps]
-                )
-
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                    "frequency": 1,
-                },
-            }
-
-        if self.hparams["lr_scheduler"] == "plateau":
-            # Lightning 原生支持：通过 monitor 字段自动将主指标传给 scheduler
-            # 下游主指标是向上的（f1_macro），所以 mode="max"
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": ReduceLROnPlateau(
-                        optimizer,
-                        mode="max",
-                        factor=float(self.hparams["plateau_factor"]),
-                        patience=int(self.hparams["plateau_patience"]),
-                        min_lr=float(self.hparams["plateau_min_lr"]),
-                    ),
-                    "interval": "epoch",
-                    "monitor": self.hparams["monitor_metric"],
-                },
-            }
-
-        raise ValueError(f"Unknown lr_scheduler: {self.hparams['lr_scheduler']}")
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        lr_sched_cfg = build_lr_scheduler(
+            optimizer,
+            scheduler_type=self.hparams["lr_scheduler"],
+            warmup_ratio=float(self.hparams["warmup_ratio"]),
+            total_steps=total_steps,
+            plateau_factor=float(self.hparams["plateau_factor"]),
+            plateau_patience=int(self.hparams["plateau_patience"]),
+            plateau_min_lr=float(self.hparams["plateau_min_lr"]),
+            plateau_mode="max",
+            plateau_monitor=self.hparams["monitor_metric"],
+        )
+        return {"optimizer": optimizer, "lr_scheduler": lr_sched_cfg}

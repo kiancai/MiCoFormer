@@ -23,26 +23,11 @@ import argparse
 import numpy as np
 from lightning.pytorch.utilities import rank_zero_info
 
+from micoformer.utils.train_utils import int_or_float
 from micoformer.workflows.pretrain import PretrainRunConfig, run_pretrain_once
 
 
 TAG = "[train_pretrain]"
-
-
-def _int_or_float(s: str):
-    """Lightning 的 limit_*_batches 既接受 float（比例 [0,1]）也接受 int（绝对 batch 数）。
-
-    解析规则：
-    - 若字符串能解析成 int 且 > 1，则返回 int（视为绝对 batch 数）
-    - 否则返回 float（视为比例）
-    """
-    try:
-        ival = int(s)
-        if str(ival) == s.strip() and ival > 1:
-            return ival
-    except ValueError:
-        pass
-    return float(s)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -98,8 +83,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max_steps", type=int, default=None)              # step 模式下的最大训练步数
     p.add_argument("--val_interval_epochs", type=int, default=None)    # epoch 模式下每多少个 epoch 验证一次
     p.add_argument("--val_interval_steps", type=int, default=None)     # step 模式下每多少步验证一次
-    p.add_argument("--limit_train_batches", type=_int_or_float, default=1.0)   # 每 Epoch 仅使用部分训练数据 (float=比例 / int=绝对 batch 数)
-    p.add_argument("--limit_val_batches", type=_int_or_float, default=1.0)     # 每 Epoch 仅使用部分验证数据 (float=比例 / int=绝对 batch 数)
+    p.add_argument("--limit_train_batches", type=int_or_float, default=1.0)   # 每 Epoch 仅使用部分训练数据 (float=比例 / int=绝对 batch 数)
+    p.add_argument("--limit_val_batches", type=int_or_float, default=1.0)     # 每 Epoch 仅使用部分验证数据 (float=比例 / int=绝对 batch 数)
 
     # 4.1. Early stopping（0=禁用，与 finetune 对称）
     p.add_argument("--early_stopping_patience", type=int, default=0,)  #Early stopping patience（0 表示禁用）

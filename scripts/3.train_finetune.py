@@ -34,6 +34,7 @@ import argparse
 import numpy as np
 from lightning.pytorch.utilities import rank_zero_info
 
+from micoformer.utils.train_utils import int_or_float, str2bool
 from micoformer.workflows.finetune import (
     FinetuneRunConfig,
     build_label_configs,
@@ -56,15 +57,19 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # 1.下游任务标签参数
     p.add_argument("--label_fields", type=str, nargs="+", required=True)
-    p.add_argument("--label_values", type=str, default=None,
-                   help="JSON 字符串 {field: [values]}，限定每个任务的有效取值")
+    p.add_argument("--label_values", type=str, nargs="*", default=None,
+                   help=(
+                       "限定每个任务的有效取值，格式为 'Field=v1,v2'，多字段空格分隔。"
+                       "示例：--label_values \"Phenotype=Health,Disease\" \"Smoking=Yes,No\""
+                   ))
 
     # 2.1.分类头 / pooling 参数
     p.add_argument("--pooling_mode", type=str, default="mean_pool",
                    choices=["sample", "mean_pool", "sample_and_mean"])
     p.add_argument("--head_hidden_dim", type=int, default=0)          # 0 表示线性分类头，>0 表示 MLP hidden dim
     p.add_argument("--head_dropout", type=float, default=0.1)         # 分类头 dropout
-    p.add_argument("--freeze_encoder", action="store_true", default=False)
+    p.add_argument("--freeze_encoder", type=str2bool, default=False,
+                   metavar="BOOL")                                      # 是否冻结 encoder（true/false/yes/no/1/0），默认 false
 
     # 2.2.数据协议参数
     p.add_argument("--batch_size", type=int, default=32)              # 每个 batch 的样本数
@@ -97,12 +102,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--early_stopping_patience", type=int, default=10)    # Early stopping patience，0 表示禁用
     p.add_argument("--early_stopping_min_delta", type=float, default=0.0)  # Early stopping 最小改善阈值
 
+    # 4.1. Trainer 控制参数（与 pretrain 对称）
+    p.add_argument("--gradient_clip_val", type=float, default=1.0)          # 梯度裁剪阈值
+    p.add_argument("--accumulate_grad_batches", type=int, default=1)        # 梯度累积步数
+    p.add_argument("--limit_train_batches", type=int_or_float, default=1.0)    # 每 Epoch 仅使用部分训练数据 (float=比例 / int=绝对 batch 数)
+    p.add_argument("--limit_val_batches", type=int_or_float, default=1.0)      # 每 Epoch 仅使用部分验证数据 (float=比例 / int=绝对 batch 数)
+
     # 5. 运行与工程参数
     p.add_argument("--devices", type=int, default=1)                     # 使用的 GPU/设备 数量
     p.add_argument("--precision", type=str, default="auto", choices=["auto", "16-mixed", "32"])
     p.add_argument("--seed", type=int, default=42)                       # 随机种子，用于可复现
     p.add_argument("--num_workers", type=int, default=4)                 # DataLoader 的 num_workers
-    p.add_argument("--log_dir", type=str, default="tmp/logs/finetune")   # 日志保存目录
+    p.add_argument("--log_dir", type=str, default="tmp/logs")            # 日志保存目录
     p.add_argument(
         "--run_name",
         type=str,
@@ -112,12 +123,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no_progress_bar", action="store_true", default=False)
 
     return p
-
-
-def _validate_args(args: argparse.Namespace) -> None:
-    """检验其余业务约束。"""
-    if not args.label_fields:
-        raise ValueError("--label_fields must contain at least one task field.")
 
 
 def _args_to_config(args: argparse.Namespace) -> FinetuneRunConfig:
@@ -145,6 +150,10 @@ def _args_to_config(args: argparse.Namespace) -> FinetuneRunConfig:
         val_interval_steps=args.val_interval_steps,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        gradient_clip_val=args.gradient_clip_val,
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        limit_train_batches=args.limit_train_batches,
+        limit_val_batches=args.limit_val_batches,
         devices=args.devices,
         precision=args.precision,
         seed=args.seed,
@@ -157,6 +166,10 @@ def _args_to_config(args: argparse.Namespace) -> FinetuneRunConfig:
 def _print_results(results: dict) -> None:
     rank_zero_info(f"{TAG} Results:")
     for split, metrics in results.items():
+        if not isinstance(metrics, dict):
+            # best_model_path / best_score 等标量字段直接打印
+            rank_zero_info(f"{TAG}   {split}: {metrics}")
+            continue
         rank_zero_info(f"{TAG}   [{split}]")
         for key, value in sorted(metrics.items()):
             rank_zero_info(f"{TAG}     {key}: {value}")
@@ -164,10 +177,10 @@ def _print_results(results: dict) -> None:
 
 def main() -> None:
     args = build_argparser().parse_args()
-    _validate_args(args)
-
     config = _args_to_config(args)
-    label_configs = build_label_configs(args.label_fields, args.label_values)
+    # nargs="*" 返回 list[str]，join 后传给 build_label_configs（支持 'Field=v1,v2' 格式）
+    label_values_str = " ".join(args.label_values) if args.label_values else None
+    label_configs = build_label_configs(args.label_fields, label_values_str)
 
     rank_zero_info(f"{TAG} Loading train indices from {args.train_indices_path} ...")
     train_indices = np.load(args.train_indices_path)

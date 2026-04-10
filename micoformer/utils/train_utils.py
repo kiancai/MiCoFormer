@@ -192,6 +192,32 @@ def build_lr_scheduler(
     raise ValueError(f"Unknown scheduler_type: {scheduler_type!r}")
 
 
+def str2bool(v: str) -> bool:
+    """argparse type= 辅助：支持 true/false/yes/no/1/0（大小写不敏感）。"""
+    if v.lower() in ("yes", "true", "1"):
+        return True
+    if v.lower() in ("no", "false", "0"):
+        return False
+    import argparse
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got {v!r}.")
+
+
+def int_or_float(s: str):
+    """argparse type= 辅助：Lightning 的 limit_*_batches 既接受 float（比例）也接受 int（绝对 batch 数）。
+
+    解析规则：
+    - 若字符串能解析成 int 且 > 1，则返回 int（视为绝对 batch 数）
+    - 否则返回 float（视为比例）
+    """
+    try:
+        ival = int(s)
+        if str(ival) == s.strip() and ival > 1:
+            return ival
+    except ValueError:
+        pass
+    return float(s)
+
+
 def validate_pretrain_config(config: Any) -> None:
     """检验预训练配置的合法性（PretrainRunConfig）"""
     # 模型主体参数：基础正整性

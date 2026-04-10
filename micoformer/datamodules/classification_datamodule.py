@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import anndata as ad
@@ -84,33 +84,26 @@ class ClassificationDataModule(L.LightningDataModule):
         }
         self.total_abundance_bins = self.num_abundance_bins + 2
 
-        # 读词表元信息
-        self.genus_vocab_size, self.rank_vocab_sizes = self._peek_dataset_meta()
-
-        # 构建标签映射
         self.task_configs: List[Dict[str, Any]] = []
-        self._labels_array: Optional[np.ndarray] = None  # setup 时填充
+        self._labels_array: Optional[np.ndarray] = None
         self._task_names: List[str] = []
 
-        self._build_label_configs()
+        # 一次性读取 var（词表）和 obs（标签配置），避免重复打开 h5ad（P2-4）
+        self._init_metadata()
 
-    def _peek_dataset_meta(self) -> Tuple[int, Dict[str, int]]:
+    def _init_metadata(self) -> None:
+        """一次性打开 h5ad，读取 var（词表）和 obs（标签配置）后关闭。"""
         adata = ad.read_h5ad(self.h5ad_path, backed="r")
         try:
+            # 读取词表
             _, rank_vocab_sizes, _ = build_taxon_path_ids(adata.var)
-        finally:
-            if getattr(adata, "file", None) is not None:
-                adata.file.close()
-        return rank_vocab_sizes["Genus"], rank_vocab_sizes
+            self.genus_vocab_size = rank_vocab_sizes["Genus"]
+            self.rank_vocab_sizes = rank_vocab_sizes
 
-    def _build_label_configs(self) -> None:
-        """从 adata.obs 构建标签映射和全局标签数组。"""
-        adata = ad.read_h5ad(self.h5ad_path, backed="r")
-        try:
+            # 构建标签配置（P2-5：向量化标签填充）
             obs = adata.obs
             n_samples = len(obs)
-            n_tasks = len(self.label_configs)
-            labels_array = np.full((n_samples, n_tasks), -1, dtype=np.int64)
+            labels_array = np.full((n_samples, len(self.label_configs)), -1, dtype=np.int64)
 
             for ti, cfg in enumerate(self.label_configs):
                 field = cfg["field"]
@@ -128,18 +121,16 @@ class ClassificationDataModule(L.LightningDataModule):
                 if valid_values is not None:
                     label_to_id = {v: i for i, v in enumerate(valid_values)}
                 else:
-                    # 自动从数据中提取唯一值（排除 NaN）
                     unique_vals = sorted(
-                        set(str(v) for v in np.unique(col) if str(v).lower() not in ("nan", "none", "<na>", ""))
+                        set(str(v) for v in np.unique(col)
+                            if str(v).lower() not in ("nan", "none", "<na>", ""))
                     )
                     label_to_id = {v: i for i, v in enumerate(unique_vals)}
 
-                # 填充标签数组
-                for si in range(n_samples):
-                    val = str(col[si]).strip()
-                    if val in label_to_id:
-                        labels_array[si, ti] = label_to_id[val]
-                    # 否则保持 -1（无效标签）
+                # 向量化标签填充（替代逐样本循环）
+                col_str = np.array([str(v).strip() for v in col])
+                for label_str, lid in label_to_id.items():
+                    labels_array[col_str == label_str, ti] = lid
 
                 self.task_configs.append({
                     "field": field,
