@@ -218,6 +218,21 @@ def int_or_float(s: str):
     return float(s)
 
 
+def resolve_pretrain_ff_params(config: Any) -> tuple[int | None, int | None]:
+    """
+    解析 pretrain 的 FF 配置。
+
+    规则：
+    - ff_dim / ff_ratio 二选一
+    - 若两者都未指定，按项目默认值回落到 ff_ratio=4
+    """
+    ff_dim = config.ff_dim
+    ff_ratio = config.ff_ratio
+    if ff_dim is None and ff_ratio is None:
+        ff_ratio = 4
+    return ff_dim, ff_ratio
+
+
 def validate_pretrain_config(config: Any) -> None:
     """检验预训练配置的合法性（PretrainRunConfig）"""
     # 模型主体参数：基础正整性
@@ -232,16 +247,18 @@ def validate_pretrain_config(config: Any) -> None:
             f"d_model ({config.d_model}) must be divisible by nhead ({config.nhead})."
         )
 
-    # ff_dim / ff_ratio 互斥检验（恰好指定其中一个）
-    if (config.ff_dim is None) == (config.ff_ratio is None):
+    ff_dim, ff_ratio = resolve_pretrain_ff_params(config)
+
+    # ff_dim / ff_ratio 互斥检验（恰好指定其中一个；两者都未指定时按默认 ff_ratio=4 解释）
+    if (ff_dim is None) == (ff_ratio is None):
         raise ValueError(
             "Exactly one of ff_dim / ff_ratio must be specified (the other must be None). "
             f"Got ff_dim={config.ff_dim}, ff_ratio={config.ff_ratio}."
         )
-    if config.ff_dim is not None and config.ff_dim <= 0:
-        raise ValueError(f"ff_dim must be > 0, got {config.ff_dim}.")
-    if config.ff_ratio is not None and config.ff_ratio <= 0:
-        raise ValueError(f"ff_ratio must be > 0, got {config.ff_ratio}.")
+    if ff_dim is not None and ff_dim <= 0:
+        raise ValueError(f"ff_dim must be > 0, got {ff_dim}.")
+    if ff_ratio is not None and ff_ratio <= 0:
+        raise ValueError(f"ff_ratio must be > 0, got {ff_ratio}.")
 
     if config.num_abundance_bins < 1:
         raise ValueError(

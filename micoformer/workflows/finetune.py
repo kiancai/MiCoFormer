@@ -20,6 +20,7 @@ from micoformer.utils.train_utils import (
     choose_precision,
     validate_finetune_config,
     validate_index_arrays,
+    validate_no_split_overlap,
 )
 
 
@@ -163,6 +164,7 @@ def run_finetune_once(
         val=val_indices,
         test=test_indices,
     )
+    validate_no_split_overlap(train=train_indices, val=val_indices, test=test_indices)
 
     # 从预训练 checkpoint 读取数据协议参数（BUG-4：继承 abundance 参数）
     from micoformer.models.pretrain_module import MiCoFormerModule as _PretrainModule

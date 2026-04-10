@@ -48,7 +48,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_layers", type=int, default=6)               # Transformer Encoder 层数
     p.add_argument("--ff_dim", type=int, default=None,
                    help="FeedForward 绝对维度，与 --ff_ratio 互斥。不指定时使用 ff_ratio。")
-    p.add_argument("--ff_ratio", type=int, default=4,
+    p.add_argument("--ff_ratio", type=int, default=None,
                    help="FeedForward 比例（dim_ff = d_model × ff_ratio），与 --ff_dim 互斥。默认 4。")
     p.add_argument("--num_abundance_bins", type=int, default=40)      # 丰度分箱数量
 

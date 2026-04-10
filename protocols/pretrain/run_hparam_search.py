@@ -31,6 +31,7 @@ from lightning.pytorch.callbacks import Callback, LearningRateMonitor
 
 from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
 from micoformer.models.pretrain_module import MiCoFormerModule
+from micoformer.utils.train_utils import validate_no_split_overlap
 
 # ---------------------------------------------------------------------------
 # 搜索空间定义
@@ -813,6 +814,7 @@ def main():
     # 加载分割索引（串行模式直接用，并行模式各 worker 自行加载）
     train_indices = np.load(args.train_indices)
     val_indices = np.load(args.val_indices)
+    validate_no_split_overlap(train=train_indices, val=val_indices)
     print(f"Train: {len(train_indices)}, Val: {len(val_indices)}")
 
     # 加载 base_config（如果指定）

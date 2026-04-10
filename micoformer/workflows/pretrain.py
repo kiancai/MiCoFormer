@@ -18,7 +18,9 @@ from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
 from micoformer.models.pretrain_module import MiCoFormerModule
 from micoformer.utils.train_utils import (
     choose_precision,
+    resolve_pretrain_ff_params,
     validate_index_arrays,
+    validate_no_split_overlap,
     validate_pretrain_config,
 )
 
@@ -41,7 +43,7 @@ class PretrainRunConfig:
     num_layers: int = 6
     # ff_dim 与 ff_ratio 互斥：指定其中一个，另一个保持 None
     ff_dim: int | None = None      # FeedForward 绝对维度
-    ff_ratio: int | None = 4       # FeedForward 比例（dim_ff = d_model × ff_ratio），默认
+    ff_ratio: int | None = None    # FeedForward 比例（dim_ff = d_model × ff_ratio）；未指定时走默认 4
     num_abundance_bins: int = 40
 
     # 2.2. 模型主体参数的协议参数
@@ -104,12 +106,14 @@ def run_pretrain_once(
         train=train_indices,
         val=val_indices,
     )
+    validate_no_split_overlap(train=train_indices, val=val_indices)
 
     # 计算有效的 dim_feedforward（ff_ratio 或 ff_dim 二选一）
-    if config.ff_dim is not None:
-        effective_ff_dim = config.ff_dim
+    ff_dim, ff_ratio = resolve_pretrain_ff_params(config)
+    if ff_dim is not None:
+        effective_ff_dim = ff_dim
     else:
-        effective_ff_dim = config.d_model * config.ff_ratio  # type: ignore[operator]
+        effective_ff_dim = config.d_model * ff_ratio  # type: ignore[operator]
 
     chosen_precision = choose_precision(config.precision)
     rank_zero_info(f"{TAG} Using precision={chosen_precision}")
