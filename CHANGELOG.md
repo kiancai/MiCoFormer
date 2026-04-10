@@ -7,7 +7,19 @@ The format is based on Keep a Changelog, adapted for the current research workfl
 ## [Unreleased]
 
 ### Changed
-- Reserved for post-`v0.2` development on the `dev` branch.
+- Reserved for post-`v0.3` development on the `dev` branch.
+
+## [0.3.0] - 2026-04-10
+
+### Changed
+- Reworked the pretraining and fine-tuning workflows around reusable workflow primitives, thinner CLI wrappers, and shared validation utilities.
+- Simplified split generation into a single filtering primitive and aligned the script layout to the current numbered entrypoints.
+- Archived the legacy pretraining pipeline notebook to keep the active notebook workspace focused on the new workflow.
+
+### Fixed
+- Fixed the finetune path to inherit abundance-bin protocol settings from the pretraining checkpoint and return stable best-checkpoint metrics.
+- Fixed pretraining FF parameter resolution so `ff_dim` and the default `ff_ratio` path both work consistently through the shared validation layer.
+- Added split-overlap checks for pretraining, fine-tuning, and hyperparameter search to prevent silently polluted experiments.
 
 ## [0.2.0] - 2026-04-05
 

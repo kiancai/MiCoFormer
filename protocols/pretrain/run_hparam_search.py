@@ -31,6 +31,7 @@ from lightning.pytorch.callbacks import Callback, LearningRateMonitor
 
 from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
 from micoformer.models.pretrain_module import MiCoFormerModule
+from micoformer.utils.train_utils import validate_no_split_overlap
 
 # ---------------------------------------------------------------------------
 # 搜索空间定义
@@ -48,7 +49,7 @@ SEARCH_SPACES: Dict[str, Dict[str, list]] = {
         "lr": [5e-5, 1e-4, 3e-4, 5e-4, 1e-3, 3e-3],
         "batch_size": [16, 32, 64, 128, 256],
         "weight_decay": [0, 1e-3, 1e-2, 5e-2, 1e-1],
-        "warmup_steps": [0, 500, 1000, 2000, 4000],
+        "warmup_ratio": [0.0, 0.05, 0.1, 0.15, 0.25, 0.4],
     },
     "data": {
         "num_abundance_bins": [10, 20, 40, 80, 160],
@@ -67,7 +68,7 @@ DEFAULTS: Dict[str, Any] = {
     "lr": 3e-4,
     "batch_size": 32,
     "weight_decay": 1e-2,
-    "warmup_steps": 2000,
+    "warmup_ratio": 0.25,
     "num_abundance_bins": 40,
     "mask_prob": 0.15,
     "min_abundance": 4e-6,
@@ -123,7 +124,7 @@ _PARAM_SHORT = {
     "d_model": "d", "num_layers": "L", "nhead": "h",
     "ff_ratio": "ff", "dropout": "dp",
     "lr": "lr", "batch_size": "bs",
-    "weight_decay": "wd", "warmup_steps": "wu",
+    "weight_decay": "wd", "warmup_ratio": "wr",
     "num_abundance_bins": "bins", "mask_prob": "mp",
     "min_abundance": "minab",
 }
@@ -158,7 +159,7 @@ def make_run_name(group: str, config: Dict[str, Any]) -> str:
             f"lr{_format_number(config['lr'])}"
             f"_bs{config['batch_size']}"
             f"_wd{_format_number(config['weight_decay'])}"
-            f"_wu{config['warmup_steps']}"
+            f"_wr{_format_number(config['warmup_ratio'])}"
         )
     elif group == "data":
         return (
@@ -503,8 +504,7 @@ def run_single_trial(
             use_taxonomy_bias=False,
             lr=config["lr"],
             weight_decay=config["weight_decay"],
-            warmup_steps=config["warmup_steps"],
-            max_steps=args.max_steps,
+            warmup_ratio=config["warmup_ratio"],
         )
 
         # 日志目录：{log_dir}/{group_log_dir}/{run_name}
@@ -814,6 +814,7 @@ def main():
     # 加载分割索引（串行模式直接用，并行模式各 worker 自行加载）
     train_indices = np.load(args.train_indices)
     val_indices = np.load(args.val_indices)
+    validate_no_split_overlap(train=train_indices, val=val_indices)
     print(f"Train: {len(train_indices)}, Val: {len(val_indices)}")
 
     # 加载 base_config（如果指定）

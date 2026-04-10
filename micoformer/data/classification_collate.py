@@ -19,21 +19,13 @@ class ClassificationCollator:
         # 将样本中的序列转为 Tensor
         taxon_seqs = [torch.as_tensor(b["taxon_ids"], dtype=torch.long) for b in batch]
         abund_seqs = [torch.as_tensor(b["abund_bins"], dtype=torch.long) for b in batch]
-        has_taxon_path = "taxon_path_ids" in batch[0]
-        taxon_path_seqs = (
-            [torch.as_tensor(b["taxon_path_ids"], dtype=torch.long) for b in batch]
-            if has_taxon_path
-            else None
-        )
+        # AnnDataDataset 始终返回 taxon_path_ids，无需条件检查
+        taxon_path_seqs = [torch.as_tensor(b["taxon_path_ids"], dtype=torch.long) for b in batch]
 
         # Padding
         token_ids = pad_sequences(taxon_seqs, self.pad_taxon_id)
         abund_bins = pad_sequences(abund_seqs, self.pad_bin_id)
-        taxon_path_ids = (
-            pad_matrix_sequences(taxon_path_seqs, pad_value=0)
-            if has_taxon_path and taxon_path_seqs is not None
-            else None
-        )
+        taxon_path_ids = pad_matrix_sequences(taxon_path_seqs, pad_value=0)
 
         # Attention mask
         attention_mask = (token_ids != self.pad_taxon_id).to(torch.bool)
@@ -43,9 +35,8 @@ class ClassificationCollator:
             "token_ids": token_ids,
             "abund_bins": abund_bins,
             "attention_mask": attention_mask,
+            "taxon_path_ids": taxon_path_ids,
         }
-        if taxon_path_ids is not None:
-            batch_out["taxon_path_ids"] = taxon_path_ids
 
         # 汇总多任务标签
         if "labels" in batch[0]:

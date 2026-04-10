@@ -5,10 +5,10 @@ from typing import Any, Dict
 import torch
 import torch.nn as nn
 import lightning as L
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 
 from micoformer.models.encoder import MiCoFormerEncoder
 from micoformer.models.heads import AbundanceBinHead
+from micoformer.utils.train_utils import build_lr_scheduler
 
 
 class MiCoFormerModule(L.LightningModule):
@@ -103,11 +103,6 @@ class MiCoFormerModule(L.LightningModule):
             loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
 
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        
-        # 记录当前的 Learning Rate
-        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-        self.log("train/lr", current_lr, prog_bar=True, on_step=True, on_epoch=False)
-        
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
@@ -127,15 +122,15 @@ class MiCoFormerModule(L.LightningModule):
             masked_logits = logits[mask_pos]
             masked_labels = labels[mask_pos]
             loss = self.criterion(masked_logits, masked_labels).mean()
-            
+
             pred = masked_logits.argmax(dim=-1)
             acc = (pred == masked_labels).float().mean()
-            
-            self.log("val/loss", loss, prog_bar=True, on_epoch=True)
-            self.log("val/acc_mask", acc, prog_bar=True, on_epoch=True)
-        else:
-            self.log("val/loss", torch.tensor(0.0, device=logits.device), prog_bar=True, on_epoch=True)
-            self.log("val/acc_mask", torch.tensor(0.0, device=logits.device), prog_bar=True, on_epoch=True)
+
+            # sync_dist=True：多 GPU 时跨 rank 聚合 val 指标
+            self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
+            self.log("val/acc_mask", acc, prog_bar=True, on_epoch=True, sync_dist=True)
+        # 没有 mask 位置时（理论上 ensure_one_mask_per_nonempty 已经避免），
+        # 直接 skip log；不再记录 0.0 以免污染 epoch 平均值
 
     def configure_optimizers(self):
         # 分离参数组：对 bias 和 LayerNorm 不使用 weight_decay，防止过度正则化
@@ -159,37 +154,16 @@ class MiCoFormerModule(L.LightningModule):
             lr=self.hparams.lr,
         )
 
-        if self.hparams.lr_scheduler == "cosine":
-            total_steps = int(self.trainer.estimated_stepping_batches)
-            warmup_steps = int(float(self.hparams.warmup_ratio) * total_steps)
-            decay_steps = max(1, total_steps - warmup_steps)
-            warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-            cosine = CosineAnnealingLR(optimizer, T_max=decay_steps, eta_min=1e-6)
-            scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                    "frequency": 1,
-                },
-            }
-
-        if self.hparams.lr_scheduler == "plateau":
-            # Lightning 原生支持：通过 monitor 字段自动将 val/loss 传给 scheduler
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": ReduceLROnPlateau(
-                        optimizer,
-                        mode="min",
-                        factor=float(self.hparams.plateau_factor),
-                        patience=int(self.hparams.plateau_patience),
-                        min_lr=float(self.hparams.plateau_min_lr),
-                    ),
-                    "interval": "epoch",
-                    "monitor": "val/loss",
-                },
-            }
-
-        raise ValueError(f"Unknown lr_scheduler: {self.hparams.lr_scheduler}")
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        lr_sched_cfg = build_lr_scheduler(
+            optimizer,
+            scheduler_type=self.hparams.lr_scheduler,
+            warmup_ratio=float(self.hparams.warmup_ratio),
+            total_steps=total_steps,
+            plateau_factor=float(self.hparams.plateau_factor),
+            plateau_patience=int(self.hparams.plateau_patience),
+            plateau_min_lr=float(self.hparams.plateau_min_lr),
+            plateau_mode="min",
+            plateau_monitor="val/loss",
+        )
+        return {"optimizer": optimizer, "lr_scheduler": lr_sched_cfg}
