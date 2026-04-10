@@ -66,9 +66,19 @@ def main() -> None:
         counts[status] = counts.get(status, 0) + 1
 
     paths = result["paths"]
+    cpu_runtime = result["cpu_runtime"]
     print(f"stage_block = {args.stage_block}")
     print(f"run_dir     = {Path(args.run_dir).resolve()}")
     print(f"gpu_ids     = {gpu_ids}")
+    print(
+        "cpu_runtime = "
+        f"available={cpu_runtime['available_cpu_cores']}, "
+        f"requested_workers={cpu_runtime['requested_num_workers']}, "
+        f"safe_workers={cpu_runtime['safe_num_workers']}, "
+        f"safe_threads={cpu_runtime['safe_cpu_threads']}"
+    )
+    if cpu_runtime["available_cpu_cores"] <= 1 and len(gpu_ids) > 1:
+        print("warning     = only 1 CPU core detected; multi-GPU runs may be CPU-bound")
     print(f"summary     = {paths['summary']}")
     print(f"live_status = {paths['live_status']}")
     print(f"dashboard   = {paths['dashboard']}")

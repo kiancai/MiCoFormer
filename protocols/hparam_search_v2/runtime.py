@@ -87,6 +87,7 @@ STAGE_C_HEAD_HIDDEN = [0, 128, 256]
 STAGE_C_HEAD_DROPOUT = [0.0, 0.1, 0.2]
 DEFAULT_LABEL_FIELD = "Is_Healthy"
 DEFAULT_LABEL_VALUES = ["True", "False"]
+DEFAULT_CPU_THREADS = 1
 STAGE_BLOCK_SPECS: dict[str, dict[str, str]] = {
     "a1_coverage": {
         "stage_name": "stage_a",
@@ -188,6 +189,61 @@ def init_run_dir(run_dir: str | Path) -> dict[str, Path]:
     return layout
 
 
+def detect_available_cpu_cores() -> int:
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        count = os.cpu_count() or 1
+        return max(1, int(count))
+
+
+def resolve_cpu_runtime_settings(
+    *,
+    requested_num_workers: int | None,
+    requested_cpu_threads: int | None = None,
+) -> dict[str, int]:
+    available_cores = detect_available_cpu_cores()
+    requested_workers = 0 if requested_num_workers is None else max(0, int(requested_num_workers))
+    requested_threads = (
+        DEFAULT_CPU_THREADS if requested_cpu_threads is None else max(1, int(requested_cpu_threads))
+    )
+
+    safe_num_workers = min(requested_workers, max(0, available_cores - 1))
+    safe_cpu_threads = min(requested_threads, available_cores)
+    return {
+        "available_cpu_cores": available_cores,
+        "requested_num_workers": requested_workers,
+        "safe_num_workers": safe_num_workers,
+        "requested_cpu_threads": requested_threads,
+        "safe_cpu_threads": safe_cpu_threads,
+    }
+
+
+def apply_cpu_runtime_settings(cpu_threads: int) -> None:
+    resolved_threads = max(1, int(cpu_threads))
+    env_values = {
+        "OMP_NUM_THREADS": str(resolved_threads),
+        "MKL_NUM_THREADS": str(resolved_threads),
+        "OPENBLAS_NUM_THREADS": str(resolved_threads),
+        "NUMEXPR_NUM_THREADS": str(resolved_threads),
+        "VECLIB_MAXIMUM_THREADS": str(resolved_threads),
+    }
+    for key, value in env_values.items():
+        os.environ[key] = value
+
+    try:
+        import torch
+
+        torch.set_num_threads(resolved_threads)
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass
+    except Exception:
+        pass
+
+
 def get_stage_block_spec(stage_block: str) -> dict[str, str]:
     if stage_block not in STAGE_BLOCK_SPECS:
         available = ", ".join(sorted(STAGE_BLOCK_SPECS))
@@ -218,6 +274,7 @@ def _try_import_version(module_name: str) -> str:
 
 def capture_environment_snapshot(output_path: str | Path, gpu_ids: list[int]) -> None:
     output_path = Path(output_path)
+    cpu_info = resolve_cpu_runtime_settings(requested_num_workers=0, requested_cpu_threads=DEFAULT_CPU_THREADS)
     try:
         import torch  # type: ignore
     except Exception:
@@ -227,6 +284,7 @@ def capture_environment_snapshot(output_path: str | Path, gpu_ids: list[int]) ->
         f"timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"python_executable: {sys.executable}",
         f"python_version: {sys.version.split()[0]}",
+        f"available_cpu_cores: {cpu_info['available_cpu_cores']}",
         f"torch_version: {_try_import_version('torch')}",
         f"lightning_version: {_try_import_version('lightning')}",
         f"anndata_version: {_try_import_version('anndata')}",
@@ -384,6 +442,10 @@ def load_run_context(run_dir: str | Path) -> dict[str, Any]:
         "run_dir": run_dir,
         "run_config": run_config,
         "split_paths": split_paths,
+        "cpu_runtime": resolve_cpu_runtime_settings(
+            requested_num_workers=run_config.get("num_workers", 4),
+            requested_cpu_threads=run_config.get("cpu_threads", DEFAULT_CPU_THREADS),
+        ),
         "shortlist_confirmed": (
             read_manifest(decisions_dir / "shortlist_confirmed.yaml")
             if (decisions_dir / "shortlist_confirmed.yaml").exists()
@@ -972,7 +1034,12 @@ def build_tasks_for_stage_block(
     run_config = context["run_config"]
     split_paths = context["split_paths"]
     seed = int(run_config.get("seed", 42))
-    resolved_workers = int(num_workers or run_config.get("num_workers", 4))
+    requested_num_workers = run_config.get("num_workers", 4) if num_workers is None else num_workers
+    resolved_cpu = resolve_cpu_runtime_settings(
+        requested_num_workers=requested_num_workers,
+        requested_cpu_threads=run_config.get("cpu_threads", DEFAULT_CPU_THREADS),
+    )
+    resolved_workers = int(resolved_cpu["safe_num_workers"])
     h5ad_path = str(run_config["h5ad_path"])
     label_field = str(run_config.get("label_field", DEFAULT_LABEL_FIELD))
     label_values = list(run_config.get("label_values", DEFAULT_LABEL_VALUES))
@@ -1522,7 +1589,8 @@ def _execute_task(task: dict[str, Any], gpu_id: int) -> dict[str, Any]:
     return row
 
 
-def _worker(task_queue: Any, result_queue: Any, gpu_id: int) -> None:
+def _worker(task_queue: Any, result_queue: Any, gpu_id: int, cpu_threads: int) -> None:
+    apply_cpu_runtime_settings(cpu_threads)
     while True:
         task = task_queue.get()
         if task is None:
@@ -1544,10 +1612,12 @@ def run_tasks(
     *,
     summary_path: str | Path,
     gpu_ids: list[int],
+    cpu_threads: int = DEFAULT_CPU_THREADS,
     live_status_path: str | Path | None = None,
     dashboard_path: str | Path | None = None,
     retry_failed: bool = False,
 ) -> list[dict[str, Any]]:
+    apply_cpu_runtime_settings(cpu_threads)
     summary_path = Path(summary_path)
     live_status_path = Path(live_status_path) if live_status_path is not None else summary_path.with_name(
         summary_path.stem.replace("_summary", "_live_status") + summary_path.suffix
@@ -1581,7 +1651,7 @@ def run_tasks(
 
     workers = []
     for gpu_id in gpu_ids[:worker_count]:
-        proc = ctx.Process(target=_worker, args=(task_queue, result_queue, gpu_id))
+        proc = ctx.Process(target=_worker, args=(task_queue, result_queue, gpu_id, cpu_threads))
         proc.start()
         workers.append(proc)
 
@@ -1746,6 +1816,11 @@ def run_stage_block(
     num_workers: int | None = None,
     retry_failed: bool = False,
 ) -> dict[str, Any]:
+    context = load_run_context(run_dir)
+    cpu_runtime = resolve_cpu_runtime_settings(
+        requested_num_workers=context["run_config"].get("num_workers", 4) if num_workers is None else num_workers,
+        requested_cpu_threads=context["run_config"].get("cpu_threads", DEFAULT_CPU_THREADS),
+    )
     prepared = prepare_stage_block(run_dir, stage_block, num_workers=num_workers)
     rows = run_tasks(
         prepared["tasks"],
@@ -1753,7 +1828,13 @@ def run_stage_block(
         live_status_path=prepared["paths"]["live_status"],
         dashboard_path=prepared["paths"]["dashboard"],
         gpu_ids=gpu_ids,
+        cpu_threads=int(cpu_runtime["safe_cpu_threads"]),
         retry_failed=retry_failed,
     )
     validate_stage_block_results(stage_block, rows)
-    return {"rows": rows, "paths": prepared["paths"], "tasks": prepared["tasks"]}
+    return {
+        "rows": rows,
+        "paths": prepared["paths"],
+        "tasks": prepared["tasks"],
+        "cpu_runtime": cpu_runtime,
+    }

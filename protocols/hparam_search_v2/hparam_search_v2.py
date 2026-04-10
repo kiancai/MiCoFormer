@@ -89,12 +89,24 @@ def stage_command(stage_block: str, retry_failed: bool = False) -> str:
 def prepare_and_print_stage(stage_block: str, retry_failed: bool = False):
     prepared = runtime.prepare_stage_block(RUN_DIR, stage_block, num_workers=NUM_WORKERS)
     spec = runtime.get_stage_block_spec(stage_block)
+    cpu_runtime = runtime.resolve_cpu_runtime_settings(
+        requested_num_workers=NUM_WORKERS,
+        requested_cpu_threads=CPU_THREADS,
+    )
     print("# ================================================================")
     print(f"# Stage block: {stage_block}")
     print(f"# Trials     : {len(prepared['tasks'])}")
     print(f"# Plan       : {prepared['paths']['plan']}")
     print(f"# Live status: {prepared['paths']['live_status']}")
     print(f"# Summary    : {prepared['paths']['summary']}")
+    print(
+        f"# CPU        : available={cpu_runtime['available_cpu_cores']}, "
+        f"requested_workers={cpu_runtime['requested_num_workers']}, "
+        f"safe_workers={cpu_runtime['safe_num_workers']}, "
+        f"safe_threads={cpu_runtime['safe_cpu_threads']}"
+    )
+    if cpu_runtime["available_cpu_cores"] <= 1 and len(GPU_IDS) > 1:
+        print("# WARNING    : only 1 CPU core detected; prefer a single GPU for stable runs")
     print("# ================================================================")
     print()
     print(stage_command(stage_block, retry_failed=retry_failed))
@@ -164,6 +176,7 @@ H5AD_PATH = PROJECT_ROOT / "data" / "processed" / "microbiome_dataset.h5ad"
 
 GPU_IDS = [0, 1, 2]
 NUM_WORKERS = 4
+CPU_THREADS = 1
 SEED = 42
 
 LABEL_FIELD = runtime.DEFAULT_LABEL_FIELD
@@ -182,6 +195,9 @@ print("RUN_ID        =", RUN_ID)
 print("RUN_DIR       =", RUN_DIR)
 print("H5AD_PATH     =", H5AD_PATH)
 print("GPU_IDS       =", GPU_IDS)
+print("NUM_WORKERS   =", NUM_WORKERS)
+print("CPU_THREADS   =", CPU_THREADS)
+print("AVAILABLE_CPU =", runtime.detect_available_cpu_cores())
 
 
 # %% [markdown]
@@ -199,6 +215,7 @@ runtime.write_manifest(
         "h5ad_path": str(H5AD_PATH),
         "gpu_ids": GPU_IDS,
         "num_workers": NUM_WORKERS,
+        "cpu_threads": CPU_THREADS,
         "seed": SEED,
         "label_field": LABEL_FIELD,
         "label_values": LABEL_VALUES,
