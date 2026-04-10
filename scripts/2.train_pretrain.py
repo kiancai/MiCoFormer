@@ -61,7 +61,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--d_model", type=int, default=256)                # token embedding 的维度，也是模型中间层的维度
     p.add_argument("--nhead", type=int, default=8)                    # 多头注意力中的头数
     p.add_argument("--num_layers", type=int, default=6)               # Transformer Encoder 层数
-    p.add_argument("--ff_dim", type=int, default=1024)                # FeedForward 层的中间维度
+    p.add_argument("--ff_dim", type=int, default=None,
+                   help="FeedForward 绝对维度，与 --ff_ratio 互斥。不指定时使用 ff_ratio。")
+    p.add_argument("--ff_ratio", type=int, default=4,
+                   help="FeedForward 比例（dim_ff = d_model × ff_ratio），与 --ff_dim 互斥。默认 4。")
     p.add_argument("--num_abundance_bins", type=int, default=40)      # 丰度分箱数量
 
     # 2.2.模型主体参数的协议参数
@@ -98,6 +101,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--limit_train_batches", type=_int_or_float, default=1.0)   # 每 Epoch 仅使用部分训练数据 (float=比例 / int=绝对 batch 数)
     p.add_argument("--limit_val_batches", type=_int_or_float, default=1.0)     # 每 Epoch 仅使用部分验证数据 (float=比例 / int=绝对 batch 数)
 
+    # 4.1. Early stopping（0=禁用，与 finetune 对称）
+    p.add_argument("--early_stopping_patience", type=int, default=0,)  #Early stopping patience（0 表示禁用）
+    p.add_argument("--early_stopping_min_delta", type=float, default=0.0,)  #Early stopping 最小改善阈值。
+
     # 5. 运行与工程参数
     p.add_argument("--devices", type=int, default=1)                   # 使用的 GPU/设备 数量
     p.add_argument("--precision", type=str, default="auto", choices=["auto", "16-mixed", "32"])
@@ -126,6 +133,7 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         nhead=args.nhead,
         num_layers=args.num_layers,
         ff_dim=args.ff_dim,
+        ff_ratio=args.ff_ratio,
         num_abundance_bins=args.num_abundance_bins,
         abundance_mode=args.abundance_mode,
         min_abundance=args.min_abundance,
@@ -155,6 +163,8 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         num_workers=args.num_workers,
         log_dir=args.log_dir,
         no_progress_bar=args.no_progress_bar,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
     )
 
 

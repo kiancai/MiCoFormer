@@ -94,6 +94,7 @@ class AnnDataDataset:
         num_abundance_bins: int = 40,
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
+        backed: Optional[str] = None,
     ) -> None:
         if max_seq_len is not None and max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be > 0 when set, got {max_seq_len}")
@@ -101,7 +102,7 @@ class AnnDataDataset:
             raise ValueError(f"Unknown abundance_mode: {abundance_mode}")
 
         # 读取 .h5ad 文件
-        self.adata = ad.read_h5ad(h5ad_path, backed=None)
+        self.adata = ad.read_h5ad(h5ad_path, backed=backed)
 
         # 记录样本总数 (N) 和 特征/物种总数 (V)
         self.n_samples = int(self.adata.n_obs)

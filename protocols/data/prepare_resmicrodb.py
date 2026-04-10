@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 def main():
     # Define project root
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # 1. 物种丰度表，与 metadata 表的路径位置
     raw_abundance_file = os.path.join(project_root, "data/ResMicroDb_90338/abundance_all_90338.csv")

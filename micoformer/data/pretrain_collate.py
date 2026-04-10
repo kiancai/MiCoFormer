@@ -55,21 +55,13 @@ class MiCoCollator:
         # 将样本中的 taxon_ids 与 abund_bins 转为 Tensor
         taxon_seqs = [torch.as_tensor(b["taxon_ids"], dtype=torch.long) for b in batch]
         abund_seqs = [torch.as_tensor(b["abund_bins"], dtype=torch.long) for b in batch]
-        has_taxon_path = "taxon_path_ids" in batch[0]
-        taxon_path_seqs = (
-            [torch.as_tensor(b["taxon_path_ids"], dtype=torch.long) for b in batch]
-            if has_taxon_path
-            else None
-        )
+        # AnnDataDataset 始终返回 taxon_path_ids，无需条件检查
+        taxon_path_seqs = [torch.as_tensor(b["taxon_path_ids"], dtype=torch.long) for b in batch]
 
         # Padding：将序列补齐到当前 Batch 的最大长度
         token_ids = pad_sequences(taxon_seqs, self.pad_taxon_id)
         abund_bins = pad_sequences(abund_seqs, self.pad_bin_id)
-        taxon_path_ids = (
-            pad_matrix_sequences(taxon_path_seqs, pad_value=0)
-            if has_taxon_path and taxon_path_seqs is not None
-            else None
-        )
+        taxon_path_ids = pad_matrix_sequences(taxon_path_seqs, pad_value=0)
 
         # 构建 Attention Mask
         attention_mask = (token_ids != self.pad_taxon_id).to(torch.bool)
@@ -110,8 +102,7 @@ class MiCoCollator:
             "attention_mask": attention_mask, # [B, L]: 注意力掩码 (True=有效, False=Pad)
             "labels_abund": labels_abund,     # [B, L]: 真实标签 (用于计算 Loss)
             "mask_positions": mask_positions, # [B, L]: 布尔矩阵，指示哪些位置被 Mask 了
+            "taxon_path_ids": taxon_path_ids, # [B, L, 5]
         }
-        if taxon_path_ids is not None:
-            batch_out["taxon_path_ids"] = taxon_path_ids  # [B, L, 5]
-        
+
         return batch_out
