@@ -237,10 +237,51 @@ def run_pretrain_once(
     trainer.fit(model, datamodule=dm)
 
     best_score = checkpoint_callback.best_model_score
+    best_model_path = checkpoint_callback.best_model_path
+    val_metrics: dict[str, object] = {}
+
+    # 当最终 epoch 不是固定验证周期的整数倍时，补一次显式验证，避免漏掉 epoch 20。
+    if (
+        config.budget_mode == "epoch"
+        and config.val_interval_epochs is not None
+        and config.max_epochs is not None
+        and config.max_epochs % config.val_interval_epochs != 0
+    ):
+        rank_zero_info(
+            f"{TAG} Final epoch {config.max_epochs} is not aligned with "
+            f"val_interval_epochs={config.val_interval_epochs}; running one final validation."
+        )
+        final_validate = trainer.validate(model, datamodule=dm, verbose=False)
+        if final_validate:
+            val_metrics = final_validate[0]
+            final_val_loss_raw = val_metrics.get("val/loss")
+            if final_val_loss_raw is not None:
+                final_val_loss = (
+                    final_val_loss_raw.item()
+                    if hasattr(final_val_loss_raw, "item")
+                    else float(final_val_loss_raw)
+                )
+                current_best = best_score.item() if best_score is not None else None
+                if current_best is None or final_val_loss < current_best:
+                    best_model_path = os.path.join(ckpt_dir, "micoformer-final-validated.ckpt")
+                    trainer.save_checkpoint(best_model_path)
+                    best_score = None
+                    rank_zero_info(
+                        f"{TAG} Final validation improved best val/loss to {final_val_loss:.6f}; "
+                        f"saved checkpoint to {best_model_path}"
+                    )
+                    return {
+                        "best_model_path": best_model_path,
+                        "best_score": final_val_loss,
+                        "best_val_loss": final_val_loss,
+                        "val_metrics": val_metrics,
+                        "test_metrics": None,
+                    }
+
     return {
-        "best_model_path": checkpoint_callback.best_model_path,
+        "best_model_path": best_model_path,
         "best_score": best_score.item() if best_score is not None else None,
         "best_val_loss": best_score.item() if best_score is not None else None,  # 向后兼容别名
-        "val_metrics": {},   # 预训练暂不做额外 validate，保留 key 供协议消费
+        "val_metrics": val_metrics,
         "test_metrics": None,
     }

@@ -1,0 +1,17 @@
+.gitignore
+.DS_Store
+.vscode/
+
+/tmp/
+/data
+/memory/
+
+__pycache__/
+*.egg-info/
+
+
+tests/
+design/
+
+*.ipynb
+/protocols/hparam_search_v2/runs/
