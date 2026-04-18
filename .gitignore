@@ -14,4 +14,5 @@ tests/
 design/
 
 *.ipynb
+.ipynb_checkpoints/
 /protocols/hparam_search_v2/runs/

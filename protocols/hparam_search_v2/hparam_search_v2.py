@@ -7,6 +7,11 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
+#       jupytext_version: 1.19.1
+#   kernelspec:
+#     display_name: Python (MiCoFormerV2)
+#     language: python
+#     name: micoformerv2
 # ---
 
 # %% [markdown]
@@ -177,13 +182,20 @@ H5AD_PATH = PROJECT_ROOT / "data" / "processed" / "microbiome_dataset.h5ad"
 GPU_IDS = [0, 1, 2]
 NUM_WORKERS = 4
 CPU_THREADS = 1
+GPU_COOLDOWN_SECONDS = runtime.DEFAULT_GPU_COOLDOWN_SECONDS
+MULTI_GPU_MAX_NUM_WORKERS_PER_TRIAL = 4
 SEED = 42
 
 LABEL_FIELD = runtime.DEFAULT_LABEL_FIELD
 LABEL_VALUES = runtime.DEFAULT_LABEL_VALUES
 
-USE_SAFE_STAGE_A_BATCH_GRID = False
+USE_SAFE_STAGE_A_BATCH_GRID = True
 FINAL_COMPARE_SEEDS = [42, 52, 62]
+# R2 优化参数：bias_table 每隔 k 步才反传一次梯度（由 runtime.BIAS_GRAD_EVERY_K 统一控制）
+# 如需覆盖，直接在此处改：BIAS_GRAD_EVERY_K = 8
+BIAS_GRAD_EVERY_K = runtime.BIAS_GRAD_EVERY_K
+
+RUN_ID = "run_20260412_052731"
 
 if "RUN_ID" not in globals():
     RUN_ID = runtime.make_run_id()
@@ -197,6 +209,8 @@ print("H5AD_PATH     =", H5AD_PATH)
 print("GPU_IDS       =", GPU_IDS)
 print("NUM_WORKERS   =", NUM_WORKERS)
 print("CPU_THREADS   =", CPU_THREADS)
+print("GPU_COOLDOWN  =", GPU_COOLDOWN_SECONDS)
+print("MULTI_GPU_NUM_WORKERS =", MULTI_GPU_MAX_NUM_WORKERS_PER_TRIAL)
 print("AVAILABLE_CPU =", runtime.detect_available_cpu_cores())
 
 
@@ -216,11 +230,14 @@ runtime.write_manifest(
         "gpu_ids": GPU_IDS,
         "num_workers": NUM_WORKERS,
         "cpu_threads": CPU_THREADS,
+        "gpu_cooldown_seconds": GPU_COOLDOWN_SECONDS,
+        "multi_gpu_max_num_workers_per_trial": MULTI_GPU_MAX_NUM_WORKERS_PER_TRIAL,
         "seed": SEED,
         "label_field": LABEL_FIELD,
         "label_values": LABEL_VALUES,
         "use_safe_stage_a_batch_grid": USE_SAFE_STAGE_A_BATCH_GRID,
         "final_compare_seeds": FINAL_COMPARE_SEEDS,
+        "bias_grad_every_k": BIAS_GRAD_EVERY_K,
     },
 )
 print("Initialized run directory:", RUN_DIR)
@@ -241,11 +258,11 @@ split_paths
 # 先运行下面 cell 生成命令，然后复制到 tmux。训练过程中可随时运行“刷新状态”。
 
 # %%
-prepare_and_print_stage("a1_coverage")
+prepared = prepare_and_print_stage("a1_coverage")
 
 
 # %%
-show_stage_status("a1_coverage")
+show = show_stage_status("a1_coverage")
 
 
 # %% [markdown]
@@ -284,7 +301,7 @@ CONFIRMED_SHORTLIST
 # ## Stage A-2
 
 # %%
-prepare_and_print_stage("a2_nhead")
+prepared = prepare_and_print_stage("a2_nhead")
 
 
 # %%
@@ -333,11 +350,11 @@ CONFIRMED_LOCKED_ARCH
 # ## Stage A-3
 
 # %%
-prepare_and_print_stage("a3_train_params")
+prepared = prepare_and_print_stage("a3_train_params")
 
 
 # %%
-show_stage_status("a3_train_params")
+show = show_stage_status("a3_train_params")
 
 
 # %% [markdown]
@@ -375,7 +392,7 @@ as_table(promoted_top3, ["model_variant", "selected_rank", "best_val_loss", "che
 # ## Stage B
 
 # %%
-prepare_and_print_stage("b_screen")
+prepared = prepare_and_print_stage("b_screen")
 
 
 # %%
@@ -409,11 +426,11 @@ as_table(promoted_representatives, ["model_variant", "val_macro_f1", "val_auroc"
 # ## Stage C1-A
 
 # %%
-prepare_and_print_stage("c1a_mode")
+prepared = prepare_and_print_stage("c1a_mode")
 
 
 # %%
-show_stage_status("c1a_mode")
+show = show_stage_status("c1a_mode")
 
 
 # %% [markdown]
@@ -426,15 +443,65 @@ runtime.write_manifest(layout["decisions"] / "stage_c_best_mode.yaml", stage_c_b
 as_table(stage_c_best_mode, ["model_variant", "pooling_mode", "freeze_encoder", "val_macro_f1", "val_auroc"])
 
 
+# %%
+# 这里为了强行保持所有模型架构采用相同的模式，决定运行下面这个 cell，来要求大家都采用 sample and mean
+
+stage_c_mode_rows = load_summary("c1a_mode")
+
+# 1. 先保留“各自最优”的自动结果，方便回溯
+stage_c_best_mode_auto = (
+  runtime.select_best_stage_c_block(stage_c_mode_rows, "mode")
+  if stage_c_mode_rows else []
+)
+runtime.write_manifest(
+  layout["decisions"] / "stage_c_best_mode_auto.yaml",
+  stage_c_best_mode_auto,
+)
+
+# 2. 决定是否强制共享 mode
+USE_SHARED_MODE = True
+SHARED_POOLING_MODE = "sample_and_mean"
+SHARED_FREEZE_ENCODER = True
+
+if USE_SHARED_MODE:
+  stage_c_best_mode = [
+      row for row in stage_c_mode_rows
+      if row.get("search_block") == "mode"
+      and row.get("pooling_mode") == SHARED_POOLING_MODE
+      and bool(row.get("freeze_encoder")) is SHARED_FREEZE_ENCODER
+      and row.get("status") == "OK"
+  ]
+
+  stage_c_best_mode = runtime.select_top_k_per_variant(
+      stage_c_best_mode,
+      metric_key="val_macro_f1",
+      k=1,
+      reverse=True,
+      min_ok_per_variant=1,
+      stage_label="Stage C1-A shared-mode selection",
+  )
+else:
+  stage_c_best_mode = stage_c_best_mode_auto
+
+runtime.write_manifest(
+  layout["decisions"] / "stage_c_best_mode.yaml",
+  stage_c_best_mode,
+)
+
+as_table(
+  stage_c_best_mode,
+  ["model_variant", "pooling_mode", "freeze_encoder", "val_macro_f1", "val_auroc"],
+)
+
 # %% [markdown]
 # ## Stage C1-B
 
 # %%
-prepare_and_print_stage("c1b_lr")
+prepared = prepare_and_print_stage("c1b_lr")
 
 
 # %%
-show_stage_status("c1b_lr")
+show = show_stage_status("c1b_lr")
 
 
 # %% [markdown]
@@ -448,10 +515,95 @@ as_table(stage_c_best_lr, ["model_variant", "lr_head", "lr_encoder", "val_macro_
 
 
 # %% [markdown]
+# ## Stage C1-B-supp
+
+# %% [markdown]
+# 刚刚 C1B 强行让所有模型架构都是用了 sample and mean 的方式，所以现在补充再看一下 最优方式是 mean 的两个模型，是什么情况 
+
+# %%
+from pathlib import Path
+import shutil
+import sys
+
+SUPP_RUN_ID = RUN_ID + "_supp_c1b_mode"
+SUPP_RUN_DIR = PROTOCOL_ROOT / "runs" / SUPP_RUN_ID
+supp_layout = runtime.init_run_dir(SUPP_RUN_DIR)
+
+for rel in [
+  "config/run_config.yaml",
+  "config/split_paths.yaml",
+]:
+  src = RUN_DIR / rel
+  dst = SUPP_RUN_DIR / rel
+  dst.parent.mkdir(parents=True, exist_ok=True)
+  shutil.copy2(src, dst)
+
+print("SUPP_RUN_DIR =", SUPP_RUN_DIR)
+print("RUN_DIR      =", RUN_DIR)
+
+# %%
+stage_c_mode_rows = load_summary("c1a_mode")
+stage_c_best_mode_auto = (
+  runtime.select_best_stage_c_block(stage_c_mode_rows, "mode")
+  if stage_c_mode_rows else []
+)
+main_best_mode = runtime.read_manifest(RUN_DIR / "decisions" / "stage_c_best_mode.yaml")
+
+auto_by_variant = {row["model_variant"]: row for row in stage_c_best_mode_auto}
+main_by_variant = {row["model_variant"]: row for row in main_best_mode}
+
+stage_c_best_mode_supp = [
+  main_by_variant["baseline"],
+  auto_by_variant["r1"],
+  main_by_variant["r2"],
+  auto_by_variant["r1r2"],
+]
+
+runtime.write_manifest(
+  SUPP_RUN_DIR / "decisions" / "stage_c_best_mode.yaml",
+  stage_c_best_mode_supp,
+)
+
+main_c1b_rows = runtime.load_rows(RUN_DIR / "stage_c" / "c1b_lr_summary.csv")
+seed_rows = [
+  row for row in main_c1b_rows
+  if row.get("model_variant") in {"baseline", "r2"}
+]
+
+supp_c1b_paths = runtime.get_stage_block_paths(SUPP_RUN_DIR, "c1b_lr")
+runtime.write_rows(seed_rows, supp_c1b_paths["summary"])
+
+as_table(
+  stage_c_best_mode_supp,
+  ["model_variant", "pooling_mode", "freeze_encoder", "val_macro_f1", "val_auroc"],
+)
+
+# %%
+supp_prepared = runtime.prepare_stage_block(SUPP_RUN_DIR, "c1b_lr", num_workers=NUM_WORKERS)
+supp_spec = runtime.get_stage_block_spec("c1b_lr")
+
+print("# Trials     :", len(supp_prepared["tasks"]))
+print("# Plan       :", supp_prepared["paths"]["plan"])
+print("# Live status:", supp_prepared["paths"]["live_status"])
+print("# Summary    :", supp_prepared["paths"]["summary"])
+print()
+print(" ".join([
+  sys.executable,
+  str(PROTOCOL_ROOT / "run_stage.py"),
+  "--run-dir", str(SUPP_RUN_DIR),
+  "--stage-block", "c1b_lr",
+  "--gpu-ids", ",".join(str(gpu_id) for gpu_id in GPU_IDS),
+  "--num-workers", str(NUM_WORKERS),
+]))
+print()
+print("# TensorBoard")
+print(f"tensorboard --logdir {supp_prepared['paths']['log_dir']} --port {supp_spec['tb_port']}")
+
+# %% [markdown]
 # ## Stage C1-C
 
 # %%
-prepare_and_print_stage("c1c_head")
+prepared = prepare_and_print_stage("c1c_head")
 
 
 # %%
@@ -463,7 +615,12 @@ show_stage_status("c1c_head")
 
 # %%
 stage_c_head_rows = load_summary("c1c_head")
-stage_c_finalists = runtime.select_stage_c_finalists(stage_c_head_rows) if stage_c_head_rows else []
+stage_c_all_rows = (
+    load_summary("c1a_mode")
+    + load_summary("c1b_lr")
+    + stage_c_head_rows
+)
+stage_c_finalists = runtime.select_stage_c_finalists(stage_c_all_rows) if stage_c_all_rows else []
 runtime.write_manifest(layout["decisions"] / "final_candidates.yaml", stage_c_finalists)
 as_table(stage_c_finalists, ["role", "model_variant", "val_macro_f1", "val_auroc", "source_checkpoint_path"])
 
@@ -472,7 +629,7 @@ as_table(stage_c_finalists, ["role", "model_variant", "val_macro_f1", "val_auroc
 # ## Stage C2
 
 # %%
-prepare_and_print_stage("c2_final_compare")
+prepared = prepare_and_print_stage("c2_final_compare")
 
 
 # %%

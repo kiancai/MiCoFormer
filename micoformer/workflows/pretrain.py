@@ -36,6 +36,7 @@ class PretrainRunConfig:
     # 1. 模型版本开关
     token_embedding_mode: str = "taxon_path"
     use_taxonomy_bias: bool = False
+    bias_grad_every_k: int = 1        # R2：每 k 步才对 bias_table 计算梯度（1=每步都算，默认行为）
 
     # 2.1. 模型主体参数
     d_model: int = 256
@@ -169,6 +170,7 @@ def run_pretrain_once(
         token_embedding_mode=config.token_embedding_mode,
         rank_vocab_sizes=dm.rank_vocab_sizes,
         use_taxonomy_bias=config.use_taxonomy_bias,
+        bias_grad_every_k=config.bias_grad_every_k,
         lr=config.lr,
         weight_decay=config.weight_decay,
         warmup_ratio=config.warmup_ratio,

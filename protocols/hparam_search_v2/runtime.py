@@ -13,17 +13,23 @@ The experiment control flow remains in `hparam_search_v2.py`.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import shutil
 import statistics
+import subprocess
 import sys
 import time
 import traceback
 from collections import defaultdict
-from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - optional dependency
+    yaml = None
 
 
 PROTOCOL_ROOT = Path(__file__).resolve().parent
@@ -49,6 +55,7 @@ VARIANT_SPECS: dict[str, dict[str, Any]] = {
         "use_taxonomy_bias": True,
     },
 }
+VARIANT_DISPATCH_PRIORITY = ["baseline", "r2", "r1r2", "r1"]
 
 HEAD_REGIMES: dict[str, dict[int, int]] = {
     "standard": {256: 4, 512: 8, 768: 12},
@@ -64,6 +71,10 @@ STAGE_A_WD_GRID = [0.05, 0.1]
 STAGE_A_COVERAGE_MIN_OK = 8
 STAGE_A_TRAIN_PARAM_MIN_OK = 9
 STAGE_C_MIN_OK = 12
+# R2 优化：每隔 k 步才对 bias_table 反传一次梯度，大幅降低 r2/r1r2 变体的训练开销。
+# k=4 是经过 profile 后的推荐值（可将 bias_table 梯度开销降低 ~4x，对模型质量影响极小）。
+# 仅在 use_taxonomy_bias=True 时生效；baseline/r1 使用此参数但不影响行为。
+BIAS_GRAD_EVERY_K: int = 4
 STAGE_B_FIXED_CONFIG = {
     "pooling_mode": "sample_and_mean",
     "freeze_encoder": False,
@@ -88,6 +99,7 @@ STAGE_C_HEAD_DROPOUT = [0.0, 0.1, 0.2]
 DEFAULT_LABEL_FIELD = "Is_Healthy"
 DEFAULT_LABEL_VALUES = ["True", "False"]
 DEFAULT_CPU_THREADS = 1
+DEFAULT_GPU_COOLDOWN_SECONDS = 15
 STAGE_BLOCK_SPECS: dict[str, dict[str, str]] = {
     "a1_coverage": {
         "stage_name": "stage_a",
@@ -219,7 +231,7 @@ def resolve_cpu_runtime_settings(
     }
 
 
-def apply_cpu_runtime_settings(cpu_threads: int) -> None:
+def apply_cpu_runtime_settings(cpu_threads: int, *, touch_torch: bool = True) -> None:
     resolved_threads = max(1, int(cpu_threads))
     env_values = {
         "OMP_NUM_THREADS": str(resolved_threads),
@@ -230,6 +242,9 @@ def apply_cpu_runtime_settings(cpu_threads: int) -> None:
     }
     for key, value in env_values.items():
         os.environ[key] = value
+
+    if not touch_torch:
+        return
 
     try:
         import torch
@@ -332,6 +347,96 @@ def load_rows(csv_path: str | Path) -> list[dict[str, Any]]:
         return [{k: _coerce_scalar(v) for k, v in row.items()} for row in reader]
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"true", "1", "yes", "y", "on"}:
+            return True
+        if raw in {"false", "0", "no", "n", "off", ""}:
+            return False
+    return bool(value)
+
+
+TASK_RESULT_FIELDS = {
+    "status",
+    "start_time",
+    "end_time",
+    "elapsed_seconds",
+    "gpu_id",
+    "error_message",
+    "checkpoint_path",
+    "promoted_checkpoint_path",
+    "best_val_loss",
+    "best_score",
+    "val_macro_f1",
+    "val_auroc",
+    "val_accuracy",
+    "test_macro_f1",
+    "test_auroc",
+    "test_accuracy",
+    "num_seeds",
+    "macro_f1_mean",
+    "macro_f1_std",
+    "macro_f1_best",
+    "auroc_mean",
+    "auroc_std",
+    "accuracy_mean",
+    "accuracy_std",
+}
+TASK_PATHLIKE_FIELDS = {
+    "h5ad_path",
+    "train_indices_path",
+    "val_indices_path",
+    "test_indices_path",
+    "pretrained_ckpt",
+    "source_checkpoint_path",
+    "log_dir",
+    "log_subdir",
+}
+
+
+def _normalize_task_signature_value(key: str, value: Any) -> Any:
+    if key in TASK_PATHLIKE_FIELDS and isinstance(value, str) and value.strip():
+        path = Path(value)
+        if key == "log_subdir":
+            return value.replace("\\", "/")
+        if len(path.parts) >= 2:
+            return "/".join(path.parts[-2:])
+        return path.name
+    if isinstance(value, list):
+        return [_normalize_task_signature_value(key, item) for item in value]
+    if isinstance(value, dict):
+        return {
+            sub_key: _normalize_task_signature_value(sub_key, sub_value)
+            for sub_key, sub_value in sorted(value.items())
+        }
+    return value
+
+
+def compute_task_signature(row: dict[str, Any]) -> str:
+    payload: dict[str, Any] = {}
+    for key, value in row.items():
+        if key in TASK_RESULT_FIELDS or key == "task_signature":
+            continue
+        payload[key] = _normalize_task_signature_value(key, value)
+    if not _as_bool(payload.get("use_taxonomy_bias", False)):
+        payload.pop("bias_grad_every_k", None)
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def attach_task_signature(row: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(row)
+    enriched["task_signature"] = compute_task_signature(enriched)
+    return enriched
+
+
 def write_rows(rows: list[dict[str, Any]], csv_path: str | Path) -> None:
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -381,11 +486,20 @@ def write_rows(rows: list[dict[str, Any]], csv_path: str | Path) -> None:
 def write_manifest(path: str | Path, payload: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
+    if path.suffix == ".json" or yaml is None:
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
+        return
+    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=False))
 
 
 def read_manifest(path: str | Path) -> Any:
-    return json.loads(Path(path).read_text())
+    path = Path(path)
+    text = path.read_text()
+    if path.suffix == ".json":
+        return json.loads(text)
+    if yaml is not None:
+        return yaml.safe_load(text)
+    return json.loads(text)
 
 
 def merge_rows(existing: list[dict[str, Any]], new_row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -446,6 +560,7 @@ def load_run_context(run_dir: str | Path) -> dict[str, Any]:
             requested_num_workers=run_config.get("num_workers", 4),
             requested_cpu_threads=run_config.get("cpu_threads", DEFAULT_CPU_THREADS),
         ),
+        "gpu_cooldown_seconds": int(run_config.get("gpu_cooldown_seconds", DEFAULT_GPU_COOLDOWN_SECONDS)),
         "shortlist_confirmed": (
             read_manifest(decisions_dir / "shortlist_confirmed.yaml")
             if (decisions_dir / "shortlist_confirmed.yaml").exists()
@@ -499,11 +614,64 @@ def validate_variant_ok_counts(
         if ok_counts[variant] < min_ok
     }
     if failures:
+        diagnostics = summarize_variant_failures(rows, failures.keys())
         raise RuntimeError(
             f"{stage_label} has insufficient OK trials: {failures}. "
-            f"V2 requires at least {min_ok} OK runs per variant before continuing."
+            f"V2 requires at least {min_ok} OK runs per variant before continuing. "
+            f"Failure details: {diagnostics}"
         )
     return ok_counts
+
+
+def summarize_variant_failures(
+    rows: list[dict[str, Any]],
+    variants: list[str] | tuple[str, ...] | Any,
+) -> dict[str, dict[str, Any]]:
+    requested = {str(variant) for variant in variants}
+    grouped_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        variant = str(row.get("model_variant", ""))
+        if variant in requested:
+            grouped_rows[variant].append(row)
+
+    diagnostics: dict[str, dict[str, Any]] = {}
+    for variant in sorted(requested):
+        variant_rows = grouped_rows.get(variant, [])
+        status_counts: dict[str, int] = defaultdict(int)
+        error_counts: dict[str, int] = defaultdict(int)
+        recent_trials: list[dict[str, str]] = []
+
+        for row in variant_rows:
+            status = str(row.get("status", "UNKNOWN"))
+            status_counts[status] += 1
+            error_message = str(row.get("error_message", "")).strip()
+            if error_message:
+                first_line = error_message.splitlines()[0].strip()
+                error_counts[first_line] += 1
+
+        def _sort_key(row: dict[str, Any]) -> tuple[str, str]:
+            return (str(row.get("end_time", "")), str(row.get("start_time", "")))
+
+        for row in sorted(variant_rows, key=_sort_key, reverse=True)[:3]:
+            recent_trials.append({
+                "trial_id": str(row.get("trial_id", "")),
+                "status": str(row.get("status", "")),
+                "gpu_id": str(row.get("gpu_id", "")),
+                "end_time": str(row.get("end_time", "")),
+                "error": str(row.get("error_message", "")).splitlines()[0].strip(),
+            })
+
+        top_errors = [
+            {"message": message, "count": count}
+            for message, count in sorted(error_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
+        ]
+
+        diagnostics[variant] = {
+            "status_counts": dict(sorted(status_counts.items())),
+            "top_errors": top_errors,
+            "recent_trials": recent_trials,
+        }
+    return diagnostics
 
 
 def _base_pretrain_task(
@@ -554,6 +722,7 @@ def _base_pretrain_task(
         "min_abundance": 4e-6,
         "token_embedding_mode": variant["token_embedding_mode"],
         "use_taxonomy_bias": variant["use_taxonomy_bias"],
+        "bias_grad_every_k": BIAS_GRAD_EVERY_K,
     }
 
 
@@ -1174,7 +1343,10 @@ def prepare_stage_block(
     *,
     num_workers: int | None = None,
 ) -> dict[str, Any]:
-    tasks = build_tasks_for_stage_block(run_dir, stage_block, num_workers=num_workers)
+    tasks = [
+        attach_task_signature(task)
+        for task in build_tasks_for_stage_block(run_dir, stage_block, num_workers=num_workers)
+    ]
     paths = get_stage_block_paths(run_dir, stage_block)
     write_rows(tasks, paths["plan"])
     return {"tasks": tasks, "paths": paths}
@@ -1372,7 +1544,8 @@ def _prepare_pretrain_config(task: dict[str, Any]) -> Any:
     return PretrainRunConfig(
         h5ad_path=str(task["h5ad_path"]),
         token_embedding_mode=str(task["token_embedding_mode"]),
-        use_taxonomy_bias=bool(task["use_taxonomy_bias"]),
+        use_taxonomy_bias=_as_bool(task["use_taxonomy_bias"]),
+        bias_grad_every_k=int(task.get("bias_grad_every_k", 1)),
         d_model=int(task["d_model"]),
         nhead=int(task["nhead"]),
         num_layers=int(task["num_layers"]),
@@ -1406,7 +1579,7 @@ def _prepare_pretrain_config(task: dict[str, Any]) -> Any:
         gradient_clip_val=float(task["gradient_clip_val"]),
         num_workers=int(task["num_workers"]),
         log_dir=str(task["log_dir"]),
-        no_progress_bar=bool(task["no_progress_bar"]),
+        no_progress_bar=_as_bool(task["no_progress_bar"]),
         early_stopping_patience=int(task["early_stopping_patience"]),
         early_stopping_min_delta=float(task["early_stopping_min_delta"]),
     )
@@ -1421,7 +1594,7 @@ def _prepare_finetune_config(task: dict[str, Any]) -> Any:
         pooling_mode=str(task["pooling_mode"]),
         head_hidden_dim=int(task["head_hidden_dim"]),
         head_dropout=float(task["head_dropout"]),
-        freeze_encoder=bool(task["freeze_encoder"]),
+        freeze_encoder=_as_bool(task["freeze_encoder"]),
         batch_size=int(task["batch_size"]),
         max_seq_len=int(task["max_seq_len"]),
         lr_head=float(task["lr_head"]),
@@ -1448,7 +1621,7 @@ def _prepare_finetune_config(task: dict[str, Any]) -> Any:
         seed=int(task["seed"]),
         num_workers=int(task["num_workers"]),
         log_dir=str(task["log_dir"]),
-        no_progress_bar=bool(task["no_progress_bar"]),
+        no_progress_bar=_as_bool(task["no_progress_bar"]),
     )
 
 
@@ -1484,6 +1657,31 @@ def _apply_live_status_defaults(
     return initialized
 
 
+def validate_existing_task_definitions(
+    tasks: list[dict[str, Any]],
+    existing_rows: list[dict[str, Any]],
+    *,
+    summary_path: Path,
+) -> None:
+    expected_by_id = {str(task["trial_id"]): str(task["task_signature"]) for task in tasks}
+    mismatches: list[str] = []
+    for row in existing_rows:
+        trial_id = str(row.get("trial_id", ""))
+        if trial_id not in expected_by_id:
+            continue
+        existing_signature = str(row.get("task_signature") or compute_task_signature(row))
+        if existing_signature != expected_by_id[trial_id]:
+            mismatches.append(trial_id)
+
+    if mismatches:
+        sample = ", ".join(sorted(mismatches)[:5])
+        raise RuntimeError(
+            f"Existing summary at {summary_path} does not match the current task definitions. "
+            f"Mismatched trial_ids: {sample}. Use a new run_dir or clear the stale summary/live-status files "
+            "before resuming."
+        )
+
+
 def _write_dashboard(rows: list[dict[str, Any]], dashboard_path: str | Path) -> None:
     counts: dict[str, int] = defaultdict(int)
     for row in rows:
@@ -1512,6 +1710,38 @@ def _sorted_summary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             str(row.get("trial_id", "")),
         ),
     )
+
+
+def prioritize_pending_tasks(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    passthrough: list[dict[str, Any]] = []
+    for task in pending:
+        variant = str(task.get("model_variant", ""))
+        if variant:
+            grouped[variant].append(task)
+        else:
+            passthrough.append(task)
+
+    if len(grouped) <= 1:
+        return pending
+
+    variant_order = [variant for variant in VARIANT_DISPATCH_PRIORITY if grouped.get(variant)]
+    variant_order.extend(
+        variant for variant in sorted(grouped) if variant not in variant_order
+    )
+
+    reordered: list[dict[str, Any]] = []
+    while True:
+        progressed = False
+        for variant in variant_order:
+            if grouped[variant]:
+                reordered.append(grouped[variant].pop(0))
+                progressed = True
+        if not progressed:
+            break
+
+    reordered.extend(passthrough)
+    return reordered
 
 
 def _execute_task(task: dict[str, Any], gpu_id: int) -> dict[str, Any]:
@@ -1589,22 +1819,199 @@ def _execute_task(task: dict[str, Any], gpu_id: int) -> dict[str, Any]:
     return row
 
 
-def _worker(task_queue: Any, result_queue: Any, gpu_id: int, cpu_threads: int) -> None:
-    apply_cpu_runtime_settings(cpu_threads)
-    while True:
-        task = task_queue.get()
-        if task is None:
-            break
-        result_queue.put({
-            "event": "started",
-            "trial_id": str(task["trial_id"]),
+def _run_tasks_in_process(
+    pending: list[dict[str, Any]],
+    *,
+    existing: list[dict[str, Any]],
+    gpu_id: int,
+    summary_path: Path,
+    live_status_path: Path,
+    dashboard_path: Path,
+) -> list[dict[str, Any]]:
+    rows = existing[:]
+    live_rows_by_id = {
+        str(row["trial_id"]): row
+        for row in load_rows(live_status_path)
+    }
+
+    for task in pending:
+        trial_id = str(task["trial_id"])
+        live_row = live_rows_by_id[trial_id]
+        live_row["status"] = "RUNNING"
+        live_row["gpu_id"] = gpu_id
+        live_row["start_time"] = _timestamp_now()
+        write_rows(list(live_rows_by_id.values()), live_status_path)
+        _write_dashboard(list(live_rows_by_id.values()), dashboard_path)
+
+        row = _execute_task(task, gpu_id)
+        rows = merge_rows(rows, row)
+        live_rows_by_id[trial_id] = dict(row)
+        write_rows(_sorted_summary_rows(rows), summary_path)
+        write_rows(list(live_rows_by_id.values()), live_status_path)
+        _write_dashboard(list(live_rows_by_id.values()), dashboard_path)
+
+    return load_rows(summary_path)
+
+
+def _tail_text(path: Path, max_chars: int = 4000) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(errors="replace")
+    return text[-max_chars:]
+
+
+def _run_tasks_with_external_processes(
+    pending: list[dict[str, Any]],
+    *,
+    existing: list[dict[str, Any]],
+    gpu_ids: list[int],
+    cpu_threads: int,
+    gpu_cooldown_seconds: int,
+    summary_path: Path,
+    live_status_path: Path,
+    dashboard_path: Path,
+) -> list[dict[str, Any]]:
+    rows = existing[:]
+    live_rows_by_id = {
+        str(row["trial_id"]): row
+        for row in load_rows(live_status_path)
+    }
+    pending_queue = list(pending)
+    active_by_trial: dict[str, dict[str, Any]] = {}
+    gpu_ready_at = {int(gpu_id): 0.0 for gpu_id in gpu_ids}
+    task_dir = dashboard_path.parent / ".task_runner"
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    def finalize_row(row: dict[str, Any]) -> None:
+        nonlocal rows
+        trial_id = str(row["trial_id"])
+        rows = merge_rows(rows, row)
+        live_rows_by_id[trial_id] = dict(row)
+        write_rows(_sorted_summary_rows(rows), summary_path)
+        write_rows(list(live_rows_by_id.values()), live_status_path)
+        _write_dashboard(list(live_rows_by_id.values()), dashboard_path)
+
+    def start_task(task: dict[str, Any], gpu_id: int) -> None:
+        trial_id = str(task["trial_id"])
+        live_row = live_rows_by_id[trial_id]
+        live_row["status"] = "RUNNING"
+        live_row["gpu_id"] = gpu_id
+        live_row["start_time"] = _timestamp_now()
+        write_rows(list(live_rows_by_id.values()), live_status_path)
+        _write_dashboard(list(live_rows_by_id.values()), dashboard_path)
+
+        task_path = task_dir / f"{trial_id}.task.json"
+        result_path = task_dir / f"{trial_id}.result.json"
+        log_path = task_dir / f"{trial_id}.log"
+        write_manifest(task_path, task)
+        if result_path.exists():
+            result_path.unlink()
+        log_handle = log_path.open("w")
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(PROTOCOL_ROOT / "run_trial.py"),
+                "--task-json",
+                str(task_path),
+                "--gpu-id",
+                str(gpu_id),
+                "--result-json",
+                str(result_path),
+                "--cpu-threads",
+                str(cpu_threads),
+            ],
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            cwd=str(PROJECT_ROOT),
+            text=True,
+        )
+        active_by_trial[trial_id] = {
+            "proc": proc,
             "gpu_id": gpu_id,
-            "start_time": _timestamp_now(),
-        })
-        result_queue.put({
-            "event": "finished",
-            "row": _execute_task(task, gpu_id),
-        })
+            "task": dict(task),
+            "task_path": task_path,
+            "result_path": result_path,
+            "log_path": log_path,
+            "log_handle": log_handle,
+            "launched_at": time.time(),
+        }
+
+    def start_ready_tasks() -> None:
+        now = time.time()
+        busy_gpu_ids = {int(info["gpu_id"]) for info in active_by_trial.values()}
+        for gpu_id in gpu_ids:
+            gpu_id = int(gpu_id)
+            if not pending_queue:
+                break
+            if gpu_id in busy_gpu_ids:
+                continue
+            if now < gpu_ready_at[gpu_id]:
+                continue
+            start_task(pending_queue.pop(0), gpu_id)
+
+    start_ready_tasks()
+
+    while active_by_trial or pending_queue:
+        finished_trials: list[tuple[str, dict[str, Any]]] = []
+        for trial_id, info in list(active_by_trial.items()):
+            proc = info["proc"]
+            exitcode = proc.poll()
+            if exitcode is None:
+                continue
+            finished_trials.append((trial_id, info))
+
+        if not finished_trials:
+            start_ready_tasks()
+            time.sleep(0.5)
+            continue
+
+        for trial_id, info in finished_trials:
+            proc = info["proc"]
+            gpu_id = int(info["gpu_id"])
+            task = dict(info["task"])
+            task_path = Path(info["task_path"])
+            result_path = Path(info["result_path"])
+            log_path = Path(info["log_path"])
+            log_handle = info["log_handle"]
+            launched_at = float(info["launched_at"])
+            log_handle.close()
+            exitcode = proc.returncode
+            active_by_trial.pop(trial_id)
+
+            if result_path.exists():
+                row = read_manifest(result_path)
+            else:
+                live_row = live_rows_by_id[trial_id]
+                start_time = str(live_row.get("start_time", "")) or _timestamp_now()
+                tail = _tail_text(log_path).strip()
+                error_message = (
+                    "External task process exited before producing a result "
+                    f"(exitcode={exitcode})."
+                )
+                if tail:
+                    error_message = f"{error_message}\n{tail}"
+                row = dict(task)
+                row.update({
+                    "status": "ERROR",
+                    "gpu_id": gpu_id,
+                    "start_time": start_time,
+                    "end_time": _timestamp_now(),
+                    "elapsed_seconds": round(time.time() - launched_at, 2),
+                    "checkpoint_path": "",
+                    "error_message": error_message,
+                })
+
+            finalize_row(row)
+            gpu_ready_at[gpu_id] = time.time() + max(0, int(gpu_cooldown_seconds))
+
+            if task_path.exists():
+                task_path.unlink()
+            if result_path.exists():
+                result_path.unlink()
+
+        start_ready_tasks()
+
+    return load_rows(summary_path)
 
 
 def run_tasks(
@@ -1613,11 +2020,12 @@ def run_tasks(
     summary_path: str | Path,
     gpu_ids: list[int],
     cpu_threads: int = DEFAULT_CPU_THREADS,
+    gpu_cooldown_seconds: int = DEFAULT_GPU_COOLDOWN_SECONDS,
     live_status_path: str | Path | None = None,
     dashboard_path: str | Path | None = None,
     retry_failed: bool = False,
 ) -> list[dict[str, Any]]:
-    apply_cpu_runtime_settings(cpu_threads)
+    apply_cpu_runtime_settings(cpu_threads, touch_torch=False)
     summary_path = Path(summary_path)
     live_status_path = Path(live_status_path) if live_status_path is not None else summary_path.with_name(
         summary_path.stem.replace("_summary", "_live_status") + summary_path.suffix
@@ -1626,6 +2034,7 @@ def run_tasks(
         summary_path.stem.replace("_summary", "_dashboard") + ".json"
     )
     existing = load_rows(summary_path)
+    validate_existing_task_definitions(tasks, existing, summary_path=summary_path)
     live_rows = _apply_live_status_defaults(tasks, existing, retry_failed=retry_failed)
     write_rows(live_rows, live_status_path)
     _write_dashboard(live_rows, dashboard_path)
@@ -1636,52 +2045,30 @@ def run_tasks(
         if row.get("status") == "OK" and not retry_failed
     }
     pending = [task for task in tasks if str(task["trial_id"]) not in completed]
+    pending = prioritize_pending_tasks(pending)
     if not pending:
         return existing
 
-    ctx = get_context("spawn")
-    task_queue = ctx.Queue()
-    result_queue = ctx.Queue()
-    worker_count = min(len(gpu_ids), len(pending))
+    if len(gpu_ids) == 1:
+        return _run_tasks_in_process(
+            pending,
+            existing=existing,
+            gpu_id=int(gpu_ids[0]),
+            summary_path=summary_path,
+            live_status_path=live_status_path,
+            dashboard_path=dashboard_path,
+        )
 
-    for task in pending:
-        task_queue.put(task)
-    for _ in range(worker_count):
-        task_queue.put(None)
-
-    workers = []
-    for gpu_id in gpu_ids[:worker_count]:
-        proc = ctx.Process(target=_worker, args=(task_queue, result_queue, gpu_id, cpu_threads))
-        proc.start()
-        workers.append(proc)
-
-    rows = existing[:]
-    events_expected = len(pending) * 2
-    live_rows_by_id = {str(row["trial_id"]): row for row in live_rows}
-    for _ in range(events_expected):
-        payload = result_queue.get()
-        if payload.get("event") == "started":
-            trial_id = str(payload["trial_id"])
-            row = live_rows_by_id[trial_id]
-            row["status"] = "RUNNING"
-            row["gpu_id"] = payload["gpu_id"]
-            row["start_time"] = payload["start_time"]
-            write_rows(list(live_rows_by_id.values()), live_status_path)
-            _write_dashboard(list(live_rows_by_id.values()), dashboard_path)
-            continue
-
-        row = payload["row"]
-        trial_id = str(row["trial_id"])
-        rows = merge_rows(rows, row)
-        live_rows_by_id[trial_id] = dict(row)
-        write_rows(_sorted_summary_rows(rows), summary_path)
-        write_rows(list(live_rows_by_id.values()), live_status_path)
-        _write_dashboard(list(live_rows_by_id.values()), dashboard_path)
-
-    for proc in workers:
-        proc.join()
-
-    return load_rows(summary_path)
+    return _run_tasks_with_external_processes(
+        pending,
+        existing=existing,
+        gpu_ids=gpu_ids[: min(len(gpu_ids), len(pending))],
+        cpu_threads=cpu_threads,
+        gpu_cooldown_seconds=gpu_cooldown_seconds,
+        summary_path=summary_path,
+        live_status_path=live_status_path,
+        dashboard_path=dashboard_path,
+    )
 
 
 def write_plan(tasks: list[dict[str, Any]], plan_path: str | Path) -> None:
@@ -1701,7 +2088,14 @@ def select_stage_b_representatives(rows: list[dict[str, Any]]) -> list[dict[str,
 
 def select_best_stage_c_block(rows: list[dict[str, Any]], search_block: str) -> list[dict[str, Any]]:
     block_rows = [row for row in rows if row.get("search_block") == search_block]
-    return select_top_k_per_variant(block_rows, metric_key="val_macro_f1", k=1, reverse=True)
+    return select_top_k_per_variant(
+        block_rows,
+        metric_key="val_macro_f1",
+        k=1,
+        reverse=True,
+        min_ok_per_variant=1,
+        stage_label=f"Stage C1 {search_block} selection",
+    )
 
 
 def select_stage_c_finalists(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1787,6 +2181,15 @@ def validate_stage_block_results(stage_block: str, rows: list[dict[str, Any]]) -
     if stage_block == "b_screen":
         select_stage_b_representatives(rows)
         return
+    if stage_block == "c1a_mode":
+        validate_variant_ok_counts(rows, min_ok=1, stage_label="Stage C1-A mode search")
+        return
+    if stage_block == "c1b_lr":
+        validate_variant_ok_counts(rows, min_ok=1, stage_label="Stage C1-B lr search")
+        return
+    if stage_block == "c1c_head":
+        validate_variant_ok_counts(rows, min_ok=1, stage_label="Stage C1-C head search")
+        return
     if stage_block == "c2_final_compare":
         grouped: dict[str, int] = defaultdict(int)
         for row in rows:
@@ -1822,6 +2225,15 @@ def run_stage_block(
         requested_cpu_threads=context["run_config"].get("cpu_threads", DEFAULT_CPU_THREADS),
     )
     prepared = prepare_stage_block(run_dir, stage_block, num_workers=num_workers)
+    if len(gpu_ids) > 1:
+        adjusted_workers = min(
+            int(cpu_runtime["safe_num_workers"]),
+            int(context["run_config"].get("multi_gpu_max_num_workers_per_trial", 0)),
+        )
+        for task in prepared["tasks"]:
+            task["num_workers"] = adjusted_workers
+            task["task_signature"] = compute_task_signature(task)
+        write_rows(prepared["tasks"], prepared["paths"]["plan"])
     rows = run_tasks(
         prepared["tasks"],
         summary_path=prepared["paths"]["summary"],
@@ -1829,6 +2241,7 @@ def run_stage_block(
         dashboard_path=prepared["paths"]["dashboard"],
         gpu_ids=gpu_ids,
         cpu_threads=int(cpu_runtime["safe_cpu_threads"]),
+        gpu_cooldown_seconds=int(context["run_config"].get("gpu_cooldown_seconds", DEFAULT_GPU_COOLDOWN_SECONDS)),
         retry_failed=retry_failed,
     )
     validate_stage_block_results(stage_block, rows)
