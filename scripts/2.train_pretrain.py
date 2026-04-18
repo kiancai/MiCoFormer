@@ -41,6 +41,9 @@ def build_argparser() -> argparse.ArgumentParser:
     # 1.模型版本开关
     p.add_argument("--token_embedding_mode", type=str, default="taxon_path", choices=["taxon", "taxon_path"])
     p.add_argument("--use_taxonomy_bias", action="store_true", default=False)
+    p.add_argument("--bias_grad_every_k", type=int, default=1,
+                   help="R2：每 k 步才对 bias_table 计算梯度（1=每步都算，默认行为；建议 4~8 以降低开销）。"
+                        "仅在 --use_taxonomy_bias 时生效。")
 
     # 2.1.模型主体参数
     p.add_argument("--d_model", type=int, default=256)                # token embedding 的维度，也是模型中间层的维度
@@ -114,6 +117,7 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         h5ad_path=args.h5ad_path,
         token_embedding_mode=args.token_embedding_mode,
         use_taxonomy_bias=args.use_taxonomy_bias,
+        bias_grad_every_k=args.bias_grad_every_k,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

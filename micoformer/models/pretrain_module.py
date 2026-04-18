@@ -28,6 +28,7 @@ class MiCoFormerModule(L.LightningModule):
         token_embedding_mode: str = "taxon_path",
         rank_vocab_sizes: Dict[str, int],
         use_taxonomy_bias: bool = False,  # R2：启用 taxonomy 距离注意力偏置
+        bias_grad_every_k: int = 1,        # R2：每 k 步才对 bias_table 计算梯度（1=每步都算）
         lr: float = 3e-4,
         weight_decay: float = 1e-2,
         warmup_ratio: float = 0.02,
@@ -54,6 +55,7 @@ class MiCoFormerModule(L.LightningModule):
             token_embedding_mode=token_embedding_mode,
             rank_vocab_sizes=rank_vocab_sizes,
             use_taxonomy_bias=use_taxonomy_bias,
+            bias_grad_every_k=bias_grad_every_k,
         )
 
         # 预训练任务头

@@ -85,6 +85,7 @@ class MiCoFormerClassifier(L.LightningModule):
             token_embedding_mode=_encoder_hparams["token_embedding_mode"],
             rank_vocab_sizes=dict(_encoder_hparams["rank_vocab_sizes"]),
             use_taxonomy_bias=_encoder_hparams.get("use_taxonomy_bias", False),
+            bias_grad_every_k=_encoder_hparams.get("bias_grad_every_k", 1),
         )
 
         if _pretrained_encoder is not None:
