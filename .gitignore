@@ -1,6 +1,7 @@
 .gitignore
 .DS_Store
 .vscode/
+.vscode/sftp.json
 
 /tmp/
 /data
@@ -16,3 +17,13 @@ design/
 *.ipynb
 .ipynb_checkpoints/
 /protocols/hparam_search_v2/runs/
+/protocols/hparam_search_v2/analysis/figures/
+/protocols/hparam_search_v2/analysis/generate_figures.R
+/protocols/hparam_search_v2_old/*
+
+checkpoints/
+*.ckpt
+events.out.tfevents.*
+lightning_logs/
+wandb/
+protocols/hparam_search_v2_old/run_stage.py
