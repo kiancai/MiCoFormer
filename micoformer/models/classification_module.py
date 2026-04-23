@@ -133,6 +133,7 @@ class MiCoFormerClassifier(L.LightningModule):
                 metrics = MetricCollection({
                     "acc": MulticlassAccuracy(num_classes=nc, average="macro"),
                     "f1_macro": MulticlassF1Score(num_classes=nc, average="macro"),
+                    "f1_weighted": MulticlassF1Score(num_classes=nc, average="weighted"),
                     "auroc": MulticlassAUROC(num_classes=nc, average="macro"),
                 })
                 # 注册为子模块，确保自动 device 迁移

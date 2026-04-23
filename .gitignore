@@ -20,6 +20,8 @@ design/
 /protocols/hparam_search_v2/analysis/figures/
 /protocols/hparam_search_v2/analysis/generate_figures.R
 /protocols/hparam_search_v2_old/*
+/protocols/aligned_benchmark/
+.Rhistory
 
 checkpoints/
 *.ckpt

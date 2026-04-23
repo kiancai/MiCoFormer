@@ -15,7 +15,6 @@ from micoformer.models.taxonomy_bias import (
     compute_taxonomy_bucket_matrix,
 )
 
-
 class MiCoFormerEncoder(nn.Module):
 
     def __init__(
@@ -160,8 +159,12 @@ class MiCoFormerEncoder(nn.Module):
             else:
                 _need_bias_grad = False
 
-            if _FLEX_ATTENTION_AVAILABLE:
-                # FlexAttention 路径：在 score_mod 内直接从 path_ids 计算 LCA bucket。
+            # FlexAttention + torch.compile 会切断 score_mod 内 bias_table 的 autograd 连接，
+            # 导致 bias_table 永远收不到梯度（grad_fn=None → grad=None）。
+            # 因此：需要 bias_table 梯度时（_need_bias_grad=True），强制使用 SDPA 回退路径；
+            # 推理或 detach 步（_need_bias_grad=False），仍可用 FlexAttention 获得速度优势。
+            if _FLEX_ATTENTION_AVAILABLE and not _need_bias_grad:
+                # FlexAttention 路径（仅推理/detach 步）：在 score_mod 内直接从 path_ids 计算 LCA bucket。
                 #
                 # 内存优化：用 4 个独立的 [B, L+1] int16 张量（共 ~420 KB）替代
                 # full_bucket [B, L+1, L+1] uint8（~5 MB），cache 利用率更高。
@@ -176,16 +179,15 @@ class MiCoFormerEncoder(nn.Module):
                 order_ids  = torch.cat([zeros_1d, pids[:, :, 2]], dim=1)
                 family_ids = torch.cat([zeros_1d, pids[:, :, 3]], dim=1)
 
-                _bt = (self.taxonomy_bias_params.bias_table
-                       if _need_bias_grad
-                       else self.taxonomy_bias_params.bias_table.detach())
+                _bt = self.taxonomy_bias_params.bias_table.detach()
 
                 # 用稳定的 callable 对象替代每次新建的闭包：
                 # 同一对象 → torch.compile identity guard 命中 → 不重新编译 Triton kernel
                 self._score_mod_obj.update(phylum_ids, class_ids, order_ids, family_ids, _bt)
                 score_mod = self._score_mod_obj
             else:
-                # 回退路径：物化 float bias（SDPA，Flash 会被禁用）
+                # SDPA 回退路径：物化 float bias（Flash 会被禁用，但梯度正确流通到 bias_table）。
+                # 当 _FLEX_ATTENTION_AVAILABLE=False 或 _need_bias_grad=True 时均走此路径。
                 bucket_matrix = compute_taxonomy_bucket_matrix(taxon_path_ids)  # [B, L, L]
                 if _need_bias_grad:
                     taxon_bias = self.taxonomy_bias_params(bucket_matrix)       # [B, nhead, L, L]
