@@ -10,9 +10,10 @@ from micoformer.models.taxonomy_bias import (
     BiasedTransformerEncoder,
     BiasedTransformerEncoderLayer,
     TaxonomyBiasParams,
+    _FLEX_ATTENTION_AVAILABLE,
+    _TaxonomyScoreModCallable,
     compute_taxonomy_bucket_matrix,
 )
-
 
 class MiCoFormerEncoder(nn.Module):
 
@@ -31,11 +32,15 @@ class MiCoFormerEncoder(nn.Module):
         token_embedding_mode: str = "taxon_path",
         rank_vocab_sizes: Dict[str, int],
         use_taxonomy_bias: bool = False,  # R2：启用 taxonomy 距离注意力偏置
+        bias_grad_every_k: int = 1,       # R2：每 k 步才对 bias_table 计算梯度（1=每步都算，默认行为）
     ) -> None:
         super().__init__()
         self.pad_taxon_id = pad_taxon_id
         self.nhead = nhead
         self.use_taxonomy_bias = use_taxonomy_bias
+        self.bias_grad_every_k = bias_grad_every_k
+        # 不是 nn.Parameter，不进入 state_dict，仅用于训练时的步数计数
+        self._bias_grad_counter: int = 0
 
         if token_embedding_mode not in {"taxon", "taxon_path"}:
             raise ValueError(
@@ -79,6 +84,10 @@ class MiCoFormerEncoder(nn.Module):
             self.encoder = BiasedTransformerEncoder(biased_layer, num_layers=num_layers)
             # 可学习的 taxonomy 偏置参数表 [nhead, 5]，初始化为全零
             self.taxonomy_bias_params = TaxonomyBiasParams(nhead=nhead)
+            # FlexAttention score_mod 稳定包装器：__init__ 时创建一次，forward 里只更新引用
+            # 避免每次 forward 新建闭包导致 torch.compile identity guard miss（重新编译）
+            if _FLEX_ATTENTION_AVAILABLE:
+                self._score_mod_obj = _TaxonomyScoreModCallable()
         else:
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=d_model,
@@ -130,22 +139,72 @@ class MiCoFormerEncoder(nn.Module):
         sample_vec = self.sample_embed.weight.view(1, 1, -1).expand(B, -1, -1)
         x = torch.cat([sample_vec, x], dim=1)  # [B, L+1, d_model]
 
-        # R2：计算 taxonomy attention bias，零初始化的 bias_table 保证训练初期无影响
-        # taxon-taxon 部分 [B, nhead, L, L] → 扩展为 [B, nhead, L+1, L+1]
-        # [SAMPLE] 行/列（index 0）保持 0（中性偏置，不偏向任何进化谱系）
+        # R2：构造 taxonomy attention bias
+        # FlexAttention 路径（推荐）：bucket_matrix 留在 GPU 上，bias 查表融入 Triton kernel，
+        #   不物化 [B, nhead, L+1, L+1] float 矩阵，backward 无需 scatter_add。
+        # 回退路径（PyTorch < 2.5）：预先展开为 float bias，传给标准 SDPA（Flash 会被禁用）。
         attn_bias = None
+        score_mod = None
         if self.use_taxonomy_bias:
-            bucket_matrix = compute_taxonomy_bucket_matrix(taxon_path_ids)  # [B, L, L]
-            taxon_bias = self.taxonomy_bias_params(bucket_matrix)            # [B, nhead, L, L]
-            L_seq = taxon_bias.shape[2]
-            full_bias = torch.zeros(B, self.nhead, L_seq + 1, L_seq + 1,
-                                    dtype=taxon_bias.dtype, device=taxon_bias.device)
-            full_bias[:, :, 1:, 1:] = taxon_bias
-            attn_bias = full_bias
+            L_tok = taxon_path_ids.shape[1]
+
+            # ── bias_grad_every_k 判断（两条路径共用）────────────────────────────
+            # 训练模式下：每 bias_grad_every_k 步才对 bias_table 做梯度反传；
+            # eval 模式下：始终 detach（推理不需要梯度）。
+            # k=1（默认）：行为与旧版完全一致，每步都计算梯度。
+            if self.training:
+                self._bias_grad_counter += 1
+                _need_bias_grad = (self.bias_grad_every_k == 1 or
+                                   self._bias_grad_counter % self.bias_grad_every_k == 0)
+            else:
+                _need_bias_grad = False
+
+            # FlexAttention + torch.compile 会切断 score_mod 内 bias_table 的 autograd 连接，
+            # 导致 bias_table 永远收不到梯度（grad_fn=None → grad=None）。
+            # 因此：需要 bias_table 梯度时（_need_bias_grad=True），强制使用 SDPA 回退路径；
+            # 推理或 detach 步（_need_bias_grad=False），仍可用 FlexAttention 获得速度优势。
+            if _FLEX_ATTENTION_AVAILABLE and not _need_bias_grad:
+                # FlexAttention 路径（仅推理/detach 步）：在 score_mod 内直接从 path_ids 计算 LCA bucket。
+                #
+                # 内存优化：用 4 个独立的 [B, L+1] int16 张量（共 ~420 KB）替代
+                # full_bucket [B, L+1, L+1] uint8（~5 MB），cache 利用率更高。
+                #
+                # 重要：score_mod 内不能混用 tensor 索引和 Python int 常量（如 ids[b, q, 0]），
+                # 因为 FlexAttention 内部用 vmap，混合索引会触发隐式 .item() 报错。
+                # 解决方案：把 4 个 rank 拆成独立 2D 张量，统一使用 ids[b, q] 双张量索引。
+                zeros_1d = torch.zeros(B, 1, dtype=torch.int16, device=x.device)
+                pids = taxon_path_ids[:, :, :4].to(torch.int16)  # [B, L, 4]
+                phylum_ids = torch.cat([zeros_1d, pids[:, :, 0]], dim=1)  # [B, L+1]
+                class_ids  = torch.cat([zeros_1d, pids[:, :, 1]], dim=1)
+                order_ids  = torch.cat([zeros_1d, pids[:, :, 2]], dim=1)
+                family_ids = torch.cat([zeros_1d, pids[:, :, 3]], dim=1)
+
+                _bt = self.taxonomy_bias_params.bias_table.detach()
+
+                # 用稳定的 callable 对象替代每次新建的闭包：
+                # 同一对象 → torch.compile identity guard 命中 → 不重新编译 Triton kernel
+                self._score_mod_obj.update(phylum_ids, class_ids, order_ids, family_ids, _bt)
+                score_mod = self._score_mod_obj
+            else:
+                # SDPA 回退路径：物化 float bias（Flash 会被禁用，但梯度正确流通到 bias_table）。
+                # 当 _FLEX_ATTENTION_AVAILABLE=False 或 _need_bias_grad=True 时均走此路径。
+                bucket_matrix = compute_taxonomy_bucket_matrix(taxon_path_ids)  # [B, L, L]
+                if _need_bias_grad:
+                    taxon_bias = self.taxonomy_bias_params(bucket_matrix)       # [B, nhead, L, L]
+                else:
+                    with torch.no_grad():
+                        taxon_bias = self.taxonomy_bias_params(bucket_matrix)
+                full_bias = torch.zeros(
+                    B, self.nhead, L_tok + 1, L_tok + 1,
+                    dtype=taxon_bias.dtype, device=taxon_bias.device,
+                )
+                full_bias[:, :, 1:, 1:] = taxon_bias
+                attn_bias = full_bias
 
         # Transformer 前向（两种路径接口不同）
         if self.use_taxonomy_bias:
-            h = self.encoder(x, key_padding_mask=key_padding_mask, attn_bias=attn_bias)
+            h = self.encoder(x, key_padding_mask=key_padding_mask,
+                             attn_bias=attn_bias, score_mod=score_mod)
         else:
             h = self.encoder(x, src_key_padding_mask=key_padding_mask)
 
