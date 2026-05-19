@@ -18,6 +18,7 @@ from micoformer.datamodules.classification_datamodule import ClassificationDataM
 from micoformer.models.classification_module import MiCoFormerClassifier
 from micoformer.utils.train_utils import (
     choose_precision,
+    inject_var_buffers,
     validate_finetune_config,
     validate_index_arrays,
     validate_no_split_overlap,
@@ -34,7 +35,9 @@ class FinetuneRunConfig:
     pretrained_ckpt: str
 
     # 1. 分类头 / pooling 参数
-    pooling_mode: str = "mean_pool"
+    pooling_mode: str = "pma"          # V5 默认 pma;旧 sample/sample_and_mean 已删除
+    pma_nhead: int | None = None        # None → 从 ckpt hparams 继承
+    pma_k: int | None = None            # None → 从 ckpt hparams 继承(默认 1)
     head_hidden_dim: int = 0
     head_dropout: float = 0.1
     freeze_encoder: bool = False
@@ -174,9 +177,12 @@ def run_finetune_once(
     _num_bins = int(_phparams.get("total_abundance_bins", 42)) - 2
     _min_abund = float(_phparams.get("min_abundance", 4e-6))
     _abund_mode = str(_phparams.get("abundance_mode", "abs_log_bins"))
+    # V5: 同时继承 abundance_encoding,确保 finetune Dataset 产出的字段与 encoder 期望一致
+    _abund_encoding = str(_phparams.get("abundance_encoding", "mlp"))
     rank_zero_info(
         f"{TAG} Inherited from pretrain ckpt: num_abundance_bins={_num_bins}, "
-        f"min_abundance={_min_abund}, abundance_mode={_abund_mode}"
+        f"min_abundance={_min_abund}, abundance_mode={_abund_mode}, "
+        f"abundance_encoding={_abund_encoding}"
     )
 
     chosen_precision = choose_precision(config.precision)
@@ -216,6 +222,7 @@ def run_finetune_once(
         num_abundance_bins=_num_bins,
         min_abundance=_min_abund,
         abundance_mode=_abund_mode,
+        abundance_encoding=_abund_encoding,  # V5
     )
 
     # 2. 构建任务配置
@@ -236,6 +243,8 @@ def run_finetune_once(
         pretrained_ckpt_path=config.pretrained_ckpt,
         task_configs=task_configs,
         pooling_mode=config.pooling_mode,
+        pma_nhead=config.pma_nhead,
+        pma_k=config.pma_k,
         head_hidden_dim=config.head_hidden_dim,
         head_dropout=config.head_dropout,
         freeze_encoder=config.freeze_encoder,
@@ -249,6 +258,32 @@ def run_finetune_once(
         plateau_min_lr=config.lr_plateau_min_lr,
         monitor_metric=monitor_metric,
     )
+
+    # V4 R2 + V5 PhyloPE：encoder 的 dist_matrix 与 phylo_pe.coords 都是 persistent=False buffer
+    # 加载预训练 ckpt 后必须重新注入,否则 forward 报错
+    _bias_type = getattr(model.encoder, "bias_type", "none")
+    _dm_matrix = None
+    if _bias_type != "none":
+        if _bias_type == "taxo":
+            _dm_matrix = dm.taxo_dist_matrix
+        elif _bias_type == "phylo":
+            _dm_matrix = dm.phylo_dist_matrix
+        if _dm_matrix is None:
+            raise RuntimeError(
+                f"Pretrained encoder uses bias_type={_bias_type!r}, but DataModule did not load "
+                f"varp['{_bias_type}_dist']. Check that the finetune h5ad has the matching varp key."
+            )
+    _pe_coords = dm.phylo_pe_coords_raw if model.encoder.phylo_pe is not None else None
+    if model.encoder.phylo_pe is not None and _pe_coords is None:
+        raise RuntimeError(
+            "Pretrained encoder uses PhyloPE, but finetune DataModule did not load "
+            "varm['position_encoding']. Check that the finetune h5ad has it."
+        )
+    rank_zero_info(
+        f"{TAG} Injecting var buffers (bias_type={_bias_type}, "
+        f"phylo_pe={'yes' if _pe_coords is not None else 'no'})"
+    )
+    inject_var_buffers(model.encoder, _dm_matrix, _pe_coords)
 
     # 4. 设置日志记录器与回调
     # 加 uuid 后缀避免同秒并行启动的时间戳碰撞（P2-14）

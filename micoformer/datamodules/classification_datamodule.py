@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import anndata as ad
 import lightning as L
+import torch
 from torch.utils.data import DataLoader, Subset
 
 from micoformer.data.datasets import AnnDataDataset, build_taxon_path_ids
@@ -61,6 +62,8 @@ class ClassificationDataModule(L.LightningDataModule):
         num_abundance_bins: int = 40,
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
+        # V5 新增
+        abundance_encoding: str = "mlp",
     ) -> None:
         super().__init__()
         self.h5ad_path = h5ad_path
@@ -74,6 +77,7 @@ class ClassificationDataModule(L.LightningDataModule):
         self.num_abundance_bins = num_abundance_bins
         self.min_abundance = min_abundance
         self.abundance_mode = abundance_mode
+        self.abundance_encoding = abundance_encoding
 
         self.persistent_workers = True
         self.pin_memory = True
@@ -88,6 +92,12 @@ class ClassificationDataModule(L.LightningDataModule):
         self._labels_array: Optional[np.ndarray] = None
         self._task_names: List[str] = []
 
+        # 距离矩阵 / PE coords：从 varp / varm 加载,供 encoder 在使用 phylo bias / PhyloPE 时作为 buffer 使用
+        self.phylo_dist_matrix: Optional[torch.Tensor] = None  # [V, V] float32
+        self.taxo_dist_matrix: Optional[torch.Tensor] = None   # [V, V] int8
+        self.phylo_pe_coords_raw: Optional[torch.Tensor] = None  # [V_real, pe_dim] float32 (V5)
+        self.pe_dim: Optional[int] = None
+
         # 一次性读取 var（词表）和 obs（标签配置），避免重复打开 h5ad（P2-4）
         self._init_metadata()
 
@@ -99,6 +109,33 @@ class ClassificationDataModule(L.LightningDataModule):
             _, rank_vocab_sizes, _ = build_taxon_path_ids(adata.var)
             self.genus_vocab_size = rank_vocab_sizes["Genus"]
             self.rank_vocab_sizes = rank_vocab_sizes
+
+            # 加载 varp 距离矩阵（若存在）。两个矩阵都按 var_names 对齐。
+            varp_keys = set(getattr(adata, "varp", {}).keys()) if hasattr(adata, "varp") else set()
+            if "phylo_dist" in varp_keys:
+                self.phylo_dist_matrix = torch.from_numpy(
+                    np.asarray(adata.varp["phylo_dist"], dtype=np.float32)
+                )
+                rank_zero_info(
+                    f"{TAG} Loaded varp['phylo_dist']: {tuple(self.phylo_dist_matrix.shape)} float32"
+                )
+            if "taxo_dist" in varp_keys:
+                self.taxo_dist_matrix = torch.from_numpy(
+                    np.asarray(adata.varp["taxo_dist"], dtype=np.int8)
+                )
+                rank_zero_info(
+                    f"{TAG} Loaded varp['taxo_dist']: {tuple(self.taxo_dist_matrix.shape)} int8"
+                )
+
+            # V5: 加载 varm['position_encoding']
+            varm_keys = set(getattr(adata, "varm", {}).keys()) if hasattr(adata, "varm") else set()
+            if "position_encoding" in varm_keys:
+                pe_arr = np.asarray(adata.varm["position_encoding"], dtype=np.float32)
+                self.phylo_pe_coords_raw = torch.from_numpy(pe_arr)
+                self.pe_dim = int(pe_arr.shape[1])
+                rank_zero_info(
+                    f"{TAG} Loaded varm['position_encoding']: {tuple(self.phylo_pe_coords_raw.shape)} float32"
+                )
 
             # 构建标签配置（P2-5：向量化标签填充）
             obs = adata.obs
@@ -151,6 +188,7 @@ class ClassificationDataModule(L.LightningDataModule):
             num_abundance_bins=self.num_abundance_bins,
             min_abundance=self.min_abundance,
             abundance_mode=self.abundance_mode,
+            abundance_encoding=self.abundance_encoding,
         )
 
         assert self._labels_array is not None

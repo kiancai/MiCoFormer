@@ -39,11 +39,39 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--val_indices_path", type=str, required=True)
 
     # 1.模型版本开关
-    p.add_argument("--token_embedding_mode", type=str, default="taxon_path", choices=["taxon", "taxon_path"])
-    p.add_argument("--use_taxonomy_bias", action="store_true", default=False)
-    p.add_argument("--bias_grad_every_k", type=int, default=1,
-                   help="R2：每 k 步才对 bias_table 计算梯度（1=每步都算，默认行为；建议 4~8 以降低开销）。"
-                        "仅在 --use_taxonomy_bias 时生效。")
+    # 旧 alias --token_embedding_mode 仍保留(显式传时覆盖 use_hierarchical_embed)
+    p.add_argument("--token_embedding_mode", type=str, default=None, choices=["taxon", "taxon_path", None])
+    p.add_argument("--use_hierarchical_embed", action="store_true", default=False,
+                   help="V5:启用旧 R1(6-rank embedding 相加),默认关")
+    # V4 R2:距离驱动的 attention bias
+    #   none  : baseline,无 bias
+    #   taxo  : 离散 7-bucket 查 varp['taxo_dist']
+    #   phylo : 3 层 MLP 查 varp['phylo_dist'](V5 默认)
+    p.add_argument("--bias_type", type=str, default="phylo", choices=["none", "taxo", "phylo"])
+    p.add_argument("--phylo_mlp_hidden", type=int, default=64,
+                   help="phylo bias MLP 隐藏层维度(仅 --bias_type phylo 时生效;V5 默认 64,3 层 MLP)")
+
+    # V5 新增:三段相加 + PMA + metadata 多任务
+    p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
+                   help="V5:abundance 输入编码方式;mlp=连续 MLP(默认),bin=旧离散 embedding")
+    p.add_argument("--abundance_loss", type=str, default="huber", choices=["huber", "bin_ce"],
+                   help="V5:abundance MLM loss;huber=连续回归(默认),bin_ce=旧 bin 分类")
+    p.add_argument("--no_phylo_pe", action="store_true", default=False,
+                   help="V5:禁用 PhyloPE(默认启用)")
+    p.add_argument("--phylo_pe_hidden", type=int, default=128,
+                   help="PhyloPE 投影 MLP 中间维度,默认 128")
+    p.add_argument("--use_sample_token", action="store_true", default=False,
+                   help="V5:启用旧 [SAMPLE] token,默认关")
+    p.add_argument("--pooling_mode", type=str, default="pma", choices=["pma", "mean_pool"],
+                   help="V5:sample-level pooling;pma(默认) | mean_pool")
+    p.add_argument("--pma_nhead", type=int, default=4)
+    p.add_argument("--pma_k", type=int, default=1)
+    p.add_argument("--no_metadata_task", action="store_true", default=False,
+                   help="V5:禁用 EnvCategory 多任务监督(默认启用)")
+    p.add_argument("--metadata_field", type=str, default="EnvCategory")
+    p.add_argument("--metadata_loss_weight", type=float, default=0.3,
+                   help="V5:λ_meta(metadata loss 权重),默认 0.3")
+    p.add_argument("--huber_beta", type=float, default=1.0)
 
     # 2.1.模型主体参数
     p.add_argument("--d_model", type=int, default=256)                # token embedding 的维度，也是模型中间层的维度
@@ -116,8 +144,9 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
     return PretrainRunConfig(
         h5ad_path=args.h5ad_path,
         token_embedding_mode=args.token_embedding_mode,
-        use_taxonomy_bias=args.use_taxonomy_bias,
-        bias_grad_every_k=args.bias_grad_every_k,
+        use_hierarchical_embed=args.use_hierarchical_embed,
+        bias_type=args.bias_type,
+        phylo_mlp_hidden=args.phylo_mlp_hidden,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,
@@ -154,6 +183,19 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         no_progress_bar=args.no_progress_bar,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        # V5
+        abundance_encoding=args.abundance_encoding,
+        abundance_loss=args.abundance_loss,
+        use_phylo_pe=not args.no_phylo_pe,
+        phylo_pe_hidden=args.phylo_pe_hidden,
+        use_sample_token=args.use_sample_token,
+        pooling_mode=args.pooling_mode,
+        pma_nhead=args.pma_nhead,
+        pma_k=args.pma_k,
+        use_metadata_task=not args.no_metadata_task,
+        metadata_field=args.metadata_field,
+        metadata_loss_weight=args.metadata_loss_weight,
+        huber_beta=args.huber_beta,
     )
 
 

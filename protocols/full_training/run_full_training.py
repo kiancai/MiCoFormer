@@ -13,18 +13,18 @@ MiCoFormer 正式训练协议：Stage 1 预训练 + Stage 2 第一次微调。
         finetune/          # Lightning 日志 + best checkpoint
 
 Usage:
-  # 所有变体 × 3 seeds
+  # 所有 6 个变体 × 3 seeds
   python MiCoFormer/protocols/full_training/run_full_training.py \\
-      --h5ad       data/processed/microbiome_dataset_benchmark.h5ad \\
+      --h5ad       data/gg2/MCFCorpus.gg2.h5ad \\
       --splits-dir data/processed/splits \\
       --output-dir MiCoFormer/protocols/full_training/runs \\
-      --variants   baseline r1 r2 r1r2 \\
+      --variants   baseline r1 r2_taxo r1r2_taxo r2_phylo r1r2_phylo \\
       --seeds      42 52 62 \\
       --gpu-ids    0,1,2,3
 
   # 单个变体调试
   python MiCoFormer/protocols/full_training/run_full_training.py \\
-      --h5ad       data/processed/microbiome_dataset_benchmark.h5ad \\
+      --h5ad       data/gg2/MCFCorpus.gg2.h5ad \\
       --splits-dir data/processed/splits \\
       --output-dir MiCoFormer/protocols/full_training/runs \\
       --variants   baseline \\
@@ -94,8 +94,8 @@ def run_one_variant_seed(
         h5ad_path=h5ad_path,
         # 模型开关
         token_embedding_mode=variant.token_embedding_mode,
-        use_taxonomy_bias=variant.use_taxonomy_bias,
-        bias_grad_every_k=SHARED_PRETRAIN["bias_grad_every_k"],
+        bias_type=variant.bias_type,
+        phylo_mlp_hidden=SHARED_PRETRAIN["phylo_mlp_hidden"],
         # 共享主体
         d_model=SHARED_ARCH["d_model"],
         num_layers=SHARED_ARCH["num_layers"],
@@ -211,7 +211,7 @@ def main():
     parser.add_argument(
         "--variants",
         nargs="+",
-        default=["baseline", "r1", "r2", "r1r2"],
+        default=["baseline", "r1", "r2_taxo", "r1r2_taxo", "r2_phylo", "r1r2_phylo"],
         choices=list(VARIANTS.keys()),
     )
     parser.add_argument(
