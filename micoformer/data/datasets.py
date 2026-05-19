@@ -35,7 +35,7 @@ def build_taxon_path_ids(
     # 从 adata.var 构建 taxon 的 taxonomy-path id 矩阵。
     # 强制执行严格模式：必须包含所有标准层级列，否则直接报错。
     # 返回:
-    #   - path_ids:        [n_taxa, 5]，顺序为 [Phylum, Class, Order, Family, Genus]
+    #   - path_ids:        [n_taxa, len(RANK_COLUMNS)]，顺序为 RANK_COLUMNS（V5 默认 6 列：Domain..Genus）
     #   - rank_vocab_sizes: 每个 rank 的词表大小（0=PAD，1=UNK，2~=真实值）
     #   - rank_mappings:   每个 rank 的完整 name→ID 字典（含 __PAD__ 和 __UNK__）
     n_taxa = len(var_df.index)
