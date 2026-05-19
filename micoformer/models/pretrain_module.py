@@ -1,17 +1,31 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import lightning as L
 
 from micoformer.models.encoder import MiCoFormerEncoder
-from micoformer.models.heads import AbundanceBinHead
+from micoformer.models.heads import (
+    AbundanceBinHead,
+    AbundanceRegressionHead,
+    MetadataHead,
+)
+from micoformer.models.pma import PMA
 from micoformer.utils.train_utils import build_lr_scheduler
 
 
+_VALID_ABUNDANCE_LOSS = {"huber", "bin_ce"}
+_VALID_POOLING_MODE = {"pma", "mean_pool"}
+
+
 class MiCoFormerModule(L.LightningModule):
+    """V5 预训练 module:MLM(Huber 连续回归)+ Metadata 多任务(EnvCategory 6 类)。
+
+    联合 loss = L_MLM + λ_meta * L_meta
+    """
 
     def __init__(
         self,
@@ -25,10 +39,29 @@ class MiCoFormerModule(L.LightningModule):
         dropout: float = 0.1,
         pad_taxon_id: int = 0,
         pad_bin_id: int = 0,
-        token_embedding_mode: str = "taxon_path",
+        token_embedding_mode: Optional[str] = None,  # 旧 alias
         rank_vocab_sizes: Dict[str, int],
-        use_taxonomy_bias: bool = False,  # R2：启用 taxonomy 距离注意力偏置
-        bias_grad_every_k: int = 1,        # R2：每 k 步才对 bias_table 计算梯度（1=每步都算）
+        # V4 R2
+        bias_type: str = "phylo",            # V5 默认 phylo
+        phylo_mlp_hidden: int = 64,           # V5 默认 64
+        n_vars: int = 0,
+        # V5 新增
+        abundance_encoding: str = "mlp",
+        abundance_loss: str = "huber",         # "huber" | "bin_ce"
+        use_phylo_pe: bool = True,
+        phylo_pe_hidden: int = 128,
+        pe_dim: Optional[int] = None,
+        use_hierarchical_embed: bool = False,
+        use_sample_token: bool = False,
+        pooling_mode: str = "pma",             # "pma" | "mean_pool"
+        pma_nhead: int = 4,
+        pma_k: int = 1,
+        use_metadata_task: bool = True,
+        metadata_loss_weight: float = 0.3,
+        metadata_num_classes: int = 6,
+        metadata_class_weights: Optional[List[float]] = None,
+        huber_beta: float = 1.0,
+        # 优化器
         lr: float = 3e-4,
         weight_decay: float = 1e-2,
         warmup_ratio: float = 0.02,
@@ -39,7 +72,21 @@ class MiCoFormerModule(L.LightningModule):
     ) -> None:
         super().__init__()
 
-        # 保存所有 __init__ 参数到 self.hparams，便于 checkpoint 保存和恢复
+        if abundance_loss not in _VALID_ABUNDANCE_LOSS:
+            raise ValueError(
+                f"Unknown abundance_loss: {abundance_loss!r}. Expected {sorted(_VALID_ABUNDANCE_LOSS)}."
+            )
+        if pooling_mode not in _VALID_POOLING_MODE:
+            raise ValueError(
+                f"Unknown pooling_mode: {pooling_mode!r}. Expected {sorted(_VALID_POOLING_MODE)}."
+            )
+        # 互斥校验:mlp↔huber, bin↔bin_ce
+        if abundance_encoding == "mlp" and abundance_loss != "huber":
+            raise ValueError("abundance_encoding='mlp' must pair with abundance_loss='huber'.")
+        if abundance_encoding == "bin" and abundance_loss != "bin_ce":
+            raise ValueError("abundance_encoding='bin' must pair with abundance_loss='bin_ce'.")
+
+        # 保存所有 __init__ 参数到 self.hparams,便于 checkpoint 保存和恢复
         self.save_hyperparameters()
 
         self.encoder = MiCoFormerEncoder(
@@ -54,88 +101,190 @@ class MiCoFormerModule(L.LightningModule):
             pad_bin_id=pad_bin_id,
             token_embedding_mode=token_embedding_mode,
             rank_vocab_sizes=rank_vocab_sizes,
-            use_taxonomy_bias=use_taxonomy_bias,
-            bias_grad_every_k=bias_grad_every_k,
+            bias_type=bias_type,
+            phylo_mlp_hidden=phylo_mlp_hidden,
+            n_vars=n_vars if bias_type != "none" else None,
+            abundance_encoding=abundance_encoding,
+            use_phylo_pe=use_phylo_pe,
+            phylo_pe_hidden=phylo_pe_hidden,
+            pe_dim=pe_dim,
+            use_sample_token=use_sample_token,
+            use_hierarchical_embed=use_hierarchical_embed,
         )
 
-        # 预训练任务头
-        self.head = AbundanceBinHead(d_model=d_model, num_bins=total_abundance_bins)
+        # ============ MLM head ============
+        if abundance_loss == "huber":
+            self.mlm_head = AbundanceRegressionHead(d_model=d_model)
+        else:
+            self.mlm_head = AbundanceBinHead(d_model=d_model, num_bins=total_abundance_bins)
+        self.bin_ce = nn.CrossEntropyLoss(reduction="none")  # bin 路径用
+        self.huber_beta = huber_beta
 
-        # 损失函数 (不进行 reduce，保留每个样本/token的loss)
-        self.criterion = nn.CrossEntropyLoss(reduction="none")
+        # ============ PMA(V5)或 mean_pool ============
+        self.pma: Optional[PMA] = None
+        if pooling_mode == "pma":
+            self.pma = PMA(d_model=d_model, nhead_pma=pma_nhead, k=pma_k)
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # ============ Metadata head ============
+        self.metadata_head: Optional[MetadataHead] = None
+        if use_metadata_task:
+            self.metadata_head = MetadataHead(
+                d_model=d_model, num_classes=metadata_num_classes
+            )
+            # metadata_class_weights:从 list(在 hparams)重建 tensor buffer
+            # persistent=False 避免 hparams + state_dict 双份冗余;resume 时从 hparams 自动重建
+            if metadata_class_weights is not None:
+                self.register_buffer(
+                    "_meta_class_weights",
+                    torch.tensor(metadata_class_weights, dtype=torch.float32),
+                    persistent=False,
+                )
+            else:
+                self.register_buffer(
+                    "_meta_class_weights",
+                    torch.ones(metadata_num_classes, dtype=torch.float32),
+                    persistent=False,
+                )
+
+    # ------------------------------------------------------------------
+    # forward 与 step 辅助
+    # ------------------------------------------------------------------
+    def _encode(self, batch: Dict[str, torch.Tensor]):
+        """统一封装 encoder 调用,根据 abundance_encoding/use_sample_token 等 flag 自适应。"""
         h, sample_repr = self.encoder(
             token_ids=batch["token_ids"],
-            abund_bins=batch["abund_bins"],
-            taxon_path_ids=batch["taxon_path_ids"],
             attention_mask=batch["attention_mask"],
+            abund_bins=batch.get("abund_bins"),
+            abund_values=batch.get("abund_values"),
+            mask_positions=batch.get("mask_positions"),
+            taxon_path_ids=batch.get("taxon_path_ids"),
+            var_indices=batch.get("var_indices"),
         )
-        logits = self.head(h)
-        return {"token_repr": h, "sample_repr": sample_repr, "abund_logits": logits}
+        return h, sample_repr
+
+    def _h_taxon(self, h: torch.Tensor) -> torch.Tensor:
+        """返回不含 [SAMPLE] 位的 token 部分(对齐 labels 长度)。"""
+        if self.hparams.use_sample_token:
+            return h[:, 1:, :]
+        return h
+
+    def _pool(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """sample-level pooling: PMA(V5) 或 masked mean。"""
+        # 输入 h 必须不含 [SAMPLE](use_sample_token=True 时由 _h_taxon 取 token 部分,
+        # use_sample_token=False 时本来就没有 [SAMPLE])
+        h_token = self._h_taxon(h)
+        key_padding_mask = ~attention_mask  # True = PAD
+        if self.hparams.pooling_mode == "pma":
+            return self.pma(h_token, key_padding_mask=key_padding_mask)
+        # mean_pool: 对非 PAD 位置求平均
+        mask_f = attention_mask.float().unsqueeze(-1)
+        denom = mask_f.sum(dim=1).clamp(min=1.0)
+        return (h_token * mask_f).sum(dim=1) / denom
+
+    # ------------------------------------------------------------------
+    # 训练 / 验证步
+    # ------------------------------------------------------------------
+    def _shared_step(
+        self,
+        batch: Dict[str, torch.Tensor],
+        stage: str,  # "train" / "val"
+    ) -> torch.Tensor:
+        h, _ = self._encode(batch)
+        h_token = self._h_taxon(h)
+
+        # ============ MLM loss ============
+        mask_pos = batch["mask_positions"]
+        if self.hparams.abundance_loss == "huber":
+            pred = self.mlm_head(h_token)               # [B, L]
+            target = batch["labels_abund_values"]       # [B, L] float32
+            if mask_pos.any():
+                loss_mlm = F.smooth_l1_loss(
+                    pred[mask_pos], target[mask_pos], beta=self.huber_beta, reduction="mean"
+                )
+                with torch.no_grad():
+                    mae = (pred[mask_pos] - target[mask_pos]).abs().mean()
+            else:
+                loss_mlm = torch.zeros((), device=h.device, dtype=h.dtype)
+                mae = torch.zeros((), device=h.device, dtype=h.dtype)
+        else:
+            logits = self.mlm_head(h_token)              # [B, L, num_bins]
+            labels = batch["labels_abund"]               # [B, L] long
+            if mask_pos.any():
+                m_logits = logits[mask_pos]
+                m_labels = labels[mask_pos]
+                loss_mlm = self.bin_ce(m_logits, m_labels).mean()
+                with torch.no_grad():
+                    acc = (m_logits.argmax(dim=-1) == m_labels).float().mean()
+                mae = None
+                self.log(
+                    f"{stage}/acc_mask", acc,
+                    prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
+                    sync_dist=(stage == "val"),
+                )
+            else:
+                loss_mlm = torch.zeros((), device=h.device, dtype=h.dtype)
+                mae = None
+
+        # log MLM
+        self.log(
+            f"{stage}/loss_mlm", loss_mlm,
+            prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
+            sync_dist=(stage == "val"),
+        )
+        if self.hparams.abundance_loss == "huber" and mae is not None:
+            self.log(
+                f"{stage}/mlm_mae", mae,
+                prog_bar=False, on_step=(stage == "train"), on_epoch=True,
+                sync_dist=(stage == "val"),
+            )
+
+        # ============ Metadata loss ============
+        total_loss = loss_mlm
+        if self.hparams.use_metadata_task:
+            if "env_label" not in batch:
+                raise RuntimeError(
+                    "use_metadata_task=True but batch does not contain 'env_label'. "
+                    "Check that DataModule was configured with use_metadata_task=True "
+                    "(it should wrap the dataset with _EnvLabelWrappedSubset)."
+                )
+            sample_repr = self._pool(h, batch["attention_mask"])  # [B, d_model]
+            logits_meta = self.metadata_head(sample_repr)         # [B, C]
+            env_label = batch["env_label"]                        # [B]
+            loss_meta = F.cross_entropy(
+                logits_meta, env_label,
+                weight=self._meta_class_weights.to(logits_meta.dtype),
+            )
+            with torch.no_grad():
+                meta_acc = (logits_meta.argmax(dim=-1) == env_label).float().mean()
+            self.log(
+                f"{stage}/loss_meta", loss_meta,
+                prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
+                sync_dist=(stage == "val"),
+            )
+            self.log(
+                f"{stage}/metadata_acc", meta_acc,
+                prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
+                sync_dist=(stage == "val"),
+            )
+            total_loss = loss_mlm + float(self.hparams.metadata_loss_weight) * loss_meta
+
+        self.log(
+            f"{stage}/loss", total_loss,
+            prog_bar=True, on_step=(stage == "train"), on_epoch=True,
+            sync_dist=(stage == "val"),
+        )
+        return total_loss
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        # 前向传播
-        out = self(batch)
-
-        # 取出前向传播结果
-        logits = out["abund_logits"]       # [B, L, Num_Bins]
-        labels = batch["labels_abund"]     # [B, L]
-        mask_pos = batch["mask_positions"] # [B, L]
-
-        # 同样需要对齐长度，去掉 logits 的第 0 位 (SAMPLE)
-        logits = logits[:, 1:, :]
-
-        if mask_pos.any():
-            # 取出 Mask 位置的预测 Logits 与真实 Labels (布尔索引筛选)
-            masked_logits = logits[mask_pos] # [N_Masked, Num_Bins]
-            masked_labels = labels[mask_pos] # [N_Masked]
-            
-            # 计算 Cross Entropy Loss
-            loss_vec = self.criterion(masked_logits, masked_labels)
-            loss = loss_vec.mean()
-
-            # 计算 Top-1 准确率 (Accuracy)，用于监控模型学习进度
-            with torch.no_grad():
-                pred = masked_logits.argmax(dim=-1)
-                acc = (pred == masked_labels).float().mean()
-                self.log("train/acc_mask", acc, prog_bar=True, on_step=True, on_epoch=True)
-        else:
-            # 极少数情况下 (如 batch 很小且 mask_prob 很低)，可能没有采样到 mask，此时 loss 为 0
-            loss = torch.zeros((), device=logits.device, dtype=logits.dtype)
-
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        return loss
+        return self._shared_step(batch, "train")
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
+        self._shared_step(batch, "val")
 
-        out = self(batch)
-        logits = out["abund_logits"]
-        labels = batch["labels_abund"]
-        mask_pos = batch["mask_positions"]
-        
-        # 注意：Encoder 输出的 h 现在包含了 [SAMPLE] 在第 0 位
-        # 而 logits 是对 h 进行投影得到的，所以 logits 也是 [Batch, Length+1, Num_Bins]
-        # 但是 labels 和 mask_pos 是原始数据的长度 [Batch, Length] (不含 SAMPLE)
-        # 所以我们需要把 logits 的第 0 位去掉，对齐长度
-        logits = logits[:, 1:, :]
-
-        if mask_pos.any():
-            masked_logits = logits[mask_pos]
-            masked_labels = labels[mask_pos]
-            loss = self.criterion(masked_logits, masked_labels).mean()
-
-            pred = masked_logits.argmax(dim=-1)
-            acc = (pred == masked_labels).float().mean()
-
-            # sync_dist=True：多 GPU 时跨 rank 聚合 val 指标
-            self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
-            self.log("val/acc_mask", acc, prog_bar=True, on_epoch=True, sync_dist=True)
-        # 没有 mask 位置时（理论上 ensure_one_mask_per_nonempty 已经避免），
-        # 直接 skip log；不再记录 0.0 以免污染 epoch 平均值
-
+    # ------------------------------------------------------------------
+    # 优化器(同旧版)
+    # ------------------------------------------------------------------
     def configure_optimizers(self):
-        # 分离参数组：对 bias 和 LayerNorm 不使用 weight_decay，防止过度正则化
         decay_params = []
         no_decay_params = []
         no_decay_names = ["bias", "LayerNorm.weight", "norm.weight"]

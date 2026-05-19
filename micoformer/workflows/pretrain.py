@@ -18,6 +18,7 @@ from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
 from micoformer.models.pretrain_module import MiCoFormerModule
 from micoformer.utils.train_utils import (
     choose_precision,
+    inject_var_buffers,
     resolve_pretrain_ff_params,
     validate_index_arrays,
     validate_no_split_overlap,
@@ -34,9 +35,13 @@ class PretrainRunConfig:
     h5ad_path: str
 
     # 1. 模型版本开关
-    token_embedding_mode: str = "taxon_path"
-    use_taxonomy_bias: bool = False
-    bias_grad_every_k: int = 1        # R2：每 k 步才对 bias_table 计算梯度（1=每步都算，默认行为）
+    # 旧 alias:V5 推荐用 use_hierarchical_embed
+    token_embedding_mode: str | None = None
+    # V5 主开关
+    use_hierarchical_embed: bool = False
+    # V4 R2：距离驱动的 attention bias（'none' | 'taxo' | 'phylo'）
+    bias_type: str = "phylo"           # V5 默认 phylo
+    phylo_mlp_hidden: int = 64          # V5 默认 64(3 层 MLP);旧 alias phylo_bias_hidden 走同字段
 
     # 2.1. 模型主体参数
     d_model: int = 256
@@ -88,6 +93,23 @@ class PretrainRunConfig:
     num_workers: int = 4
     log_dir: str = "tmp/logs"
     no_progress_bar: bool = False
+
+    # ============== V5 新增 ==============
+    abundance_encoding: str = "mlp"             # "mlp" | "bin"
+    abundance_loss: str = "huber"               # "huber" | "bin_ce"
+    use_phylo_pe: bool = True
+    phylo_pe_hidden: int = 128
+    use_sample_token: bool = False
+    pooling_mode: str = "pma"                   # "pma" | "mean_pool"
+    pma_nhead: int = 4
+    pma_k: int = 1
+    use_metadata_task: bool = True
+    metadata_field: str = "EnvCategory"
+    metadata_loss_weight: float = 0.3
+    metadata_num_classes: int = 6
+    huber_beta: float = 1.0
+    # 验证 val 监控 loss 名称(V5 默认 val/loss,跟现有 ModelCheckpoint 一致)
+    val_monitor: str = "val/loss"
 
 
 # 执行一次完整的预训练流程，返回结果字典
@@ -149,6 +171,9 @@ def run_pretrain_once(
         num_abundance_bins=config.num_abundance_bins,
         min_abundance=config.min_abundance,
         abundance_mode=config.abundance_mode,
+        # V5
+        abundance_encoding=config.abundance_encoding,
+        use_metadata_task=config.use_metadata_task,
     )
 
     # 2. 初始化模型
@@ -156,7 +181,56 @@ def run_pretrain_once(
         f"{TAG} Initializing Model with d_model={config.d_model}, "
         f"layers={config.num_layers}, ff_dim={effective_ff_dim}"
     )
-    rank_zero_info(f"{TAG} Token embedding mode: {config.token_embedding_mode}")
+    rank_zero_info(
+        f"{TAG} V5 flags: abundance_encoding={config.abundance_encoding} (loss={config.abundance_loss}), "
+        f"use_phylo_pe={config.use_phylo_pe}, pooling={config.pooling_mode}, "
+        f"use_sample_token={config.use_sample_token}, use_hierarchical_embed={config.use_hierarchical_embed}, "
+        f"use_metadata_task={config.use_metadata_task} (λ={config.metadata_loss_weight})"
+    )
+    # bias_type != 'none' 时把 var 表大小传给模型（占位 dist_matrix buffer 用），
+    # 同时从 datamodule 拿对应的距离矩阵（phylo 或 taxo），注入 encoder
+    _n_vars = 0
+    _dist_matrix_to_inject = None
+    if config.bias_type != "none":
+        if config.bias_type == "taxo":
+            _dist_matrix_to_inject = dm.taxo_dist_matrix
+        elif config.bias_type == "phylo":
+            _dist_matrix_to_inject = dm.phylo_dist_matrix
+        if _dist_matrix_to_inject is None:
+            raise RuntimeError(
+                f"bias_type={config.bias_type!r} requires varp['{config.bias_type}_dist'] in h5ad, "
+                f"but DataModule did not load it. Check that MCFCorpus has the corresponding varp key."
+            )
+        _n_vars = int(_dist_matrix_to_inject.shape[0])
+        rank_zero_info(
+            f"{TAG} R2 bias_type={config.bias_type}, n_vars={_n_vars}, "
+            f"dist_matrix dtype={_dist_matrix_to_inject.dtype}"
+        )
+
+    # PE coords 检查(use_phylo_pe=True 时必须有 varm['position_encoding'])
+    _pe_coords_to_inject = None
+    _pe_dim = None
+    if config.use_phylo_pe:
+        if dm.phylo_pe_coords_raw is None:
+            raise RuntimeError(
+                "use_phylo_pe=True requires varm['position_encoding'] in h5ad, "
+                "but DataModule did not load it."
+            )
+        _pe_coords_to_inject = dm.phylo_pe_coords_raw
+        _pe_dim = dm.pe_dim
+        rank_zero_info(
+            f"{TAG} PhyloPE: pe_dim={_pe_dim}, coords shape={tuple(_pe_coords_to_inject.shape)}"
+        )
+
+    # Metadata class weights
+    _meta_weights_list = None
+    if config.use_metadata_task and dm.env_class_weights is not None:
+        _meta_weights_list = dm.env_class_weights.tolist()
+        rank_zero_info(
+            f"{TAG} EnvCategory class weights (sqrt-smoothed): "
+            f"{[f'{w:.3f}' for w in _meta_weights_list]}"
+        )
+
     model = MiCoFormerModule(
         genus_vocab_size=dm.genus_vocab_size,
         total_abundance_bins=dm.total_abundance_bins,
@@ -169,8 +243,26 @@ def run_pretrain_once(
         pad_bin_id=dm.special_ids["pad_bin_id"],
         token_embedding_mode=config.token_embedding_mode,
         rank_vocab_sizes=dm.rank_vocab_sizes,
-        use_taxonomy_bias=config.use_taxonomy_bias,
-        bias_grad_every_k=config.bias_grad_every_k,
+        bias_type=config.bias_type,
+        phylo_mlp_hidden=config.phylo_mlp_hidden,
+        n_vars=_n_vars,
+        # V5
+        abundance_encoding=config.abundance_encoding,
+        abundance_loss=config.abundance_loss,
+        use_phylo_pe=config.use_phylo_pe,
+        phylo_pe_hidden=config.phylo_pe_hidden,
+        pe_dim=_pe_dim,
+        use_hierarchical_embed=config.use_hierarchical_embed,
+        use_sample_token=config.use_sample_token,
+        pooling_mode=config.pooling_mode,
+        pma_nhead=config.pma_nhead,
+        pma_k=config.pma_k,
+        use_metadata_task=config.use_metadata_task,
+        metadata_loss_weight=config.metadata_loss_weight,
+        metadata_num_classes=config.metadata_num_classes,
+        metadata_class_weights=_meta_weights_list,
+        huber_beta=config.huber_beta,
+        # 优化器
         lr=config.lr,
         weight_decay=config.weight_decay,
         warmup_ratio=config.warmup_ratio,
@@ -179,6 +271,9 @@ def run_pretrain_once(
         plateau_patience=config.lr_plateau_patience,
         plateau_min_lr=config.lr_plateau_min_lr,
     )
+
+    # 注入 var-level buffer:dist_matrix(R2) + phylo_pe coords(V5)
+    inject_var_buffers(model.encoder, _dist_matrix_to_inject, _pe_coords_to_inject)
 
     # 3. 设置日志记录器与回调
     # 加 uuid 后缀避免同秒并行启动的时间戳碰撞

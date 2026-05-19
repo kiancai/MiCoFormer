@@ -63,9 +63,14 @@ def build_argparser() -> argparse.ArgumentParser:
                        "示例：--label_values \"Phenotype=Health,Disease\" \"Smoking=Yes,No\""
                    ))
 
-    # 2.1.分类头 / pooling 参数
-    p.add_argument("--pooling_mode", type=str, default="mean_pool",
-                   choices=["sample", "mean_pool", "sample_and_mean"])
+    # 2.1.分类头 / pooling 参数(V5:删除 sample/sample_and_mean)
+    p.add_argument("--pooling_mode", type=str, default="pma",
+                   choices=["pma", "mean_pool"],
+                   help="V5:pma(默认) | mean_pool;sample/sample_and_mean 已删除")
+    p.add_argument("--pma_nhead", type=int, default=None,
+                   help="None=从预训练 ckpt 继承,否则覆盖")
+    p.add_argument("--pma_k", type=int, default=None,
+                   help="None=从预训练 ckpt 继承(默认 1)")
     p.add_argument("--head_hidden_dim", type=int, default=0)          # 0 表示线性分类头，>0 表示 MLP hidden dim
     p.add_argument("--head_dropout", type=float, default=0.1)         # 分类头 dropout
     p.add_argument("--freeze_encoder", type=str2bool, default=False,
@@ -130,6 +135,8 @@ def _args_to_config(args: argparse.Namespace) -> FinetuneRunConfig:
         h5ad_path=args.h5ad_path,
         pretrained_ckpt=args.pretrained_ckpt,
         pooling_mode=args.pooling_mode,
+        pma_nhead=args.pma_nhead,
+        pma_k=args.pma_k,
         head_hidden_dim=args.head_hidden_dim,
         head_dropout=args.head_dropout,
         freeze_encoder=args.freeze_encoder,
