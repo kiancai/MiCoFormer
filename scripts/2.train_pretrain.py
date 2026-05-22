@@ -137,6 +137,12 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--no_progress_bar", action="store_true", default=False)
 
+    # DAPT 续训:从已有 ckpt 加载初始权重(非 trainer resume,只 init state_dict)
+    p.add_argument(
+        "--init_from_ckpt", type=str, default=None,
+        help="从该 ckpt 加载初始 state_dict;buffer 缺失会自动跳过(strict=False)。用于 DAPT 二阶段。",
+    )
+
     return p
 
 
@@ -196,6 +202,7 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         metadata_field=args.metadata_field,
         metadata_loss_weight=args.metadata_loss_weight,
         huber_beta=args.huber_beta,
+        init_from_ckpt=args.init_from_ckpt,
     )
 
 

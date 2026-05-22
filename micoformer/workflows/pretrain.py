@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import anndata as ad
 import lightning as L
 import numpy as np
+import torch
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
 from lightning.pytorch.utilities import rank_zero_info
@@ -110,6 +111,10 @@ class PretrainRunConfig:
     huber_beta: float = 1.0
     # 验证 val 监控 loss 名称(V5 默认 val/loss,跟现有 ModelCheckpoint 一致)
     val_monitor: str = "val/loss"
+
+    # DAPT/续训用:从已有 ckpt 加载初始 state_dict(非 trainer resume,仅初始化权重)
+    # None=正常从头训练;指定路径=load_state_dict(strict=False),允许 buffer 缺失
+    init_from_ckpt: str | None = None
 
 
 # 执行一次完整的预训练流程，返回结果字典
@@ -274,6 +279,25 @@ def run_pretrain_once(
 
     # 注入 var-level buffer:dist_matrix(R2) + phylo_pe coords(V5)
     inject_var_buffers(model.encoder, _dist_matrix_to_inject, _pe_coords_to_inject)
+
+    # DAPT 续训:在 buffer 注入之后加载 ckpt 的 state_dict(strict=False 允许 non-persistent buffer 缺失)
+    if config.init_from_ckpt:
+        rank_zero_info(f"{TAG} Loading initial weights from {config.init_from_ckpt}")
+        _state = torch.load(config.init_from_ckpt, map_location="cpu", weights_only=False)
+        _sd = _state.get("state_dict", _state)
+        _incompat = model.load_state_dict(_sd, strict=False)
+        # 报告 missing/unexpected 帮助诊断 V5 架构兼容性
+        _miss = [k for k in _incompat.missing_keys
+                 if not (k.endswith(".coords") or k.endswith(".dist_matrix"))]
+        _unexp = list(_incompat.unexpected_keys)
+        rank_zero_info(
+            f"{TAG} load_state_dict: missing={len(_miss)} unexpected={len(_unexp)} "
+            f"(non-persistent buffers excluded)"
+        )
+        if _miss:
+            rank_zero_info(f"{TAG}   first missing keys: {_miss[:5]}")
+        if _unexp:
+            rank_zero_info(f"{TAG}   first unexpected keys: {_unexp[:5]}")
 
     # 3. 设置日志记录器与回调
     # 加 uuid 后缀避免同秒并行启动的时间戳碰撞
