@@ -121,6 +121,8 @@ def build_argparser() -> argparse.ArgumentParser:
     # 4.1. Early stopping（0=禁用，与 finetune 对称）
     p.add_argument("--early_stopping_patience", type=int, default=0,)  #Early stopping patience（0 表示禁用）
     p.add_argument("--early_stopping_min_delta", type=float, default=0.0,)  #Early stopping 最小改善阈值。
+    p.add_argument("--save_top_k", type=int, default=3,
+                   help="ModelCheckpoint 保留数：-1=保存每个验证 ckpt（长训练回头看用），>0=只留最优 K 个")
 
     # 5. 运行与工程参数
     p.add_argument("--devices", type=int, default=1)                   # 使用的 GPU/设备 数量（单节点内卡数）
@@ -195,6 +197,7 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         no_progress_bar=args.no_progress_bar,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        save_top_k=args.save_top_k,
         # V5
         abundance_encoding=args.abundance_encoding,
         abundance_loss=args.abundance_loss,

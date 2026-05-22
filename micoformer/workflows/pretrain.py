@@ -85,6 +85,8 @@ class PretrainRunConfig:
     # 4.1. Early stopping（0=禁用，与 finetune 对称）
     early_stopping_patience: int = 0
     early_stopping_min_delta: float = 0.0
+    # ModelCheckpoint 保留数：-1=保存每次验证的 ckpt（长训练"回头看"用），>0=只留最优 K 个
+    save_top_k: int = 3
 
     # 5. 运行与工程参数
     devices: int = 1
@@ -334,7 +336,7 @@ def run_pretrain_once(
         dirpath=ckpt_dir,
         monitor="val/loss",
         mode="min",
-        save_top_k=3,
+        save_top_k=config.save_top_k,
         save_last=True,
         auto_insert_metric_name=False,
         filename="micoformer-epoch{epoch:02d}",
