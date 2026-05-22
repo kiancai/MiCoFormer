@@ -12,11 +12,10 @@ from torchmetrics.classification import (
     MulticlassAUROC,
 )
 
-from micoformer.models.pretrain_module import MiCoFormerModule
 from micoformer.models.encoder import MiCoFormerEncoder
 from micoformer.models.heads import ClassificationHead
 from micoformer.models.pma import PMA
-from micoformer.utils.train_utils import build_lr_scheduler
+from micoformer.utils.train_utils import build_lr_scheduler, extract_encoder_artifacts_from_ckpt
 
 
 _VALID_FINETUNE_POOLING = {"pma", "mean_pool"}
@@ -67,19 +66,15 @@ class MiCoFormerClassifier(L.LightningModule):
             )
 
         if pretrained_ckpt_path is not None:
-            # 首次创建：从预训练 ckpt 提取 encoder 架构参数和权重
-            pretrained_module = MiCoFormerModule.load_from_checkpoint(
-                pretrained_ckpt_path, map_location="cpu"
-            )
-            _encoder_hparams = dict(pretrained_module.hparams)
-            _pretrained_encoder = pretrained_module.encoder
-            # V5: 提取 PMA state_dict(若预训练 module 含 pma)
-            if hasattr(pretrained_module, "pma") and pretrained_module.pma is not None:
-                _pma_state_dict = {k: v.detach().cpu() for k, v in pretrained_module.pma.state_dict().items()}
+            # 首次创建:从 ckpt 提取 encoder 架构参数 + encoder/PMA 权重。
+            # helper 自动识别 pretrain(MiCoFormerModule)/ finetune(MiCoFormerClassifier)两种 ckpt,
+            # 后者支持 CC LOO 从 broad finetune ckpt 起跳(finetune_plan.md §5.1)。
+            _encoder_hparams, _pretrained_encoder_sd, _pma_state_dict = \
+                extract_encoder_artifacts_from_ckpt(pretrained_ckpt_path)
         elif _encoder_hparams is not None:
             # 从微调 ckpt 恢复:_encoder_hparams 来自已保存的 hparams,
             # Lightning 将从 state_dict 恢复 encoder + pma 权重
-            _pretrained_encoder = None
+            _pretrained_encoder_sd = None
         else:
             raise RuntimeError(
                 "Cannot create MiCoFormerClassifier: provide pretrained_ckpt_path or _encoder_hparams. "
@@ -120,10 +115,10 @@ class MiCoFormerClassifier(L.LightningModule):
             use_hierarchical_embed=_encoder_hparams.get("use_hierarchical_embed", False),
         )
 
-        if _pretrained_encoder is not None:
+        if _pretrained_encoder_sd is not None:
             # 首次创建:加载预训练 encoder 权重(strict=False 容忍 buffer 差异 / V5 新模块)
             missing, unexpected = self.encoder.load_state_dict(
-                _pretrained_encoder.state_dict(), strict=False,
+                _pretrained_encoder_sd, strict=False,
             )
             if missing or unexpected:
                 import warnings

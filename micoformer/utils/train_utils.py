@@ -209,6 +209,35 @@ def inject_var_buffers(encoder, dist_matrix=None, pe_coords_raw=None) -> None:
         encoder.phylo_pe.set_coords(pe_coords_raw)
 
 
+def extract_encoder_artifacts_from_ckpt(ckpt_path):
+    """从 pretrain(MiCoFormerModule)或 finetune(MiCoFormerClassifier)ckpt 提取
+    encoder 复用三件套:(encoder_hparams, encoder_state_dict, pma_state_dict_or_None)。
+
+    自动识别 ckpt 类型:
+      - hparams 顶层有 'genus_vocab_size'  → pretrain ckpt,hparams 即 encoder_hparams
+      - hparams 顶层有 '_encoder_hparams'    → finetune ckpt,从该嵌套 dict 取
+    两种 ckpt 的 state_dict 都用 'encoder.' / 'pma.' 前缀,统一剥前缀。
+
+    直接 torch.load 读 ckpt,不走 Lightning load_from_checkpoint,
+    避免"必须能 instantiate model"的限制(finetune ckpt 无法当 pretrain module 加载)。
+    """
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    hp = raw.get("hyper_parameters", {})
+    sd = raw.get("state_dict", {})
+    if "genus_vocab_size" in hp:
+        encoder_hparams = dict(hp)                        # pretrain ckpt
+    elif hp.get("_encoder_hparams"):
+        encoder_hparams = dict(hp["_encoder_hparams"])    # finetune ckpt
+    else:
+        raise ValueError(
+            f"Cannot identify ckpt type (hparams has neither 'genus_vocab_size' "
+            f"nor '_encoder_hparams'): {ckpt_path}"
+        )
+    encoder_sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
+    pma_sd = {k[len("pma."):]: v for k, v in sd.items() if k.startswith("pma.")}
+    return encoder_hparams, encoder_sd, (pma_sd or None)
+
+
 def str2bool(v: str) -> bool:
     """argparse type= 辅助：支持 true/false/yes/no/1/0（大小写不敏感）。"""
     if v.lower() in ("yes", "true", "1"):

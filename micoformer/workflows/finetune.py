@@ -169,18 +169,17 @@ def run_finetune_once(
     )
     validate_no_split_overlap(train=train_indices, val=val_indices, test=test_indices)
 
-    # 从预训练 checkpoint 读取数据协议参数（BUG-4：继承 abundance 参数）
-    from micoformer.models.pretrain_module import MiCoFormerModule as _PretrainModule
-    _phparams = _PretrainModule.load_from_checkpoint(
-        config.pretrained_ckpt, map_location="cpu"
-    ).hparams
-    _num_bins = int(_phparams.get("total_abundance_bins", 42)) - 2
-    _min_abund = float(_phparams.get("min_abundance", 4e-6))
-    _abund_mode = str(_phparams.get("abundance_mode", "abs_log_bins"))
+    # 从 checkpoint 读取数据协议参数（BUG-4：继承 abundance 参数）
+    # helper 自动识别 pretrain / finetune ckpt(后者支持 Stage 4 从 broad ckpt 起跳)
+    from micoformer.utils.train_utils import extract_encoder_artifacts_from_ckpt
+    _enc_hparams, _, _ = extract_encoder_artifacts_from_ckpt(config.pretrained_ckpt)
+    _num_bins = int(_enc_hparams.get("total_abundance_bins", 42)) - 2
+    _min_abund = float(_enc_hparams.get("min_abundance", 4e-6))      # 两种 ckpt 均无此字段→默认
+    _abund_mode = str(_enc_hparams.get("abundance_mode", "abs_log_bins"))  # 同上
     # V5: 同时继承 abundance_encoding,确保 finetune Dataset 产出的字段与 encoder 期望一致
-    _abund_encoding = str(_phparams.get("abundance_encoding", "mlp"))
+    _abund_encoding = str(_enc_hparams.get("abundance_encoding", "mlp"))
     rank_zero_info(
-        f"{TAG} Inherited from pretrain ckpt: num_abundance_bins={_num_bins}, "
+        f"{TAG} Inherited from ckpt: num_abundance_bins={_num_bins}, "
         f"min_abundance={_min_abund}, abundance_mode={_abund_mode}, "
         f"abundance_encoding={_abund_encoding}"
     )
