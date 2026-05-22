@@ -11,7 +11,7 @@ Outputs(默认 --out_dir = data/gg2/splits/):
   cc_loo/{disease}/manifest.json                        ← fold 元信息
 
 按 finetune_plan.md:
-  pretrain_ma: MA 子集随机 95/5 train/val
+  pretrain_ma: MA 子集按 Project_ID group split 95/5(val 全是没见过的 study,避免泄漏)
   pretrain_rm: RM 子集(排除 external control)随机 95/5
   broad     : BroadFinetune_eligible=True,按 Project_ID group split 80/10/10
   cc_loo    : 每个 disease 每个 CC study 一个 fold;test=该 study,train=其他 CC studies
@@ -19,6 +19,8 @@ Outputs(默认 --out_dir = data/gg2/splits/):
 Usage:
   python MiCoFormer/scripts/_prepare_finetune_splits.py
   python MiCoFormer/scripts/_prepare_finetune_splits.py --diseases COPD Asthma TB RSV --seed 42
+  # 只重新生成某些阶段(避免覆盖已就绪的 broad/cc_loo):
+  python MiCoFormer/scripts/_prepare_finetune_splits.py --stages pretrain_ma
 """
 from __future__ import annotations
 
@@ -46,6 +48,22 @@ def random_split(indices: np.ndarray, val_frac: float, seed: int) -> Tuple[np.nd
     val_idx = indices[perm[:n_val]]
     train_idx = indices[perm[n_val:]]
     return np.sort(train_idx), np.sort(val_idx)
+
+
+def group_split(
+    indices: np.ndarray,
+    groups: np.ndarray,
+    val_frac: float,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """按 group 切 train/val(two-way),group 不重叠 → val 全是没见过的 study。
+
+    用于 pretrain_ma:val/loss 反映跨 study 泛化,避免 train/val 同 study 泄漏。
+    返回两个 sorted np.ndarray。
+    """
+    gss = GroupShuffleSplit(n_splits=1, test_size=val_frac, random_state=seed)
+    tr_idx, vl_idx = next(gss.split(indices, groups=groups))
+    return np.sort(indices[tr_idx]), np.sort(indices[vl_idx])
 
 
 def group_split_three(
@@ -82,6 +100,10 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--diseases", nargs="+", default=DEFAULT_DISEASES,
                    help="哪些 disease 生成 CC LOO splits")
+    p.add_argument("--stages", nargs="+",
+                   default=["pretrain_ma", "pretrain_rm", "broad", "cc_loo"],
+                   choices=["pretrain_ma", "pretrain_rm", "broad", "cc_loo"],
+                   help="只生成指定阶段的 splits(默认全跑)。传单个阶段可避免覆盖已就绪的其他阶段文件。")
     p.add_argument("--pretrain_val_frac", type=float, default=0.05)
     p.add_argument("--broad_val_frac",    type=float, default=0.10)
     p.add_argument("--broad_test_frac",   type=float, default=0.10)
@@ -100,29 +122,64 @@ def main():
     print(f"   Total samples: {n_total:,}  ({time.time() - t0:.1f}s)")
 
     rows = np.arange(n_total, dtype=np.int64)
+    stages = set(args.stages)
+    print(f"   Stages to generate: {sorted(stages)}")
 
     # ============= Stage 1: pretrain_ma =============
-    print(f"\n[2/5] pretrain_ma splits ...")
-    ma_mask = (obs["Database"] == "MicrobeAtlas").values
-    ma_idx = rows[ma_mask]
-    tr, vl = random_split(ma_idx, args.pretrain_val_frac, args.seed)
-    np.save(out_dir / "pretrain_ma_train.npy", tr)
-    np.save(out_dir / "pretrain_ma_val.npy", vl)
-    print(f"   train={len(tr):,}  val={len(vl):,}  (val_frac={args.pretrain_val_frac})")
+    if "pretrain_ma" in stages:
+        print(f"\n[2/5] pretrain_ma splits (group by Project_ID) ...")
+        ma_mask = (obs["Database"] == "MicrobeAtlas").values
+        ma_idx = rows[ma_mask]
+        ma_groups = obs["Project_ID"].values[ma_mask]
+        # NaN study 审计(group split 要求每样本有 study;NaN 会被 astype(str) 并成单一 "nan" 组)
+        n_null = int(pd.isna(ma_groups).sum())
+        ma_groups = ma_groups.astype(str)
+        tr, vl = group_split(ma_idx, ma_groups, args.pretrain_val_frac, args.seed)
+        np.save(out_dir / "pretrain_ma_train.npy", tr)
+        np.save(out_dir / "pretrain_ma_val.npy", vl)
+        tr_studies = set(obs.iloc[tr]["Project_ID"].astype(str))
+        vl_studies = set(obs.iloc[vl]["Project_ID"].astype(str))
+        overlap = tr_studies & vl_studies
+        print(f"   train={len(tr):,}  val={len(vl):,}  (val_frac={args.pretrain_val_frac})")
+        print(f"   #studies: train={len(tr_studies)}  val={len(vl_studies)}  "
+              f"OVERLAP={len(overlap)}  (Project_ID nulls in MA: {n_null})")
+        if overlap:
+            print(f"   [WARN] {len(overlap)} studies overlap train/val (expected 0 for group split)")
+    else:
+        print(f"\n[2/5] pretrain_ma: SKIP (not in --stages)")
 
     # ============= Stage 2: pretrain_rm =============
-    print(f"\n[3/5] pretrain_rm splits ...")
-    rm_mask = (
-        (obs["Database"] == "ResMicroDb").values
-        & ~obs["IsExternalControl"].values
-    )
-    rm_idx = rows[rm_mask]
-    tr, vl = random_split(rm_idx, args.pretrain_val_frac, args.seed)
-    np.save(out_dir / "pretrain_rm_train.npy", tr)
-    np.save(out_dir / "pretrain_rm_val.npy", vl)
-    print(f"   train={len(tr):,}  val={len(vl):,}  (val_frac={args.pretrain_val_frac})")
+    if "pretrain_rm" in stages:
+        print(f"\n[3/5] pretrain_rm splits ...")
+        rm_mask = (
+            (obs["Database"] == "ResMicroDb").values
+            & ~obs["IsExternalControl"].values
+        )
+        rm_idx = rows[rm_mask]
+        tr, vl = random_split(rm_idx, args.pretrain_val_frac, args.seed)
+        np.save(out_dir / "pretrain_rm_train.npy", tr)
+        np.save(out_dir / "pretrain_rm_val.npy", vl)
+        print(f"   train={len(tr):,}  val={len(vl):,}  (val_frac={args.pretrain_val_frac})")
+    else:
+        print(f"\n[3/5] pretrain_rm: SKIP (not in --stages)")
 
     # ============= Stage 3: broad finetune =============
+    if "broad" not in stages:
+        print(f"\n[4/5] broad: SKIP (not in --stages)")
+    else:
+        _run_broad_stage(obs, rows, out_dir, args)
+
+    # ============= Stage 4: CC LOO per disease =============
+    if "cc_loo" not in stages:
+        print(f"\n[5/5] cc_loo: SKIP (not in --stages)")
+    else:
+        _run_cc_loo_stage(obs, rows, out_dir, args)
+
+    print(f"\nDone. {time.time() - t0:.1f}s   ->   {out_dir}")
+
+
+def _run_broad_stage(obs, rows, out_dir, args) -> None:
+    """Stage 3: broad finetune splits (group by Project_ID)."""
     print(f"\n[4/5] broad finetune splits (group by Project_ID) ...")
     broad_mask = obs["BroadFinetune_eligible"].values
     broad_idx = rows[broad_mask]
@@ -147,7 +204,9 @@ def main():
         sub = obs.iloc[ix]["RM_Is_Healthy"].fillna(False).astype(bool)
         print(f"   {name:5s}: healthy={sub.sum():>6,}  diseased={(~sub).sum():>6,}")
 
-    # ============= Stage 4: CC LOO per disease =============
+
+def _run_cc_loo_stage(obs, rows, out_dir, args) -> None:
+    """Stage 4: CC LOO splits per disease."""
     print(f"\n[5/5] CC LOO splits for {len(args.diseases)} disease(s) ...")
     cc_dir = out_dir / "cc_loo"
     cc_dir.mkdir(exist_ok=True)
@@ -194,8 +253,6 @@ def main():
             print(f"     fold{f['fold']:>2d}  test={f['test_study']:<15s}  "
                   f"train(case/ctrl)={f['train_case']:>4d}/{f['train_control']:>4d}  "
                   f"test(case/ctrl)={f['test_case']:>4d}/{f['test_control']:>4d}")
-
-    print(f"\nDone. {time.time() - t0:.1f}s   ->   {out_dir}")
 
 
 if __name__ == "__main__":

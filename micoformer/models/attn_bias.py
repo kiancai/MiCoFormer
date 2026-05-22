@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -224,11 +225,22 @@ class BiasedTransformerEncoderLayer(nn.Module):
 
 
 class BiasedTransformerEncoder(nn.Module):
-    """BiasedTransformerEncoderLayer 的多层堆叠，逐层传递 attn_bias。"""
+    """BiasedTransformerEncoderLayer 的多层堆叠，逐层传递 attn_bias。
 
-    def __init__(self, layer: BiasedTransformerEncoderLayer, num_layers: int) -> None:
+    grad_checkpointing=True 时,每层用激活重算(activation recomputation):
+    前向不缓存中间激活,反向时重跑该层前向重建激活 —— 以时间换显存
+    (单卡可开更大 batch)。默认关;微调链路永不开。
+    """
+
+    def __init__(
+        self,
+        layer: BiasedTransformerEncoderLayer,
+        num_layers: int,
+        grad_checkpointing: bool = False,
+    ) -> None:
         super().__init__()
         self.layers = nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
+        self.grad_checkpointing = grad_checkpointing
 
     def forward(
         self,
@@ -237,5 +249,12 @@ class BiasedTransformerEncoder(nn.Module):
         attn_bias: Optional[Tensor] = None,
     ) -> Tensor:
         for layer in self.layers:
-            x = layer(x, key_padding_mask=key_padding_mask, attn_bias=attn_bias)
+            if self.grad_checkpointing and self.training:
+                # 位置参数匹配 layer.forward(x, key_padding_mask, attn_bias) 签名;
+                # use_reentrant=False 正确处理 None 的 attn_bias + dropout RNG
+                x = checkpoint(
+                    layer, x, key_padding_mask, attn_bias, use_reentrant=False
+                )
+            else:
+                x = layer(x, key_padding_mask=key_padding_mask, attn_bias=attn_bias)
         return x

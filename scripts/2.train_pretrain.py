@@ -89,7 +89,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max_seq_len", type=int, default=1024)           # 每个样本保留的最大物种数 (截断长度)
 
     # 3.1.预训练中的训练主体参数
-    p.add_argument("--batch_size", type=int, default=32)              # 每个 batch 的样本数
+    p.add_argument("--batch_size", type=int, default=32,
+                   help="per-GPU micro-batch（DDP 下有效 batch = batch_size × devices × accumulate_grad_batches）")
     p.add_argument("--mask_prob", type=float, default=0.15)           # 预训练 Mask 概率
     p.add_argument("--dropout", type=float, default=0.1)              # Dropout 概率
     p.add_argument("--lr", type=float, default=3e-4)                  # 学习率
@@ -122,11 +123,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--early_stopping_min_delta", type=float, default=0.0,)  #Early stopping 最小改善阈值。
 
     # 5. 运行与工程参数
-    p.add_argument("--devices", type=int, default=1)                   # 使用的 GPU/设备 数量
+    p.add_argument("--devices", type=int, default=1)                   # 使用的 GPU/设备 数量（单节点内卡数）
+    p.add_argument("--num_nodes", type=int, default=1)                 # 多节点 DDP 节点数（单节点保持 1）
     p.add_argument("--precision", type=str, default="auto", choices=["auto", "16-mixed", "32"])
     p.add_argument("--seed", type=int, default=42)                     # 随机种子，用于可复现
     p.add_argument("--accumulate_grad_batches", type=int, default=1)   # 梯度累积步数
     p.add_argument("--gradient_clip_val", type=float, default=1.0)     # 梯度裁剪阈值
+    p.add_argument("--grad_checkpointing", action="store_true", default=False,
+                   help="激活重算（以时间换显存，单卡可开更大 batch）；默认关，本次正式训练不用")
     p.add_argument("--num_workers", type=int, default=4)               # DataLoader 的 num_workers
     p.add_argument("--log_dir", type=str, default="tmp/logs")          # 日志保存目录
     p.add_argument(
@@ -180,10 +184,12 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         limit_train_batches=args.limit_train_batches,
         limit_val_batches=args.limit_val_batches,
         devices=args.devices,
+        num_nodes=args.num_nodes,
         precision=args.precision,
         seed=args.seed,
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=args.gradient_clip_val,
+        grad_checkpointing=args.grad_checkpointing,
         num_workers=args.num_workers,
         log_dir=args.log_dir,
         no_progress_bar=args.no_progress_bar,

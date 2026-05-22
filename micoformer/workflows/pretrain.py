@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
-import uuid
 from dataclasses import dataclass
 
 import anndata as ad
@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, TensorBoardLogger
+from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.utilities import rank_zero_info
 
 from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
@@ -87,6 +88,7 @@ class PretrainRunConfig:
 
     # 5. 运行与工程参数
     devices: int = 1
+    num_nodes: int = 1                 # 多节点 DDP 节点数(单节点保持 1)
     precision: str = "auto"
     seed: int = 42
     accumulate_grad_batches: int = 1
@@ -94,6 +96,8 @@ class PretrainRunConfig:
     num_workers: int = 4
     log_dir: str = "tmp/logs"
     no_progress_bar: bool = False
+    # 激活重算(以时间换显存,留给未来对比学习);默认关,本次正式训练不用
+    grad_checkpointing: bool = False
 
     # ============== V5 新增 ==============
     abundance_encoding: str = "mlp"             # "mlp" | "bin"
@@ -259,6 +263,7 @@ def run_pretrain_once(
         pe_dim=_pe_dim,
         use_hierarchical_embed=config.use_hierarchical_embed,
         use_sample_token=config.use_sample_token,
+        grad_checkpointing=config.grad_checkpointing,
         pooling_mode=config.pooling_mode,
         pma_nhead=config.pma_nhead,
         pma_k=config.pma_k,
@@ -300,8 +305,26 @@ def run_pretrain_once(
             rank_zero_info(f"{TAG}   first unexpected keys: {_unexp[:5]}")
 
     # 3. 设置日志记录器与回调
-    # 加 uuid 后缀避免同秒并行启动的时间戳碰撞
-    run_version = time.strftime("run_%Y%m%d_%H%M%S") + f"_{uuid.uuid4().hex[:6]}"
+    # DDP subprocess 下各 rank 各自重跑本脚本,run_version 必须确定性生成
+    # (不能含 uuid / 秒级时间,否则各 rank 算出不同目录 → 日志/ckpt 分裂)。
+    # 指纹基于影响本次 run 的关键 config;所有 rank 拿到相同 config → 必然一致。
+    # 同 config 重跑会落到同一目录(可接受;Lightning 会续写/覆盖)。
+    _fp_src = "|".join(
+        [
+            log_subdir,
+            str(config.seed),
+            os.path.abspath(config.h5ad_path),
+            config.budget_mode,
+            str(config.max_epochs),
+            str(config.max_steps),
+            str(config.batch_size),
+            str(config.devices),
+            str(config.accumulate_grad_batches),
+            str(config.lr),
+        ]
+    )
+    _fp = hashlib.md5(_fp_src.encode("utf-8")).hexdigest()[:10]
+    run_version = f"run_{time.strftime('%Y%m%d')}_{_fp}"
     csv_logger = CSVLogger(save_dir=config.log_dir, name=log_subdir, version=run_version)
     tb_logger = TensorBoardLogger(save_dir=config.log_dir, name=log_subdir, version=run_version)
 
@@ -330,8 +353,11 @@ def run_pretrain_once(
         )
 
     # 4. 初始化 Trainer
+    _use_gpu = torch.cuda.is_available()
     trainer_kwargs = dict(
+        accelerator="gpu" if _use_gpu else "cpu",
         devices=config.devices,
+        num_nodes=config.num_nodes,
         precision=chosen_precision,
         accumulate_grad_batches=config.accumulate_grad_batches,
         gradient_clip_val=config.gradient_clip_val,
@@ -341,6 +367,19 @@ def run_pretrain_once(
         callbacks=callbacks,
         default_root_dir=config.log_dir,
     )
+    # 多卡 DDP:显式 DDPStrategy(subprocess launcher,非 ddp_spawn)。
+    #  - subprocess 让每 rank 重跑 run_pretrain_once → 各自本地 inject_var_buffers,
+    #    避免 spawn 跨进程 pickle 263MB dist_matrix buffer。
+    #  - broadcast_buffers=False:dist_matrix / phylo_pe.coords / _meta_class_weights 都是
+    #    persistent=False 的冻结 buffer,各 rank 已本地注入/重建相同值;否则 DDP 每步
+    #    broadcast 263MB 走 PCIe 严重拖慢。
+    #  - find_unused_parameters=True:abund_embed(encoder 无条件创建)在 mlp 路径不参与
+    #    forward,否则 DDP backward 会因检测到未用参数而报错。
+    if _use_gpu and config.devices > 1:
+        trainer_kwargs["strategy"] = DDPStrategy(
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
     if config.budget_mode == "epoch":
         trainer_kwargs["max_epochs"] = config.max_epochs
         trainer_kwargs["check_val_every_n_epoch"] = config.val_interval_epochs

@@ -53,6 +53,7 @@ class MiCoFormerModule(L.LightningModule):
         pe_dim: Optional[int] = None,
         use_hierarchical_embed: bool = False,
         use_sample_token: bool = False,
+        grad_checkpointing: bool = False,       # 激活重算开关(透传给 encoder),默认关
         pooling_mode: str = "pma",             # "pma" | "mean_pool"
         pma_nhead: int = 4,
         pma_k: int = 1,
@@ -110,6 +111,7 @@ class MiCoFormerModule(L.LightningModule):
             pe_dim=pe_dim,
             use_sample_token=use_sample_token,
             use_hierarchical_embed=use_hierarchical_embed,
+            grad_checkpointing=grad_checkpointing,
         )
 
         # ============ MLM head ============

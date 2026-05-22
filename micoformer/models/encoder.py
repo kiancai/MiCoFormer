@@ -62,6 +62,7 @@ class MiCoFormerEncoder(nn.Module):
         pe_dim: Optional[int] = None,          # PE 坐标维度;use_phylo_pe=True 时必须
         use_sample_token: bool = False,        # V5 默认 False(删 [SAMPLE]);True 时启用旧路径
         use_hierarchical_embed: bool = False,   # V5 默认 False(单 genus embedding)
+        grad_checkpointing: bool = False,       # 激活重算开关(以时间换显存),默认关
     ) -> None:
         super().__init__()
         self.pad_taxon_id = pad_taxon_id
@@ -164,7 +165,9 @@ class MiCoFormerEncoder(nn.Module):
             dim_feedforward=dim_feedforward,
             dropout=dropout,
         )
-        self.encoder = BiasedTransformerEncoder(biased_layer, num_layers=num_layers)
+        self.encoder = BiasedTransformerEncoder(
+            biased_layer, num_layers=num_layers, grad_checkpointing=grad_checkpointing
+        )
 
         # V4 R2:距离 bias 模块(None / TaxoDistBias / PhyloDistBias)
         self.dist_bias = make_dist_bias(
