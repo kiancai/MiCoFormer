@@ -39,7 +39,7 @@ class MiCoFormerModule(L.LightningModule):
         dropout: float = 0.1,
         pad_taxon_id: int = 0,
         pad_bin_id: int = 0,
-        token_embedding_mode: Optional[str] = None,  # 旧 alias
+        # hierarchical 删除后此参数不再使用,保留以免签名/ckpt-hparam 改动(透传给 encoder)
         rank_vocab_sizes: Dict[str, int],
         # V4 R2
         bias_type: str = "phylo",            # V5 默认 phylo
@@ -51,8 +51,6 @@ class MiCoFormerModule(L.LightningModule):
         use_phylo_pe: bool = True,
         phylo_pe_hidden: int = 128,
         pe_dim: Optional[int] = None,
-        use_hierarchical_embed: bool = False,
-        use_sample_token: bool = False,
         grad_checkpointing: bool = False,       # 激活重算开关(透传给 encoder),默认关
         pooling_mode: str = "pma",             # "pma" | "mean_pool"
         pma_nhead: int = 4,
@@ -100,7 +98,6 @@ class MiCoFormerModule(L.LightningModule):
             dropout=dropout,
             pad_taxon_id=pad_taxon_id,
             pad_bin_id=pad_bin_id,
-            token_embedding_mode=token_embedding_mode,
             rank_vocab_sizes=rank_vocab_sizes,
             bias_type=bias_type,
             phylo_mlp_hidden=phylo_mlp_hidden,
@@ -109,8 +106,6 @@ class MiCoFormerModule(L.LightningModule):
             use_phylo_pe=use_phylo_pe,
             phylo_pe_hidden=phylo_pe_hidden,
             pe_dim=pe_dim,
-            use_sample_token=use_sample_token,
-            use_hierarchical_embed=use_hierarchical_embed,
             grad_checkpointing=grad_checkpointing,
         )
 
@@ -152,29 +147,20 @@ class MiCoFormerModule(L.LightningModule):
     # forward 与 step 辅助
     # ------------------------------------------------------------------
     def _encode(self, batch: Dict[str, torch.Tensor]):
-        """统一封装 encoder 调用,根据 abundance_encoding/use_sample_token 等 flag 自适应。"""
-        h, sample_repr = self.encoder(
+        """统一封装 encoder 调用,根据 abundance_encoding 等 flag 自适应。"""
+        h = self.encoder(
             token_ids=batch["token_ids"],
             attention_mask=batch["attention_mask"],
             abund_bins=batch.get("abund_bins"),
             abund_values=batch.get("abund_values"),
             mask_positions=batch.get("mask_positions"),
-            taxon_path_ids=batch.get("taxon_path_ids"),
             var_indices=batch.get("var_indices"),
         )
-        return h, sample_repr
-
-    def _h_taxon(self, h: torch.Tensor) -> torch.Tensor:
-        """返回不含 [SAMPLE] 位的 token 部分(对齐 labels 长度)。"""
-        if self.hparams.use_sample_token:
-            return h[:, 1:, :]
         return h
 
     def _pool(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """sample-level pooling: PMA(V5) 或 masked mean。"""
-        # 输入 h 必须不含 [SAMPLE](use_sample_token=True 时由 _h_taxon 取 token 部分,
-        # use_sample_token=False 时本来就没有 [SAMPLE])
-        h_token = self._h_taxon(h)
+        h_token = h
         key_padding_mask = ~attention_mask  # True = PAD
         if self.hparams.pooling_mode == "pma":
             return self.pma(h_token, key_padding_mask=key_padding_mask)
@@ -191,8 +177,8 @@ class MiCoFormerModule(L.LightningModule):
         batch: Dict[str, torch.Tensor],
         stage: str,  # "train" / "val"
     ) -> torch.Tensor:
-        h, _ = self._encode(batch)
-        h_token = self._h_taxon(h)
+        h = self._encode(batch)
+        h_token = h
 
         # ============ MLM loss ============
         mask_pos = batch["mask_positions"]

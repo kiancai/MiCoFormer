@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from micoformer.data.datasets import RANK_COLUMNS
 from micoformer.models.attn_bias import (
     BiasedTransformerEncoder,
     BiasedTransformerEncoderLayer,
@@ -25,10 +23,8 @@ class MiCoFormerEncoder(nn.Module):
     input_token[i] = genus_embed[i] + abundance_embed[i] + phylo_pe[i]
                      └── 身份 ──┘     └── 数值 ──┘     └── 位置/几何 ──┘
 
-    保留旧 flag:
-      - use_sample_token=True 时拼接 [SAMPLE] token,使用 self.sample_embed
+    可选 flag:
       - abundance_encoding='bin' 时用 self.abund_embed(nn.Embedding) 代替 self.abund_mlp
-      - use_hierarchical_embed=True 时把 5/6-rank embedding 相加(旧 R1)代替单 genus_embed
       - use_phylo_pe=False 时不加 phylo_pe
     """
 
@@ -44,7 +40,7 @@ class MiCoFormerEncoder(nn.Module):
         dropout: float = 0.1,
         pad_taxon_id: int = 0,
         pad_bin_id: int = 0,
-        token_embedding_mode: Optional[str] = None,  # 旧 alias:'taxon' / 'taxon_path';显式传时覆盖 use_hierarchical_embed
+        # hierarchical 删除后此参数不再使用,保留以免签名/ckpt-hparam 改动(调用方仍传它)
         rank_vocab_sizes: Dict[str, int],
         # V4 R2:距离驱动的 attention bias
         # - "none"  :baseline,不注入任何距离 bias
@@ -60,8 +56,6 @@ class MiCoFormerEncoder(nn.Module):
         use_phylo_pe: bool = True,             # 启用 PhyloPE(V5 默认 True)
         phylo_pe_hidden: int = 128,
         pe_dim: Optional[int] = None,          # PE 坐标维度;use_phylo_pe=True 时必须
-        use_sample_token: bool = False,        # V5 默认 False(删 [SAMPLE]);True 时启用旧路径
-        use_hierarchical_embed: bool = False,   # V5 默认 False(单 genus embedding)
         grad_checkpointing: bool = False,       # 激活重算开关(以时间换显存),默认关
     ) -> None:
         super().__init__()
@@ -74,18 +68,6 @@ class MiCoFormerEncoder(nn.Module):
             )
         self.bias_type = bias_type
 
-        # 兼容旧 alias:显式传 token_embedding_mode 时覆盖 use_hierarchical_embed
-        if token_embedding_mode is not None:
-            if token_embedding_mode not in {"taxon", "taxon_path"}:
-                raise ValueError(
-                    f"Unknown token_embedding_mode: {token_embedding_mode}. "
-                    "Expected 'taxon' or 'taxon_path'."
-                )
-            use_hierarchical_embed = (token_embedding_mode == "taxon_path")
-        self.use_hierarchical_embed = bool(use_hierarchical_embed)
-        # 保留 token_embedding_mode 供 ckpt 兼容/调试用
-        self.token_embedding_mode = "taxon_path" if self.use_hierarchical_embed else "taxon"
-
         if abundance_encoding not in _VALID_ABUNDANCE_ENCODING:
             raise ValueError(
                 f"Unknown abundance_encoding: {abundance_encoding!r}. "
@@ -93,36 +75,19 @@ class MiCoFormerEncoder(nn.Module):
             )
         self.abundance_encoding = abundance_encoding
         self.use_phylo_pe = use_phylo_pe
-        self.use_sample_token = use_sample_token
 
         # ============ Token identity embedding ============
-        # genus_embed:V5 默认路径(单 genus embedding)。保留 self.taxon_embed 作为同一对象的别名,旧 ckpt 兼容
-        # 当 use_hierarchical_embed=False 时用它;True 时不用(走 rank_embeds 相加)
-        self.taxon_embed: Optional[nn.Embedding] = None
-        if not self.use_hierarchical_embed:
-            self.taxon_embed = nn.Embedding(genus_vocab_size, d_model, padding_idx=pad_taxon_id)
-        # 别名(V5 语义),与 taxon_embed 共享对象;若旧路径未构造则为 None
+        # genus_embed:V5 单 genus embedding。保留 self.taxon_embed 作为同一对象的别名,ckpt 兼容
+        self.taxon_embed = nn.Embedding(genus_vocab_size, d_model, padding_idx=pad_taxon_id)
+        # 别名(V5 语义),与 taxon_embed 共享对象
         self.genus_embed = self.taxon_embed
 
-        # rank_embeds:旧 R1 路径(6 级 embedding 相加),use_hierarchical_embed=True 时使用
-        self.rank_embeds = nn.ModuleDict()
-        if self.use_hierarchical_embed:
-            for rank_name in RANK_COLUMNS:
-                if rank_name not in rank_vocab_sizes:
-                    raise ValueError(
-                        f"Missing rank vocab size for '{rank_name}'. "
-                        f"Expected ranks: {RANK_COLUMNS}, got: {list(rank_vocab_sizes.keys())}."
-                    )
-                self.rank_embeds[rank_name] = nn.Embedding(
-                    int(rank_vocab_sizes[rank_name]), d_model, padding_idx=0
-                )
-
         # ============ Abundance embedding ============
-        # bin 路径(旧):nn.Embedding(num_bins+2, d_model)
-        # mlp 路径(V5):MLP(1 → d/4 → d) + LayerNorm + abund_mask_token
-        # 两套权重并存,根据 self.abundance_encoding 选用(便于 ablation)
-        self.abund_embed = nn.Embedding(total_abundance_bins, d_model, padding_idx=pad_bin_id)
+        # bin 路径:nn.Embedding(num_bins+2, d_model)
+        # mlp 路径(V5 默认):MLP(1 → d/4 → d) + LayerNorm + abund_mask_token
+        # 仅创建当前 abundance_encoding 对应的权重(避免无关参数不参与 forward → DDP find_unused)
         if self.abundance_encoding == "mlp":
+            self.abund_embed = None
             self.abund_mlp = nn.Sequential(
                 nn.Linear(1, max(1, d_model // 4)),
                 nn.GELU(),
@@ -131,15 +96,9 @@ class MiCoFormerEncoder(nn.Module):
             )
             self.abund_mask_token = nn.Parameter(torch.zeros(d_model))
         else:
-            # 占位属性,bin 路径下不被消费
+            self.abund_embed = nn.Embedding(total_abundance_bins, d_model, padding_idx=pad_bin_id)
             self.abund_mlp = None
             self.abund_mask_token = None
-
-        # ============ [SAMPLE] token(旧路径) ============
-        # V5 默认删除([SAMPLE] 不在输入序列中);use_sample_token=True 时启用
-        self.sample_embed: Optional[nn.Embedding] = None
-        if self.use_sample_token:
-            self.sample_embed = nn.Embedding(1, d_model)
 
         # ============ Phylo PE(V5) ============
         # vocab_size 含 PAD/UNK,而 anndata.n_vars(=V_real)不含 → PhyloPE 内部 = genus_vocab_size
@@ -211,20 +170,9 @@ class MiCoFormerEncoder(nn.Module):
         self.register_buffer("dist_matrix", matrix.to(self.dist_matrix.device), persistent=False)
         self._dist_matrix_loaded = True
 
-    def _build_token_embedding(
-        self,
-        token_ids: torch.Tensor,
-        taxon_path_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        # baseline / V5: 用 genus_embed
-        # 旧 R1: 6 级 embedding 相加(use_hierarchical_embed=True)
-        if self.use_hierarchical_embed:
-            token_x = self.rank_embeds[RANK_COLUMNS[0]](taxon_path_ids[:, :, 0])
-            for rank_idx, rank_name in enumerate(RANK_COLUMNS[1:], start=1):
-                token_x = token_x + self.rank_embeds[rank_name](taxon_path_ids[:, :, rank_idx])
-        else:
-            token_x = self.taxon_embed(token_ids)
-        return token_x
+    def _build_token_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:
+        # V5: 单 genus embedding
+        return self.taxon_embed(token_ids)
 
     def _build_abundance_embedding(
         self,
@@ -260,32 +208,21 @@ class MiCoFormerEncoder(nn.Module):
         abund_bins: Optional[torch.Tensor] = None,          # [B, L]  bin 路径用
         abund_values: Optional[torch.Tensor] = None,        # [B, L]  mlp 路径用
         mask_positions: Optional[torch.Tensor] = None,      # [B, L]  bool,MLM 被 mask 的位置(mlp 路径用)
-        taxon_path_ids: Optional[torch.Tensor] = None,      # [B, L, 6]  use_hierarchical_embed=True 时必须
         var_indices: Optional[torch.Tensor] = None,         # [B, L]  int64  bias_type!='none' 时必需
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         """
         Returns:
-            h:           [B, L, d_model] (V5)  或  [B, L+1, d_model] (use_sample_token=True)
-            sample_repr: use_sample_token=True 时是 [B, d_model]([SAMPLE] 位);否则 None
-                        (V5 路径:PMA pooling 在 module 层做,encoder 不返回 sample_repr)
+            h: [B, L, d_model]  token-level 输出(sample-level PMA pooling 在 module 层做)
         """
-        B = token_ids.size(0)
-
         # ============ Token embedding 三段相加 ============
-        token_x = self._build_token_embedding(token_ids, taxon_path_ids)
+        token_x = self._build_token_embedding(token_ids)
         abund_x = self._build_abundance_embedding(abund_bins, abund_values, mask_positions)
         x = token_x + abund_x
         if self.use_phylo_pe and self.phylo_pe is not None:
             x = x + self.phylo_pe(token_ids)
 
-        # ============ [SAMPLE] 拼接(旧路径) + attention mask ============
-        if self.use_sample_token:
-            sample_mask = torch.ones((B, 1), dtype=torch.bool, device=token_ids.device)
-            key_padding_mask = ~torch.cat([sample_mask, attention_mask], dim=1)
-            sample_vec = self.sample_embed.weight.view(1, 1, -1).expand(B, -1, -1)
-            x = torch.cat([sample_vec, x], dim=1)  # [B, L+1, d_model]
-        else:
-            key_padding_mask = ~attention_mask  # [B, L]
+        # ============ attention mask ============
+        key_padding_mask = ~attention_mask  # [B, L]
 
         # ============ Attention bias(R2) ============
         attn_bias: Optional[torch.Tensor] = None
@@ -298,20 +235,8 @@ class MiCoFormerEncoder(nn.Module):
                 raise RuntimeError(
                     "dist_matrix has not been loaded. Call encoder.set_dist_matrix(...) before forward()."
                 )
-            taxon_bias = self.dist_bias(var_indices, self.dist_matrix)  # [B, nhead, L, L]
-            if self.use_sample_token:
-                # 旧路径:pad 一圈零让 attn_bias 兼容 [B, nhead, L+1, L+1]
-                attn_bias = F.pad(taxon_bias, (1, 0, 1, 0), mode="constant", value=0.0)
-            else:
-                attn_bias = taxon_bias
+            attn_bias = self.dist_bias(var_indices, self.dist_matrix)  # [B, nhead, L, L]
 
         h = self.encoder(x, key_padding_mask=key_padding_mask, attn_bias=attn_bias)
         h = self.layer_norm(h)
-
-        # V5 路径:sample_repr 由 PMA 在上层做,encoder 不返回(None)
-        # 旧路径:返回 [SAMPLE] 位置的输出作 sample_repr
-        if self.use_sample_token:
-            sample_repr = h[:, 0, :]
-        else:
-            sample_repr = None
-        return h, sample_repr
+        return h

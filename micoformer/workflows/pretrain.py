@@ -37,10 +37,6 @@ class PretrainRunConfig:
     h5ad_path: str
 
     # 1. 模型版本开关
-    # 旧 alias:V5 推荐用 use_hierarchical_embed
-    token_embedding_mode: str | None = None
-    # V5 主开关
-    use_hierarchical_embed: bool = False
     # V4 R2：距离驱动的 attention bias（'none' | 'taxo' | 'phylo'）
     bias_type: str = "phylo"           # V5 默认 phylo
     phylo_mlp_hidden: int = 64          # V5 默认 64(3 层 MLP);旧 alias phylo_bias_hidden 走同字段
@@ -106,7 +102,6 @@ class PretrainRunConfig:
     abundance_loss: str = "huber"               # "huber" | "bin_ce"
     use_phylo_pe: bool = True
     phylo_pe_hidden: int = 128
-    use_sample_token: bool = False
     pooling_mode: str = "pma"                   # "pma" | "mean_pool"
     pma_nhead: int = 4
     pma_k: int = 1
@@ -194,7 +189,6 @@ def run_pretrain_once(
     rank_zero_info(
         f"{TAG} V5 flags: abundance_encoding={config.abundance_encoding} (loss={config.abundance_loss}), "
         f"use_phylo_pe={config.use_phylo_pe}, pooling={config.pooling_mode}, "
-        f"use_sample_token={config.use_sample_token}, use_hierarchical_embed={config.use_hierarchical_embed}, "
         f"use_metadata_task={config.use_metadata_task} (λ={config.metadata_loss_weight})"
     )
     # bias_type != 'none' 时把 var 表大小传给模型（占位 dist_matrix buffer 用），
@@ -251,7 +245,6 @@ def run_pretrain_once(
         dropout=config.dropout,
         pad_taxon_id=dm.special_ids["pad_taxon_id"],
         pad_bin_id=dm.special_ids["pad_bin_id"],
-        token_embedding_mode=config.token_embedding_mode,
         rank_vocab_sizes=dm.rank_vocab_sizes,
         bias_type=config.bias_type,
         phylo_mlp_hidden=config.phylo_mlp_hidden,
@@ -262,8 +255,6 @@ def run_pretrain_once(
         use_phylo_pe=config.use_phylo_pe,
         phylo_pe_hidden=config.phylo_pe_hidden,
         pe_dim=_pe_dim,
-        use_hierarchical_embed=config.use_hierarchical_embed,
-        use_sample_token=config.use_sample_token,
         grad_checkpointing=config.grad_checkpointing,
         pooling_mode=config.pooling_mode,
         pma_nhead=config.pma_nhead,
@@ -374,12 +365,13 @@ def run_pretrain_once(
     #  - broadcast_buffers=False:dist_matrix / phylo_pe.coords / _meta_class_weights 都是
     #    persistent=False 的冻结 buffer,各 rank 已本地注入/重建相同值;否则 DDP 每步
     #    broadcast 263MB 走 PCIe 严重拖慢。
-    #  - find_unused_parameters=True:abund_embed(encoder 无条件创建)在 mlp 路径不参与
-    #    forward,否则 DDP backward 会因检测到未用参数而报错。
+    #  - find_unused_parameters=False:abund_embed 已改条件创建 + sample_embed 已删 →
+    #    默认/各 flag 组合下所有参数都参与 forward,可关 find_unused。
+    #    ⚠️ 仅 CPU 验证过,首次多卡 DDP 跑若报 unused-parameter 错,改回 True 并排查。
     if _use_gpu and config.devices > 1:
         trainer_kwargs["strategy"] = DDPStrategy(
             broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
     if config.budget_mode == "epoch":
         trainer_kwargs["max_epochs"] = config.max_epochs

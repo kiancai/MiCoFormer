@@ -39,10 +39,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--val_indices_path", type=str, required=True)
 
     # 1.模型版本开关
-    # 旧 alias --token_embedding_mode 仍保留(显式传时覆盖 use_hierarchical_embed)
-    p.add_argument("--token_embedding_mode", type=str, default=None, choices=["taxon", "taxon_path", None])
-    p.add_argument("--use_hierarchical_embed", action="store_true", default=False,
-                   help="V5:启用旧 R1(6-rank embedding 相加),默认关")
     # V4 R2:距离驱动的 attention bias
     #   none  : baseline,无 bias
     #   taxo  : 离散 7-bucket 查 varp['taxo_dist']
@@ -60,8 +56,6 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="V5:禁用 PhyloPE(默认启用)")
     p.add_argument("--phylo_pe_hidden", type=int, default=128,
                    help="PhyloPE 投影 MLP 中间维度,默认 128")
-    p.add_argument("--use_sample_token", action="store_true", default=False,
-                   help="V5:启用旧 [SAMPLE] token,默认关")
     p.add_argument("--pooling_mode", type=str, default="pma", choices=["pma", "mean_pool"],
                    help="V5:sample-level pooling;pma(默认) | mean_pool")
     p.add_argument("--pma_nhead", type=int, default=4)
@@ -154,8 +148,6 @@ def build_argparser() -> argparse.ArgumentParser:
 def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
     return PretrainRunConfig(
         h5ad_path=args.h5ad_path,
-        token_embedding_mode=args.token_embedding_mode,
-        use_hierarchical_embed=args.use_hierarchical_embed,
         bias_type=args.bias_type,
         phylo_mlp_hidden=args.phylo_mlp_hidden,
         d_model=args.d_model,
@@ -202,7 +194,6 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         abundance_loss=args.abundance_loss,
         use_phylo_pe=not args.no_phylo_pe,
         phylo_pe_hidden=args.phylo_pe_hidden,
-        use_sample_token=args.use_sample_token,
         pooling_mode=args.pooling_mode,
         pma_nhead=args.pma_nhead,
         pma_k=args.pma_k,

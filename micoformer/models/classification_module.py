@@ -101,7 +101,6 @@ class MiCoFormerClassifier(L.LightningModule):
             dropout=_encoder_hparams.get("dropout", 0.1),
             pad_taxon_id=_encoder_hparams.get("pad_taxon_id", 0),
             pad_bin_id=_encoder_hparams.get("pad_bin_id", 0),
-            token_embedding_mode=_encoder_hparams.get("token_embedding_mode"),
             rank_vocab_sizes=dict(_encoder_hparams["rank_vocab_sizes"]),
             bias_type=_bias_type,
             phylo_mlp_hidden=_encoder_hparams.get("phylo_mlp_hidden", 64),
@@ -111,8 +110,6 @@ class MiCoFormerClassifier(L.LightningModule):
             use_phylo_pe=_encoder_hparams.get("use_phylo_pe", True),
             phylo_pe_hidden=_encoder_hparams.get("phylo_pe_hidden", 128),
             pe_dim=_encoder_hparams.get("pe_dim", None),
-            use_sample_token=_encoder_hparams.get("use_sample_token", False),
-            use_hierarchical_embed=_encoder_hparams.get("use_hierarchical_embed", False),
         )
 
         if _pretrained_encoder_sd is not None:
@@ -205,14 +202,9 @@ class MiCoFormerClassifier(L.LightningModule):
     def _pool(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """根据 pooling_mode 从 encoder 输出中提取样本表示(V5:pma / mean_pool)。
 
-        V5 默认 use_sample_token=False,encoder 输出 h 不含 [SAMPLE],直接对整个 [B, L, d] 做 pool。
-        若旧 ckpt 使用 use_sample_token=True,encoder 输出 [B, L+1, d],需要先去掉第 0 位 [SAMPLE]。
+        encoder 输出 h 为 [B, L, d],直接对整个序列做 pool。
         """
-        # 兼容旧 ckpt:若 encoder 仍带 [SAMPLE],去掉第 0 位
-        if self.encoder.use_sample_token:
-            h_token = h[:, 1:, :]
-        else:
-            h_token = h
+        h_token = h
 
         mode = self.hparams["pooling_mode"]
         if mode == "pma":
@@ -225,13 +217,12 @@ class MiCoFormerClassifier(L.LightningModule):
             raise ValueError(f"Unknown pooling_mode: {mode}")
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        h, _ = self.encoder(
+        h = self.encoder(
             token_ids=batch["token_ids"],
             attention_mask=batch["attention_mask"],
             abund_bins=batch.get("abund_bins"),
             abund_values=batch.get("abund_values"),
             mask_positions=None,  # 微调时无 MLM mask
-            taxon_path_ids=batch.get("taxon_path_ids"),
             var_indices=batch.get("var_indices"),
         )
         pooled = self._pool(h, batch["attention_mask"])
