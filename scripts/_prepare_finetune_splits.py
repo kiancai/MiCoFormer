@@ -150,16 +150,24 @@ def main():
 
     # ============= Stage 2: pretrain_rm =============
     if "pretrain_rm" in stages:
-        print(f"\n[3/5] pretrain_rm splits ...")
+        print(f"\n[3/5] pretrain_rm splits (group by Project_ID) ...")
         rm_mask = (
             (obs["Database"] == "ResMicroDb").values
             & ~obs["IsExternalControl"].values
         )
         rm_idx = rows[rm_mask]
-        tr, vl = random_split(rm_idx, args.pretrain_val_frac, args.seed)
+        rm_groups = obs["Project_ID"].values[rm_mask].astype(str)
+        # 与 pretrain_ma 对称:group split → val 全是没见过的 study,val/loss 反映呼吸道跨-study 泛化
+        tr, vl = group_split(rm_idx, rm_groups, args.pretrain_val_frac, args.seed)
         np.save(out_dir / "pretrain_rm_train.npy", tr)
         np.save(out_dir / "pretrain_rm_val.npy", vl)
+        tr_studies = set(obs.iloc[tr]["Project_ID"].astype(str))
+        vl_studies = set(obs.iloc[vl]["Project_ID"].astype(str))
+        overlap = tr_studies & vl_studies
         print(f"   train={len(tr):,}  val={len(vl):,}  (val_frac={args.pretrain_val_frac})")
+        print(f"   #studies: train={len(tr_studies)}  val={len(vl_studies)}  OVERLAP={len(overlap)}")
+        if overlap:
+            print(f"   [WARN] {len(overlap)} studies overlap train/val (expected 0 for group split)")
     else:
         print(f"\n[3/5] pretrain_rm: SKIP (not in --stages)")
 
