@@ -68,7 +68,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--pma_k", type=int, default=1)
     p.add_argument("--no_metadata_task", action="store_true", default=False,
                    help="V5:禁用 EnvCategory 多任务监督(默认启用)")
-    p.add_argument("--metadata_field", type=str, default="EnvCategory")
     p.add_argument("--metadata_loss_weight", type=float, default=0.3,
                    help="V5:λ_meta(metadata loss 权重),默认 0.3")
     p.add_argument("--huber_beta", type=float, default=1.0)
@@ -208,7 +207,6 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         pma_nhead=args.pma_nhead,
         pma_k=args.pma_k,
         use_metadata_task=not args.no_metadata_task,
-        metadata_field=args.metadata_field,
         metadata_loss_weight=args.metadata_loss_weight,
         huber_beta=args.huber_beta,
         init_from_ckpt=args.init_from_ckpt,

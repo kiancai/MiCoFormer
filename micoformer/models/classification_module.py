@@ -68,7 +68,7 @@ class MiCoFormerClassifier(L.LightningModule):
         if pretrained_ckpt_path is not None:
             # 首次创建:从 ckpt 提取 encoder 架构参数 + encoder/PMA 权重。
             # helper 自动识别 pretrain(MiCoFormerModule)/ finetune(MiCoFormerClassifier)两种 ckpt,
-            # 后者支持 CC LOO 从 broad finetune ckpt 起跳(finetune_plan.md §5.1)。
+            # 后者支持 CC LOO 从 broad finetune ckpt 起跳(见 pipeline.md CC-LOO 段)。
             _encoder_hparams, _pretrained_encoder_sd, _pma_state_dict = \
                 extract_encoder_artifacts_from_ckpt(pretrained_ckpt_path)
         elif _encoder_hparams is not None:

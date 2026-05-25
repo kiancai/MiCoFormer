@@ -1,7 +1,7 @@
 """Generate all splits needed for V5 overnight pipeline test.
 
 Reads `data/gg2/MCFCorpusV2.gg2.labeled.h5ad` (产出于 _prepare_labels.py),
-按 finetune_plan.md 的设计生成所有 .npy 索引文件.
+按 pipeline.md(训练流程 / 各 split)+ data.md(标签)的设计生成所有 .npy 索引文件.
 
 Outputs(默认 --out_dir = data/gg2/splits/):
   pretrain_ma_train.npy / pretrain_ma_val.npy           ← Stage 1
@@ -10,7 +10,7 @@ Outputs(默认 --out_dir = data/gg2/splits/):
   cc_loo/{disease}/fold_{i}_{train,test}.npy            ← Stage 4 (每 fold 一对)
   cc_loo/{disease}/manifest.json                        ← fold 元信息
 
-按 finetune_plan.md:
+按 pipeline.md / data.md 的设计:
   pretrain_ma: MA 子集按 Project_ID group split 95/5(val 全是没见过的 study,避免泄漏)
   pretrain_rm: RM 子集(排除 external control)随机 95/5
   broad     : BroadFinetune_eligible=True,按 Project_ID group split 80/10/10

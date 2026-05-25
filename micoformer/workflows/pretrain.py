@@ -111,7 +111,6 @@ class PretrainRunConfig:
     pma_nhead: int = 4
     pma_k: int = 1
     use_metadata_task: bool = True
-    metadata_field: str = "EnvCategory"
     metadata_loss_weight: float = 0.3
     metadata_num_classes: int = 6
     huber_beta: float = 1.0

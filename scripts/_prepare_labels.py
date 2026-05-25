@@ -7,7 +7,7 @@ Reads V2 corpus, derives 12 fields:
 
 Writes a new labeled.h5ad. Original h5ad untouched.
 
-See .claude/rules/micoformer/current/finetune_plan.md §6 for full spec.
+See .claude/docs/micoformer/current/data.md (微调数据筛选 / 疾病清单 / Role 字段 / prepare_labels) for full spec.
 
 Usage:
     # 先 dry-run 验证 case/control 数对得上 §3.2
@@ -50,7 +50,7 @@ DISEASE_MERGE: Dict[str, List[str]] = {
 def derive_labels(
     obs: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, Dict[str, Set[str]], Set[str]]:
-    """按 finetune_plan.md §6.2 步骤派生 12 个新字段。
+    """按 data.md(微调数据 / 标签派生)派生 12 个新字段。
 
     返回:
       new_obs: 含 12 个派生字段的 obs 副本
@@ -80,7 +80,7 @@ def derive_labels(
     )
 
     # ---- Step 3: per-disease Role_<d>(宽松 control 定义) ----
-    # 见 finetune_plan.md §6.2 + §2.1: control = (Is_Healthy=True) OR (Pheno='Control' 且在该疾病 CC study 内)
+    # 见 data.md(宽松 control 定义): control = (Is_Healthy=True) OR (Pheno='Control' 且在该疾病 CC study 内)
     cc_studies_per_disease: Dict[str, Set[str]] = {}
     role_cols: Dict[str, pd.Series] = {}
 
@@ -134,10 +134,10 @@ def sanity_print(
     cc_studies_per_disease: Dict[str, Set[str]],
     broad_excluded: Set[str],
 ) -> None:
-    """打印各疾病 CC studies + case/control 数,与 finetune_plan.md §3.2 对照。"""
+    """打印各疾病 CC studies + case/control 数,与 data.md(疾病清单)对照。"""
     print()
     print("=" * 80)
-    print("Sanity Check (对照 finetune_plan.md §3.2)")
+    print("Sanity Check (对照 data.md 疾病清单)")
     print("=" * 80)
     print(f"Total samples:                  {len(obs):>10,}")
     print(f"IsExternalControl:              {obs['IsExternalControl'].sum():>10,}  (expected: 2,026)")
