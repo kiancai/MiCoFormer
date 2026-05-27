@@ -99,6 +99,7 @@ class PretrainRunConfig:
 
     # ============== V5 新增 ==============
     abundance_encoding: str = "mlp"             # "mlp" | "bin"
+    abundance_value_transform: str = "rclr_sigma"  # V5 §4.2 present-only 写法（编码消融,见 datasets._VALID_VALUE_TRANSFORM）
     abundance_loss: str = "huber"               # "huber" | "bin_ce"
     use_phylo_pe: bool = True
     phylo_pe_hidden: int = 128
@@ -178,6 +179,7 @@ def run_pretrain_once(
         abundance_mode=config.abundance_mode,
         # V5
         abundance_encoding=config.abundance_encoding,
+        abundance_value_transform=config.abundance_value_transform,
         use_metadata_task=config.use_metadata_task,
     )
 
@@ -313,6 +315,7 @@ def run_pretrain_once(
             str(config.devices),
             str(config.accumulate_grad_batches),
             str(config.lr),
+            config.abundance_value_transform,  # §4.2:不同写法的 run 落不同目录,避免互相覆盖
         ]
     )
     _fp = hashlib.md5(_fp_src.encode("utf-8")).hexdigest()[:10]

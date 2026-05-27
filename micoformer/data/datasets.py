@@ -20,6 +20,14 @@ TAG = "[dataset]"
 RANK_COLUMNS = ("Domain", "Phylum", "Class", "Order", "Family", "Genus")
 _GENUS_COL_IDX = RANK_COLUMNS.index("Genus")
 
+# V5 §4.2:present-only abundance 数值写法（编码消融旋钮）。rclr_sigma = 现状默认。
+#   rclr_sigma : (log-μ)/σ          —— present-only CLR 再 ÷σ（现状）
+#   rclr       : log-μ              —— present-only CLR，去 σ
+#   rank       : present 内降序排名归一到 (0,1]，丰度越高越接近 1
+#   presence   : 全 1               —— 丢量级（MLM target 退化为常数，慎用）
+#   raw        : 相对丰度原值
+_VALID_VALUE_TRANSFORM = {"rclr_sigma", "rclr", "rank", "presence", "raw"}
+
 
 def _normalize_tax_label(value: Any) -> str:
     # 将输入值标准化为字符串，缺失值统一映射为 __UNK__
@@ -101,6 +109,8 @@ class AnnDataDataset:
         #   "bin":       旧路径,输入侧用 nn.Embedding 查表
         # 两种模式 __getitem__ 始终返回 abund_values 与 abund_bins(由 collator/module 按 flag 选用)
         abundance_encoding: str = "mlp",
+        # V5 §4.2:present-only abundance 数值写法（消融旋钮，详见 _VALID_VALUE_TRANSFORM）
+        abundance_value_transform: str = "rclr_sigma",
         backed: Optional[str] = None,
     ) -> None:
         if max_seq_len is not None and max_seq_len <= 0:
@@ -109,6 +119,11 @@ class AnnDataDataset:
             raise ValueError(f"Unknown abundance_mode: {abundance_mode}")
         if abundance_encoding not in {"mlp", "bin"}:
             raise ValueError(f"Unknown abundance_encoding: {abundance_encoding}")
+        if abundance_value_transform not in _VALID_VALUE_TRANSFORM:
+            raise ValueError(
+                f"Unknown abundance_value_transform: {abundance_value_transform!r}. "
+                f"Expected {sorted(_VALID_VALUE_TRANSFORM)}."
+            )
 
         # 读取 .h5ad 文件
         self.adata = ad.read_h5ad(h5ad_path, backed=backed)
@@ -127,6 +142,7 @@ class AnnDataDataset:
         # 配置参数
         self.abundance_mode = abundance_mode
         self.abundance_encoding = abundance_encoding
+        self.abundance_value_transform = abundance_value_transform
 
         self.num_abundance_bins = num_abundance_bins   # 用户指定的真实 bin 数（不含 PAD/MASK）
         self.min_abundance = min_abundance
@@ -208,6 +224,7 @@ class AnnDataDataset:
             log_vals_full = np.log(vals.astype(np.float32) + 1e-10)
             mu = float(log_vals_full.mean())
             sigma = float(log_vals_full.std())
+            n_full = int(log_vals_full.shape[0])  # 截断前非零数（rank 归一分母，保截断不变尺度）
 
             # 截断序列到最大长度
             if self.max_seq_len is not None:
@@ -229,11 +246,26 @@ class AnnDataDataset:
             else:
                 abund_bins = self._bin_abundance_rank(vals).astype(np.int64)
 
-            # std<1e-6（样本只有 1 个非零 taxon 等极端情况）→ 用 zeros 兜底防除零
-            if sigma < 1e-6:
-                abund_values = np.zeros_like(log_vals, dtype=np.float32)
-            else:
-                abund_values = ((log_vals - mu) / (sigma + 1e-8)).astype(np.float32)
+            # V5 §4.2:按 abundance_value_transform 生成连续 abund_values（present-only）。
+            # 注意:abund_values 同时是 mlp 输入与 huber MLM target（collate 的
+            # labels_abund_values = 其 clone）→ 换写法 = 同时换"喂进去的数"与"重建目标"。
+            t = self.abundance_value_transform
+            if t in ("rclr_sigma", "rclr"):
+                centered = log_vals - mu                       # present-only CLR（去 σ 即 rclr）
+                if t == "rclr":
+                    abund_values = centered.astype(np.float32)
+                elif sigma < 1e-6:                             # 单 taxon 等极端 → 兜底防除零
+                    abund_values = np.zeros_like(log_vals, dtype=np.float32)
+                else:
+                    abund_values = (centered / (sigma + 1e-8)).astype(np.float32)
+            elif t == "rank":
+                # present 内降序排名归一（分母 n_full、保截断不变尺度）；丰度越高越接近 1
+                kept = log_vals.shape[0]
+                abund_values = ((n_full - np.arange(kept)) / float(n_full)).astype(np.float32)
+            elif t == "presence":                             # 丢量级，全 1（MLM 退化，慎用）
+                abund_values = np.ones_like(log_vals, dtype=np.float32)
+            else:                                             # raw：相对丰度原值（截断后）
+                abund_values = vals.astype(np.float32)
 
         return {
             "taxon_ids": taxon_ids,
