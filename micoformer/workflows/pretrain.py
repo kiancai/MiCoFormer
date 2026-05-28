@@ -70,6 +70,12 @@ class PretrainRunConfig:
     protein_pe_hidden: int = 128
     # protein_pe_dim 不在 config 里指定:由 datamodule 加载 varm['protein_pe'] 后自动决定
 
+    # Phylo Soft-Target CE(2026-05-29,替代 X2 32d MSE — 实测 mean collapse)
+    # phylo_ce_weight>0 时:① workflow 自动注入 dist_matrix(无论 bias_type) ② module 创建 vocab_head
+    # phylo_ce_tau:soft target 温度,推荐 6.5
+    phylo_ce_weight: float = 0.0
+    phylo_ce_tau: float = 6.5
+
     # 2.1. 模型主体参数
     d_model: int = 256
     nhead: int = 8
@@ -226,20 +232,29 @@ def run_pretrain_once(
     # 同时从 datamodule 拿对应的距离矩阵（phylo 或 taxo），注入 encoder
     _n_vars = 0
     _dist_matrix_to_inject = None
-    if config.bias_type != "none":
+    # 2026-05-29:phylo_ce_weight>0 也需要 dist_matrix(即使 bias_type='none')
+    # 优先级:taxo bias → taxo_dist;phylo bias 或 phylo_ce → phylo_dist
+    _need_dist = config.bias_type != "none" or config.phylo_ce_weight > 0
+    if _need_dist:
         if config.bias_type == "taxo":
             _dist_matrix_to_inject = dm.taxo_dist_matrix
-        elif config.bias_type == "phylo":
+            _dist_source = "taxo (bias)"
+        else:
+            # phylo bias OR phylo_ce(bias_type='none')都用 phylo_dist
             _dist_matrix_to_inject = dm.phylo_dist_matrix
+            _dist_source = (
+                "phylo (bias)" if config.bias_type == "phylo"
+                else "phylo (for phylo_ce loss, bias_type=none)"
+            )
         if _dist_matrix_to_inject is None:
             raise RuntimeError(
-                f"bias_type={config.bias_type!r} requires varp['{config.bias_type}_dist'] in h5ad, "
-                f"but DataModule did not load it. Check that MCFCorpus has the corresponding varp key."
+                f"need dist_matrix ({_dist_source}) but DataModule did not load it. "
+                f"Check that MCFCorpus has the corresponding varp key."
             )
         _n_vars = int(_dist_matrix_to_inject.shape[0])
         rank_zero_info(
-            f"{TAG} R2 bias_type={config.bias_type}, n_vars={_n_vars}, "
-            f"dist_matrix dtype={_dist_matrix_to_inject.dtype}"
+            f"{TAG} dist_matrix source={_dist_source}, n_vars={_n_vars}, "
+            f"dtype={_dist_matrix_to_inject.dtype}"
         )
 
     # PE coords 检查(use_phylo_pe=True 时必须有 varm['position_encoding'])
@@ -308,6 +323,9 @@ def run_pretrain_once(
         use_protein_pe=config.use_protein_pe,
         protein_pe_hidden=config.protein_pe_hidden,
         protein_pe_dim=_protein_pe_dim,
+        # Phylo Soft-Target CE(2026-05-29)
+        phylo_ce_weight=config.phylo_ce_weight,
+        phylo_ce_tau=config.phylo_ce_tau,
         n_vars=_n_vars,
         # V5
         abundance_encoding=config.abundance_encoding,

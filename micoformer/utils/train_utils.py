@@ -207,7 +207,9 @@ def inject_var_buffers(
     - pe_coords_raw:[V_real, pe_dim],仅当 encoder.phylo_pe 存在时注入(set_coords 会前置 PAD/UNK)
     - protein_pe_coords_raw:[V_real, protein_pe_dim],仅当 encoder.protein_pe 存在时注入
     """
-    if dist_matrix is not None and getattr(encoder, "bias_type", "none") != "none":
+    # 2026-05-29:dist_matrix 注入条件改为基于 encoder buffer 是否存在(不基于 bias_type),
+    # 因为 phylo_ce loss 也需要 dist_matrix 即使 bias_type='none'
+    if dist_matrix is not None and getattr(encoder, "dist_matrix", None) is not None:
         encoder.set_dist_matrix(dist_matrix)
     if pe_coords_raw is not None and getattr(encoder, "phylo_pe", None) is not None:
         encoder.phylo_pe.set_coords(pe_coords_raw)

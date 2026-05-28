@@ -75,6 +75,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--protein_pe_hidden", type=int, default=128,
                    help="ProteinPE 投影 MLP 中间维度,默认 128")
 
+    # Phylo Soft-Target CE(2026-05-29,替代 X2 32d MSE — X2 实测 mean collapse)
+    # 推荐:--phylo_ce_weight 1.0 --phylo_ce_tau 6.5 --bias_type none
+    p.add_argument("--phylo_ce_weight", type=float, default=0.0,
+                   help="Phylo Soft-Target CE loss 权重 — vocab_head + soft target(softmax(-dist/tau));"
+                        "默认 0=关;新方案 phase 1 推荐 1.0")
+    p.add_argument("--phylo_ce_tau", type=float, default=6.5,
+                   help="Phylo Soft-Target CE 温度 τ:soft target = softmax(-dist/τ);"
+                        "推荐 6.5 ≈ log1p(patristic_max=656),让近亲 vs 远亲 prob ratio 在 e^2~e^4")
+
     # V5 新增:三段相加 + PMA + metadata 多任务
     p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
                    help="V5:abundance 输入编码方式;mlp=连续 MLP(默认),bin=旧离散 embedding")
@@ -194,6 +203,9 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         x2_head_hidden=args.x2_head_hidden,
         use_protein_pe=args.use_protein_pe,
         protein_pe_hidden=args.protein_pe_hidden,
+        # Phylo Soft-Target CE(2026-05-29)
+        phylo_ce_weight=args.phylo_ce_weight,
+        phylo_ce_tau=args.phylo_ce_tau,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

@@ -167,13 +167,10 @@ class MiCoFormerEncoder(nn.Module):
         )
 
         # 距离矩阵 buffer:persistent=False(不进 ckpt,需 workflow 重新注入)
-        if bias_type != "none":
-            if n_vars is None:
-                raise ValueError(
-                    f"bias_type={bias_type!r} requires n_vars (var 表行数) to allocate "
-                    f"the dist_matrix buffer. Pass n_vars=adata.n_vars when building encoder."
-                )
-            placeholder_dtype = torch.float32 if bias_type == "phylo" else torch.int8
+        # 2026-05-29 起:phylo_ce loss 也需要 dist_matrix,即使 bias_type='none' 也可能要创建
+        # → 改为 n_vars 是否传入决定是否创建,跟 bias_type 解耦
+        if n_vars is not None and n_vars > 0:
+            placeholder_dtype = torch.float32 if bias_type != "taxo" else torch.int8
             self.register_buffer(
                 "dist_matrix",
                 torch.zeros((n_vars, n_vars), dtype=placeholder_dtype),
@@ -181,21 +178,34 @@ class MiCoFormerEncoder(nn.Module):
             )
             self._dist_matrix_loaded = False
         else:
+            if bias_type != "none":
+                raise ValueError(
+                    f"bias_type={bias_type!r} requires n_vars (var 表行数) to allocate "
+                    f"the dist_matrix buffer. Pass n_vars=adata.n_vars when building encoder."
+                )
             self.dist_matrix = None
             self._dist_matrix_loaded = True
 
         self.layer_norm = nn.LayerNorm(d_model)
 
     def set_dist_matrix(self, matrix: torch.Tensor) -> None:
-        """注入真实的距离矩阵。"""
-        if self.bias_type == "none":
-            raise RuntimeError("bias_type='none' does not need a dist_matrix.")
+        """注入真实的距离矩阵。
+
+        2026-05-29 起:bias_type='none' 时也允许注入(phylo_ce loss 需要 dist_matrix);
+        前提是 encoder 构造时 n_vars > 0 已经创建了 dist_matrix buffer。
+        """
+        if self.dist_matrix is None:
+            raise RuntimeError(
+                "encoder.dist_matrix is None — pass n_vars > 0 at encoder __init__ "
+                "(needed for bias_type != 'none' OR phylo_ce_weight > 0)."
+            )
         if matrix.shape != self.dist_matrix.shape:
             raise ValueError(
                 f"dist_matrix shape mismatch: expected {tuple(self.dist_matrix.shape)}, "
                 f"got {tuple(matrix.shape)}."
             )
-        expected_dtype = torch.float32 if self.bias_type == "phylo" else torch.int8
+        # dtype:taxo bucket 用 int8,其余(phylo bias / bias='none' 时的 phylo_ce)用 float32
+        expected_dtype = torch.int8 if self.bias_type == "taxo" else torch.float32
         if matrix.dtype != expected_dtype:
             matrix = matrix.to(expected_dtype)
         self.register_buffer("dist_matrix", matrix.to(self.dist_matrix.device), persistent=False)
