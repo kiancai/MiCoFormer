@@ -50,21 +50,34 @@ class TreeLossHelper(nn.Module):
         self.n_pairs = int(n_pairs)
         self.n_triplets = int(n_triplets)
         self.margin = float(margin)
-        # phylo_dist 引用(非 Parameter,非 Buffer——不进 state_dict)
-        # 由 set_phylo_dist 注入;直接读 encoder.dist_matrix 也行,但显式注入更解耦
-        self._phylo_dist: Optional[torch.Tensor] = None
-        self._log_max: Optional[torch.Tensor] = None
+        # phylo_dist 注册成 non-persistent buffer:
+        #   - non-persistent → 不进 ckpt(避免 263MB 双份)
+        #   - 仍受 nn.Module .to(device) 自动迁移 → 跟 helper 一起上 GPU
+        # 占位初始化:set_phylo_dist 调用前 _phylo_dist_loaded=False, forward raise
+        self.register_buffer(
+            "_phylo_dist",
+            torch.zeros(1, 1, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_log_max",
+            torch.zeros((), dtype=torch.float32),
+            persistent=False,
+        )
+        self._phylo_dist_loaded = False
 
     def set_phylo_dist(self, phylo_dist: torch.Tensor) -> None:
         """注入 phylo 距离矩阵 [V, V] float32。
 
-        workflow 在 inject_var_buffers 之后调用本方法,把 encoder.dist_matrix
-        引用过来(同一对象,避免重复显存)。
+        workflow 在 inject_var_buffers 之后调用本方法;helper 持有的是
+        non-persistent buffer,model.to(device) 时会跟着移到 GPU。
         """
         if phylo_dist.dtype != torch.float32:
             phylo_dist = phylo_dist.float()
-        self._phylo_dist = phylo_dist
-        self._log_max = torch.log1p(phylo_dist.max())
+        # 用 register_buffer 重新注册替换占位,保持 persistent=False
+        self.register_buffer("_phylo_dist", phylo_dist, persistent=False)
+        self.register_buffer("_log_max", torch.log1p(phylo_dist.max()), persistent=False)
+        self._phylo_dist_loaded = True
 
     def forward(
         self,
@@ -77,7 +90,7 @@ class TreeLossHelper(nn.Module):
             loss_pair, loss_triplet:可加到主 loss 的标量
             triplet_violation_rate, d_ap_mean, d_an_mean:诊断数值(detached)
         """
-        if self._phylo_dist is None:
+        if not self._phylo_dist_loaded:
             raise RuntimeError(
                 "TreeLossHelper.set_phylo_dist() has not been called. "
                 "Workflow must inject phylo_dist before training."
