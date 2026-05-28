@@ -44,6 +44,15 @@ class PretrainRunConfig:
     # (见 attn_bias.PhyloDistBias 注释,实测 bias 是 dead-weight 让 weight 学不出距离依赖)
     phylo_bias_last_layer_bias: bool = True
 
+    # Tree loss(distance-preservation 辅助损失,见 utils/tree_loss.py 文献依据)
+    # tree_loss_weight=0 时整条路径不创建,跟现状完全等价(默认 off);
+    # tree_loss_weight>0 时要求 bias_type='phylo'(连续 patristic dist 拟合 cosine);
+    # workflow 注入 dist_matrix buffer 之后会自动把 phylo_dist 引用挂到 helper 上。
+    tree_loss_weight: float = 0.0
+    tree_n_pairs: int = 256
+    tree_n_triplets: int = 128
+    tree_margin: float = 0.5
+
     # 2.1. 模型主体参数
     d_model: int = 256
     nhead: int = 8
@@ -254,6 +263,11 @@ def run_pretrain_once(
         bias_type=config.bias_type,
         phylo_mlp_hidden=config.phylo_mlp_hidden,
         phylo_bias_last_layer_bias=config.phylo_bias_last_layer_bias,
+        # Tree loss
+        tree_loss_weight=config.tree_loss_weight,
+        tree_n_pairs=config.tree_n_pairs,
+        tree_n_triplets=config.tree_n_triplets,
+        tree_margin=config.tree_margin,
         n_vars=_n_vars,
         # V5
         abundance_encoding=config.abundance_encoding,
@@ -282,6 +296,21 @@ def run_pretrain_once(
 
     # 注入 var-level buffer:dist_matrix(R2) + phylo_pe coords(V5)
     inject_var_buffers(model.encoder, _dist_matrix_to_inject, _pe_coords_to_inject)
+
+    # Tree loss helper 需要 phylo_dist 引用;在 encoder 注入之后立刻挂上
+    # (用同一对象,避免重复占 263MB 显存)
+    if model.tree_loss_helper is not None:
+        if model.encoder.dist_matrix is None or not model.encoder._dist_matrix_loaded:
+            raise RuntimeError(
+                "tree_loss_weight>0 requires encoder.dist_matrix to be loaded; "
+                "ensure bias_type='phylo' + inject_var_buffers ran successfully."
+            )
+        model.tree_loss_helper.set_phylo_dist(model.encoder.dist_matrix)
+        rank_zero_info(
+            f"{TAG} TreeLossHelper attached: weight={config.tree_loss_weight}, "
+            f"n_pairs={config.tree_n_pairs}, n_triplets={config.tree_n_triplets}, "
+            f"margin={config.tree_margin}"
+        )
 
     # DAPT 续训:在 buffer 注入之后加载 ckpt 的 state_dict(strict=False 允许 non-persistent buffer 缺失)
     if config.init_from_ckpt:

@@ -49,6 +49,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--phylo_bias_no_last_bias", action="store_true",
                    help="关掉 PhyloDistBias 末层 Linear 的 bias 项(推荐;实测 bias 是 dead-weight,关掉让 weight 真去学距离依赖)")
 
+    # Tree loss(distance-preservation 辅助损失,见 utils/tree_loss.py)
+    p.add_argument("--tree_loss_weight", type=float, default=0.0,
+                   help="Tree loss 系数 λ:loss_total = L_MLM + λ × (L_pair + L_triplet);默认 0=不开。推荐 0.1")
+    p.add_argument("--tree_n_pairs", type=int, default=256,
+                   help="每 forward 抽多少 token pair 算 L_pair(默认 256)")
+    p.add_argument("--tree_n_triplets", type=int, default=128,
+                   help="每 forward 抽多少 triplet(anchor + phylo 近邻 + phylo 远端;默认 128)")
+    p.add_argument("--tree_margin", type=float, default=0.5,
+                   help="Triplet margin:||h_a - h_p|| + margin < ||h_a - h_n|| 才不罚(默认 0.5)")
+
     # V5 新增:三段相加 + PMA + metadata 多任务
     p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
                    help="V5:abundance 输入编码方式;mlp=连续 MLP(默认),bin=旧离散 embedding")
@@ -157,6 +167,10 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         bias_type=args.bias_type,
         phylo_mlp_hidden=args.phylo_mlp_hidden,
         phylo_bias_last_layer_bias=not args.phylo_bias_no_last_bias,
+        tree_loss_weight=args.tree_loss_weight,
+        tree_n_pairs=args.tree_n_pairs,
+        tree_n_triplets=args.tree_n_triplets,
+        tree_margin=args.tree_margin,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

@@ -15,6 +15,7 @@ from micoformer.models.heads import (
 )
 from micoformer.models.pma import PMA
 from micoformer.utils.train_utils import build_lr_scheduler
+from micoformer.utils.tree_loss import TreeLossHelper
 
 
 _VALID_ABUNDANCE_LOSS = {"huber", "bin_ce"}
@@ -71,6 +72,12 @@ class MiCoFormerModule(L.LightningModule):
         plateau_factor: float = 0.5,
         plateau_patience: int = 2,
         plateau_min_lr: float = 1e-6,
+        # Tree loss(distance-preservation 辅助损失,见 utils/tree_loss.py)
+        # tree_loss_weight=0 时整条 helper 不创建,跟现状完全等价
+        tree_loss_weight: float = 0.0,
+        tree_n_pairs: int = 256,
+        tree_n_triplets: int = 128,
+        tree_margin: float = 0.5,
     ) -> None:
         super().__init__()
 
@@ -146,6 +153,24 @@ class MiCoFormerModule(L.LightningModule):
                     torch.ones(metadata_num_classes, dtype=torch.float32),
                     persistent=False,
                 )
+
+        # ============ Tree loss helper(可选,默认 off) ============
+        # tree_loss_weight=0:不创建 helper,_shared_step 中也跳过分支,与现状完全等价
+        # tree_loss_weight>0:创建 helper,workflow 须在 inject_var_buffers 之后调
+        #                    `module.tree_loss_helper.set_phylo_dist(encoder.dist_matrix)`
+        # 要求 bias_type='phylo'(其它 dist 类型不是连续 patristic 不能拟合 cosine)
+        self.tree_loss_helper: Optional[TreeLossHelper] = None
+        if tree_loss_weight > 0:
+            if bias_type != "phylo":
+                raise ValueError(
+                    f"tree_loss_weight>0 requires bias_type='phylo' (continuous patristic "
+                    f"distance), got bias_type={bias_type!r}."
+                )
+            self.tree_loss_helper = TreeLossHelper(
+                n_pairs=tree_n_pairs,
+                n_triplets=tree_n_triplets,
+                margin=tree_margin,
+            )
 
     # ------------------------------------------------------------------
     # forward 与 step 辅助
@@ -259,6 +284,27 @@ class MiCoFormerModule(L.LightningModule):
                 sync_dist=(stage == "val"),
             )
             total_loss = loss_mlm + float(self.hparams.metadata_loss_weight) * loss_meta
+
+        # ============ Tree loss(distance-preservation 辅助,可选) ============
+        # 仅 train 阶段 + tree_loss_weight>0 + helper 已创建 时启用
+        # 同 batch h 直接复用,不重 forward
+        tlw = float(self.hparams.tree_loss_weight)
+        if stage == "train" and tlw > 0 and self.tree_loss_helper is not None:
+            tl = self.tree_loss_helper(
+                h=h_token,
+                var_indices=batch["var_indices"],
+                attention_mask=batch["attention_mask"],
+            )
+            loss_pair = tl["loss_pair"]
+            loss_triplet = tl["loss_triplet"]
+            loss_tree = loss_pair + loss_triplet
+            total_loss = total_loss + tlw * loss_tree
+            # log 诊断数值(epoch-level 汇总在 logger CSV 里)
+            self.log(f"{stage}/loss_pair", loss_pair, on_step=True, on_epoch=True)
+            self.log(f"{stage}/loss_triplet", loss_triplet, on_step=True, on_epoch=True)
+            self.log(f"{stage}/triplet_violation_rate", tl["triplet_violation_rate"], on_step=True, on_epoch=True)
+            self.log(f"{stage}/d_ap_mean", tl["d_ap_mean"], on_step=True, on_epoch=True)
+            self.log(f"{stage}/d_an_mean", tl["d_an_mean"], on_step=True, on_epoch=True)
 
         self.log(
             f"{stage}/loss", total_loss,
