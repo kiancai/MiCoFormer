@@ -40,6 +40,9 @@ class PretrainRunConfig:
     # V4 R2：距离驱动的 attention bias（'none' | 'taxo' | 'phylo'）
     bias_type: str = "phylo"           # V5 默认 phylo
     phylo_mlp_hidden: int = 64          # V5 默认 64(3 层 MLP);旧 alias phylo_bias_hidden 走同字段
+    # phylo MLP 末层是否保留 bias 项。默认 True 保持兼容;新预训练推荐 False
+    # (见 attn_bias.PhyloDistBias 注释,实测 bias 是 dead-weight 让 weight 学不出距离依赖)
+    phylo_bias_last_layer_bias: bool = True
 
     # 2.1. 模型主体参数
     d_model: int = 256
@@ -250,6 +253,7 @@ def run_pretrain_once(
         rank_vocab_sizes=dm.rank_vocab_sizes,
         bias_type=config.bias_type,
         phylo_mlp_hidden=config.phylo_mlp_hidden,
+        phylo_bias_last_layer_bias=config.phylo_bias_last_layer_bias,
         n_vars=_n_vars,
         # V5
         abundance_encoding=config.abundance_encoding,

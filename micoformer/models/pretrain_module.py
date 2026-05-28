@@ -44,6 +44,9 @@ class MiCoFormerModule(L.LightningModule):
         # V4 R2
         bias_type: str = "phylo",            # V5 默认 phylo
         phylo_mlp_hidden: int = 64,           # V5 默认 64
+        # phylo MLP 末层是否保留 bias 项(仅 bias_type='phylo' 时生效)。
+        # 默认 True 保持现有 ckpt 兼容;新预训练推荐 False(见 encoder.MiCoFormerEncoder 注释)。
+        phylo_bias_last_layer_bias: bool = True,
         n_vars: int = 0,
         # V5 新增
         abundance_encoding: str = "mlp",
@@ -101,6 +104,7 @@ class MiCoFormerModule(L.LightningModule):
             rank_vocab_sizes=rank_vocab_sizes,
             bias_type=bias_type,
             phylo_mlp_hidden=phylo_mlp_hidden,
+            phylo_bias_last_layer_bias=phylo_bias_last_layer_bias,
             n_vars=n_vars if bias_type != "none" else None,
             abundance_encoding=abundance_encoding,
             use_phylo_pe=use_phylo_pe,
@@ -273,14 +277,31 @@ class MiCoFormerModule(L.LightningModule):
     # 优化器(同旧版)
     # ------------------------------------------------------------------
     def configure_optimizers(self):
+        # no_decay 分组规则(2026-05-28 完整修复,见 [[feedback-wd-no-decay-rule]]):
+        #   ① 含 'bias' / 'LayerNorm.weight' / 'norm.weight' — 标准 BERT/GPT 做法
+        #   ② phylo_pe.* / dist_bias.* 整模块 — zero-init 渐进涌现型先验,WD 会持续压回 0
+        #      (实测 tmp/20260528_phylo_task_redesign:WD=0.05 时 phylo 全模块静止,
+        #       移除后 PE_proj_w 2000 step 单调涨 +0.76%)
+        #   ③ abund_mask_token — 类 BERT [MASK] token 的可学习 special token
+        #   ④ pma.query — Set Transformer 可学习 query seed,类 [CLS]
+        #   ⑤ 兜底 param.ndim == 1 — LayerNorm 嵌套进 nn.Sequential 时,LN gamma 名字不含
+        #      'norm'/'LayerNorm' 而被关键字漏抓(如 V5 abund_mlp.3.weight = LayerNorm gamma)
         decay_params = []
         no_decay_params = []
         no_decay_names = ["bias", "LayerNorm.weight", "norm.weight"]
+        no_decay_prefixes = ("encoder.phylo_pe.", "encoder.dist_bias.")
+        no_decay_exact = {"encoder.abund_mask_token", "pma.query"}
 
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
-            if any(nd in name for nd in no_decay_names):
+            is_no_decay = (
+                any(nd in name for nd in no_decay_names)
+                or any(name.startswith(p) for p in no_decay_prefixes)
+                or name in no_decay_exact
+                or param.ndim == 1
+            )
+            if is_no_decay:
                 no_decay_params.append(param)
             else:
                 decay_params.append(param)

@@ -46,6 +46,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--bias_type", type=str, default="phylo", choices=["none", "taxo", "phylo"])
     p.add_argument("--phylo_mlp_hidden", type=int, default=64,
                    help="phylo bias MLP 隐藏层维度(仅 --bias_type phylo 时生效;V5 默认 64,3 层 MLP)")
+    p.add_argument("--phylo_bias_no_last_bias", action="store_true",
+                   help="关掉 PhyloDistBias 末层 Linear 的 bias 项(推荐;实测 bias 是 dead-weight,关掉让 weight 真去学距离依赖)")
 
     # V5 新增:三段相加 + PMA + metadata 多任务
     p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
@@ -154,6 +156,7 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         h5ad_path=args.h5ad_path,
         bias_type=args.bias_type,
         phylo_mlp_hidden=args.phylo_mlp_hidden,
+        phylo_bias_last_layer_bias=not args.phylo_bias_no_last_bias,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

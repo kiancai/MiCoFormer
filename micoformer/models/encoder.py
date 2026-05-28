@@ -49,6 +49,9 @@ class MiCoFormerEncoder(nn.Module):
         bias_type: str = "none",
         # phylo MLP 隐藏层维度(仅 bias_type="phylo" 时生效);V5 默认 64(3 层 MLP)
         phylo_mlp_hidden: int = 64,
+        # phylo MLP 末层是否保留 bias 项(仅 bias_type="phylo" 时生效)。False=关掉末层 bias,
+        # 见 attn_bias.PhyloDistBias 注释。默认 True 保持现有 ckpt 兼容。
+        phylo_bias_last_layer_bias: bool = True,
         # 词表大小(用于在不持有 dist_matrix 时占位创建 buffer,避免 ckpt 加载时无 buffer)
         n_vars: Optional[int] = None,
         # ---------------- V5 新增 ----------------
@@ -133,6 +136,7 @@ class MiCoFormerEncoder(nn.Module):
             bias_type=bias_type,
             nhead=nhead,
             phylo_mlp_hidden=phylo_mlp_hidden,
+            phylo_last_layer_bias=phylo_bias_last_layer_bias,
         )
 
         # 距离矩阵 buffer:persistent=False(不进 ckpt,需 workflow 重新注入)

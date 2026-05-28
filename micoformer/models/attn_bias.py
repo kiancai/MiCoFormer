@@ -79,18 +79,24 @@ class PhyloDistBias(nn.Module):
       - 不接 LayerNorm(直接加到 attention score 上,量级 ~1,LN 会破坏自然幅度)
     """
 
-    def __init__(self, nhead: int, hidden_dim: int = 64) -> None:
+    def __init__(self, nhead: int, hidden_dim: int = 64, last_layer_bias: bool = True) -> None:
         super().__init__()
+        # last_layer_bias=False:末层 Linear(hidden, nhead) 关掉 bias 项。
+        # 理由:bias 是 head-specific 常数偏置,加到所有 (q,k) score 上被 softmax 消掉等价无效;
+        # 但在训练中它充当 dead-weight 容量、让 MLP weight 学不出 phylo 距离依赖
+        # (实测 tmp/20260528_phylo_task_redesign:bias=True 时 weight norm 几乎不动、bias norm 22.8;
+        #  bias=False 时 weight 才被驱动真去学距离信号)。
         self.mlp = nn.Sequential(
             nn.Linear(1, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, nhead),
+            nn.Linear(hidden_dim, nhead, bias=last_layer_bias),
         )
         # 末层零初始化（训练初期 attention 等价无 bias）
         nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        if self.mlp[-1].bias is not None:
+            nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, var_indices: Tensor, dist_matrix: Tensor) -> Tensor:
         """
@@ -109,17 +115,25 @@ class PhyloDistBias(nn.Module):
         return bias.permute(0, 3, 1, 2).contiguous()
 
 
-def make_dist_bias(bias_type: str, nhead: int, phylo_mlp_hidden: int = 64) -> Optional[nn.Module]:
+def make_dist_bias(
+    bias_type: str,
+    nhead: int,
+    phylo_mlp_hidden: int = 64,
+    phylo_last_layer_bias: bool = True,
+) -> Optional[nn.Module]:
     """工厂函数：根据 bias_type 创建对应的 bias 模块（none 时返回 None）。
 
     V5 默认 phylo_mlp_hidden=64(对应 3 层 MLP 设计)。
+    phylo_last_layer_bias: 仅 bias_type='phylo' 时生效。False=关掉末层 bias(推荐,见 PhyloDistBias 注释)。
     """
     if bias_type == "none":
         return None
     if bias_type == "taxo":
         return TaxoDistBias(nhead=nhead)
     if bias_type == "phylo":
-        return PhyloDistBias(nhead=nhead, hidden_dim=phylo_mlp_hidden)
+        return PhyloDistBias(
+            nhead=nhead, hidden_dim=phylo_mlp_hidden, last_layer_bias=phylo_last_layer_bias
+        )
     raise ValueError(f"Unknown bias_type: {bias_type!r}. Expected 'none' | 'taxo' | 'phylo'.")
 
 
