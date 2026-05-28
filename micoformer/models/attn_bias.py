@@ -187,6 +187,12 @@ class BiasedMultiheadAttention(nn.Module):
         if attn_bias is not None:
             combined_bias = (combined_bias + attn_bias) if combined_bias is not None else attn_bias
 
+        # PyTorch SDPA 自动选 backend(2026-05-28 夜 X2 配置下):
+        #   - X2 phase 1 撤 bias(bias_type='none')→ attn_bias=None,但 key_padding_mask
+        #     还在 → combined_bias 是 float -inf mask → SDPA 自动选 EFFICIENT_ATTENTION
+        #     (memory-efficient kernel,比之前 bias_type='phylo' 触发的 MATH fallback 快 3-5×)
+        #   - 严格 FLASH_ATTENTION 要求 attn_mask=None,我们有 padding 必然不满足;要 FLASH 需
+        #     unpadding trick + flash_attn 库,工程代价大不在本次 scope
         out = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=combined_bias,

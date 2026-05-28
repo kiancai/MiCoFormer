@@ -53,6 +53,23 @@ class PretrainRunConfig:
     tree_n_triplets: int = 128
     tree_margin: float = 0.5
 
+    # X2 多任务范式(2026-05-28 夜,详 decisions.md / roadmap §4.1 d):
+    #   mlm_weight       : abundance huber 回归权重(0 关掉 MLM)
+    #   x2_phylo_weight  : 预测 phylo coord MSE 权重
+    #   x2_protein_weight: 预测 protein coord MSE 权重(等 bacformer 出 protein_pe)
+    #   x2_head_hidden   : PriorCoordHead 中间层维度
+    # phase 1 默认 mlm=1, x2_phylo=1, x2_protein=0(蛋白 off,无外部阻塞)
+    # phase 2 蛋白完成后开:mlm=1, x2_phylo=1, x2_protein=1
+    # 三个 weight 都=0 + tree_loss_weight=0 会触发 module __init__ ValueError
+    mlm_weight: float = 1.0
+    x2_phylo_weight: float = 0.0
+    x2_protein_weight: float = 0.0
+    x2_head_hidden: int = 128
+    # 蛋白 PE 通道:phase 2 启用时 use_protein_pe=True + protein_pe_dim 从 varm['protein_pe'].shape[1] 读
+    use_protein_pe: bool = False
+    protein_pe_hidden: int = 128
+    # protein_pe_dim 不在 config 里指定:由 datamodule 加载 varm['protein_pe'] 后自动决定
+
     # 2.1. 模型主体参数
     d_model: int = 256
     nhead: int = 8
@@ -240,6 +257,21 @@ def run_pretrain_once(
             f"{TAG} PhyloPE: pe_dim={_pe_dim}, coords shape={tuple(_pe_coords_to_inject.shape)}"
         )
 
+    # Protein PE coords 检查(X2 phase 2:use_protein_pe=True 时必须有 varm['protein_pe'])
+    _protein_pe_coords_to_inject = None
+    _protein_pe_dim = None
+    if config.use_protein_pe:
+        if getattr(dm, "protein_pe_coords_raw", None) is None:
+            raise RuntimeError(
+                "use_protein_pe=True requires varm['protein_pe'] in h5ad, "
+                "but DataModule did not load it (likely bacformer_prior pipeline 未完成)."
+            )
+        _protein_pe_coords_to_inject = dm.protein_pe_coords_raw
+        _protein_pe_dim = int(_protein_pe_coords_to_inject.shape[1])
+        rank_zero_info(
+            f"{TAG} ProteinPE: pe_dim={_protein_pe_dim}, coords shape={tuple(_protein_pe_coords_to_inject.shape)}"
+        )
+
     # Metadata class weights
     _meta_weights_list = None
     if config.use_metadata_task and dm.env_class_weights is not None:
@@ -268,6 +300,14 @@ def run_pretrain_once(
         tree_n_pairs=config.tree_n_pairs,
         tree_n_triplets=config.tree_n_triplets,
         tree_margin=config.tree_margin,
+        # X2 多任务(2026-05-28 夜)
+        mlm_weight=config.mlm_weight,
+        x2_phylo_weight=config.x2_phylo_weight,
+        x2_protein_weight=config.x2_protein_weight,
+        x2_head_hidden=config.x2_head_hidden,
+        use_protein_pe=config.use_protein_pe,
+        protein_pe_hidden=config.protein_pe_hidden,
+        protein_pe_dim=_protein_pe_dim,
         n_vars=_n_vars,
         # V5
         abundance_encoding=config.abundance_encoding,
@@ -294,8 +334,13 @@ def run_pretrain_once(
         plateau_min_lr=config.lr_plateau_min_lr,
     )
 
-    # 注入 var-level buffer:dist_matrix(R2) + phylo_pe coords(V5)
-    inject_var_buffers(model.encoder, _dist_matrix_to_inject, _pe_coords_to_inject)
+    # 注入 var-level buffer:dist_matrix(R2) + phylo_pe coords(V5) + protein_pe coords(X2 phase 2)
+    inject_var_buffers(
+        model.encoder,
+        _dist_matrix_to_inject,
+        _pe_coords_to_inject,
+        _protein_pe_coords_to_inject,
+    )
 
     # Tree loss helper 需要 phylo_dist 引用;在 encoder 注入之后立刻挂上
     # (用同一对象,避免重复占 263MB 显存)

@@ -59,6 +59,22 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--tree_margin", type=float, default=0.5,
                    help="Triplet margin:||h_a - h_p|| + margin < ||h_a - h_n|| 才不罚(默认 0.5)")
 
+    # X2 多任务范式(2026-05-28 夜,详 decisions / roadmap §4.1 d)
+    # phase 1 推荐:--mlm_weight 1.0 --x2_phylo_weight 1.0 --bias_type none(撤 attention bias)
+    # phase 2 蛋白完成后:加 --x2_protein_weight 1.0 --use_protein_pe(需要 varm['protein_pe'])
+    p.add_argument("--mlm_weight", type=float, default=1.0,
+                   help="X2 多任务:abundance huber 回归权重,默认 1.0(0=关掉 MLM)")
+    p.add_argument("--x2_phylo_weight", type=float, default=0.0,
+                   help="X2 多任务:预测 phylo coord MSE 权重,默认 0(=旧 MLM 行为);phase 1 推荐 1.0")
+    p.add_argument("--x2_protein_weight", type=float, default=0.0,
+                   help="X2 多任务:预测 protein coord MSE 权重,默认 0(蛋白 phase 2 开,需 use_protein_pe)")
+    p.add_argument("--x2_head_hidden", type=int, default=128,
+                   help="PriorCoordHead 中间层维度,默认 128")
+    p.add_argument("--use_protein_pe", action="store_true", default=False,
+                   help="X2 phase 2:启用蛋白 PE 输入通道(要求 varm['protein_pe'] 已写入语料)")
+    p.add_argument("--protein_pe_hidden", type=int, default=128,
+                   help="ProteinPE 投影 MLP 中间维度,默认 128")
+
     # V5 新增:三段相加 + PMA + metadata 多任务
     p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
                    help="V5:abundance 输入编码方式;mlp=连续 MLP(默认),bin=旧离散 embedding")
@@ -171,6 +187,13 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         tree_n_pairs=args.tree_n_pairs,
         tree_n_triplets=args.tree_n_triplets,
         tree_margin=args.tree_margin,
+        # X2 多任务(2026-05-28 夜)
+        mlm_weight=args.mlm_weight,
+        x2_phylo_weight=args.x2_phylo_weight,
+        x2_protein_weight=args.x2_protein_weight,
+        x2_head_hidden=args.x2_head_hidden,
+        use_protein_pe=args.use_protein_pe,
+        protein_pe_hidden=args.protein_pe_hidden,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

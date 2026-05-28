@@ -178,6 +178,9 @@ class MiCoDataModule(L.LightningDataModule):
         self.taxo_dist_matrix: Optional[torch.Tensor] = None   # [V, V] int8  （LCA 离散 hop 距离，0~6）
         self.phylo_pe_coords_raw: Optional[torch.Tensor] = None  # [V_real, pe_dim] float32 (V5)
         self.pe_dim: Optional[int] = None
+        # X2 phase 2:蛋白 PE coords(等 bacformer_prior 出 varm['protein_pe'])
+        # 默认 None,workflow 自行判断 use_protein_pe 是否要求其存在
+        self.protein_pe_coords_raw: Optional[torch.Tensor] = None  # [V_real, protein_pe_dim] float32
 
         # EnvCategory 派生结果(V5)
         self.env_labels: Optional[np.ndarray] = None        # [N_obs] int64
@@ -224,6 +227,13 @@ class MiCoDataModule(L.LightningDataModule):
                 self.pe_dim = int(pe_arr.shape[1])
                 rank_zero_info(
                     f"{TAG} Loaded varm['position_encoding']: {tuple(self.phylo_pe_coords_raw.shape)} float32"
+                )
+            # X2 phase 2: 加载 varm['protein_pe'](由 bacformer_prior pipeline 写入,可选)
+            if "protein_pe" in varm_keys:
+                ppe_arr = np.asarray(adata.varm["protein_pe"], dtype=np.float32)
+                self.protein_pe_coords_raw = torch.from_numpy(ppe_arr)
+                rank_zero_info(
+                    f"{TAG} Loaded varm['protein_pe']: {tuple(self.protein_pe_coords_raw.shape)} float32"
                 )
 
             # V5: 派生 EnvCategory + class weight(若启用)

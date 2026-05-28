@@ -59,6 +59,10 @@ class MiCoFormerEncoder(nn.Module):
         use_phylo_pe: bool = True,             # 启用 PhyloPE(V5 默认 True)
         phylo_pe_hidden: int = 128,
         pe_dim: Optional[int] = None,          # PE 坐标维度;use_phylo_pe=True 时必须
+        # X2 多任务(2026-05-28 夜):蛋白功能 prior,镜像 phylo_pe 同构
+        use_protein_pe: bool = False,          # 启用 ProteinPE(等 bacformer_prior 出 varm['protein_pe'])
+        protein_pe_hidden: int = 128,
+        protein_pe_dim: Optional[int] = None,  # protein PE 坐标维度;use_protein_pe=True 时必须
         grad_checkpointing: bool = False,       # 激活重算开关(以时间换显存),默认关
     ) -> None:
         super().__init__()
@@ -78,6 +82,7 @@ class MiCoFormerEncoder(nn.Module):
             )
         self.abundance_encoding = abundance_encoding
         self.use_phylo_pe = use_phylo_pe
+        self.use_protein_pe = use_protein_pe
 
         # ============ Token identity embedding ============
         # genus_embed:V5 单 genus embedding。保留 self.taxon_embed 作为同一对象的别名,ckpt 兼容
@@ -119,6 +124,28 @@ class MiCoFormerEncoder(nn.Module):
                 vocab_size=genus_vocab_size,
                 hidden=phylo_pe_hidden,
             )
+
+        # ============ Protein PE(X2 多任务,2026-05-28 夜) ============
+        # 蛋白功能 prior,镜像 phylo_pe:复用同一 PhyloPE 类(语义对偶)
+        # 等 bacformer_prior 出 varm['protein_pe'] 才启用;phase 1 默认 None
+        self.protein_pe: Optional[PhyloPE] = None
+        if self.use_protein_pe:
+            if protein_pe_dim is None:
+                raise ValueError(
+                    "use_protein_pe=True requires protein_pe_dim (蛋白 PE 坐标维度)."
+                )
+            self.protein_pe = PhyloPE(
+                d_model=d_model,
+                pe_dim=protein_pe_dim,
+                vocab_size=genus_vocab_size,
+                hidden=protein_pe_hidden,
+            )
+
+        # ============ Genus mask token(X2 范式,2026-05-28 夜) ============
+        # 镜像 abund_mask_token:mask 位置的 token embed 被替换为此可学习 token
+        # 防止模型从 token_id 直接 lookup phylo coord 答案(X2 任务的硬约束)
+        # 默认零初始化,跟 abund_mask_token 一致
+        self.genus_mask_token = nn.Parameter(torch.zeros(d_model))
 
         # ============ Transformer ============
         biased_layer = BiasedTransformerEncoderLayer(
@@ -213,17 +240,32 @@ class MiCoFormerEncoder(nn.Module):
         abund_values: Optional[torch.Tensor] = None,        # [B, L]  mlp 路径用
         mask_positions: Optional[torch.Tensor] = None,      # [B, L]  bool,MLM 被 mask 的位置(mlp 路径用)
         var_indices: Optional[torch.Tensor] = None,         # [B, L]  int64  bias_type!='none' 时必需
+        mask_token_id_replace: bool = False,                # X2 范式:mask 位置 token embed 替换为 genus_mask_token + PE 输出乘 0 防作弊
     ) -> torch.Tensor:
         """
         Returns:
             h: [B, L, d_model]  token-level 输出(sample-level PMA pooling 在 module 层做)
         """
-        # ============ Token embedding 三段相加 ============
+        # ============ Token embedding 三/四段相加 ============
         token_x = self._build_token_embedding(token_ids)
+        # X2 范式:mask 位置 token embed 替换为可学习 mask token(防 token_id 泄露答案)
+        if mask_token_id_replace and mask_positions is not None and mask_positions.any():
+            mask_expanded = mask_positions.unsqueeze(-1)  # [B, L, 1]
+            token_x = torch.where(mask_expanded, self.genus_mask_token, token_x)
         abund_x = self._build_abundance_embedding(abund_bins, abund_values, mask_positions)
         x = token_x + abund_x
+        # phylo PE:mask 位置在 X2 下要乘 0(防 phylo_pe.coords[token_id] 泄露答案)
         if self.use_phylo_pe and self.phylo_pe is not None:
-            x = x + self.phylo_pe(token_ids)
+            pe_x = self.phylo_pe(token_ids)
+            if mask_token_id_replace and mask_positions is not None and mask_positions.any():
+                pe_x = pe_x * (~mask_positions).unsqueeze(-1).to(pe_x.dtype)
+            x = x + pe_x
+        # protein PE:同 phylo PE 屏蔽逻辑
+        if self.use_protein_pe and self.protein_pe is not None:
+            ppe_x = self.protein_pe(token_ids)
+            if mask_token_id_replace and mask_positions is not None and mask_positions.any():
+                ppe_x = ppe_x * (~mask_positions).unsqueeze(-1).to(ppe_x.dtype)
+            x = x + ppe_x
 
         # ============ attention mask ============
         key_padding_mask = ~attention_mask  # [B, L]

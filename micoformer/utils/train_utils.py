@@ -196,17 +196,23 @@ def build_lr_scheduler(
     raise ValueError(f"Unknown scheduler_type: {scheduler_type!r}")
 
 
-def inject_var_buffers(encoder, dist_matrix=None, pe_coords_raw=None) -> None:
-    """统一注入 encoder 的两个 var-level buffer:dist_matrix(R2)+ phylo_pe.coords(V5 PE)。
+def inject_var_buffers(
+    encoder, dist_matrix=None, pe_coords_raw=None, protein_pe_coords_raw=None
+) -> None:
+    """统一注入 encoder 的三个 var-level buffer:
+       dist_matrix(R2)+ phylo_pe.coords(V5 PE)+ protein_pe.coords(X2 phase 2)。
 
-    两者都是 persistent=False,不进 ckpt,所以每次创建/恢复 model 都必须重新注入。
+    都是 persistent=False,不进 ckpt,所以每次创建/恢复 model 都必须重新注入。
     - dist_matrix:[V, V],仅当 encoder.bias_type != 'none' 时注入
     - pe_coords_raw:[V_real, pe_dim],仅当 encoder.phylo_pe 存在时注入(set_coords 会前置 PAD/UNK)
+    - protein_pe_coords_raw:[V_real, protein_pe_dim],仅当 encoder.protein_pe 存在时注入
     """
     if dist_matrix is not None and getattr(encoder, "bias_type", "none") != "none":
         encoder.set_dist_matrix(dist_matrix)
     if pe_coords_raw is not None and getattr(encoder, "phylo_pe", None) is not None:
         encoder.phylo_pe.set_coords(pe_coords_raw)
+    if protein_pe_coords_raw is not None and getattr(encoder, "protein_pe", None) is not None:
+        encoder.protein_pe.set_coords(protein_pe_coords_raw)
 
 
 def extract_encoder_artifacts_from_ckpt(ckpt_path):

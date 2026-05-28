@@ -12,6 +12,7 @@ from micoformer.models.heads import (
     AbundanceBinHead,
     AbundanceRegressionHead,
     MetadataHead,
+    PriorCoordHead,
 )
 from micoformer.models.pma import PMA
 from micoformer.utils.train_utils import build_lr_scheduler
@@ -78,6 +79,22 @@ class MiCoFormerModule(L.LightningModule):
         tree_n_pairs: int = 256,
         tree_n_triplets: int = 128,
         tree_margin: float = 0.5,
+        # X2 多任务范式(2026-05-28 夜,详 decisions.md / roadmap §4.1 d):
+        #   mlm_weight       : abundance huber 回归权重(0 关掉 MLM,>0 开)
+        #   x2_phylo_weight  : 预测 phylo coord MSE 权重(0 关掉 X2_phylo)
+        #   x2_protein_weight: 预测 protein coord MSE 权重(等 bacformer 出 protein_pe,phase 1 默认 0)
+        #   x2_head_hidden   : PriorCoordHead 中间层维度
+        # phase 1 默认:mlm=1, x2_phylo=1, x2_protein=0(蛋白 off)
+        # phase 2 默认:mlm=1, x2_phylo=1, x2_protein=1(三任务全开)
+        # 向后兼容:三个 weight 都=0 + tree_loss_weight=0 时退化为原 V5 MLM(沿用旧 ckpt 行为)
+        mlm_weight: float = 1.0,
+        x2_phylo_weight: float = 0.0,
+        x2_protein_weight: float = 0.0,
+        x2_head_hidden: int = 128,
+        # X2 protein 通道开关 + 维度(透传给 encoder.protein_pe)
+        use_protein_pe: bool = False,
+        protein_pe_hidden: int = 128,
+        protein_pe_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -94,6 +111,27 @@ class MiCoFormerModule(L.LightningModule):
             raise ValueError("abundance_encoding='mlp' must pair with abundance_loss='huber'.")
         if abundance_encoding == "bin" and abundance_loss != "bin_ce":
             raise ValueError("abundance_encoding='bin' must pair with abundance_loss='bin_ce'.")
+
+        # X2 多任务一致性校验(2026-05-28 夜)
+        if x2_phylo_weight > 0 and not use_phylo_pe:
+            raise ValueError(
+                "x2_phylo_weight > 0 requires use_phylo_pe=True "
+                "(phylo coord 来自 encoder.phylo_pe.coords buffer,必须先加载 PE)."
+            )
+        if x2_protein_weight > 0 and not use_protein_pe:
+            raise ValueError(
+                "x2_protein_weight > 0 requires use_protein_pe=True "
+                "(protein coord 来自 encoder.protein_pe.coords buffer,必须先加载 PE)."
+            )
+        if use_protein_pe and protein_pe_dim is None:
+            raise ValueError("use_protein_pe=True requires protein_pe_dim.")
+        # 三任务 weight 都 = 0 + tree_loss=0 = 没 supervision,触发警告级 error
+        _x2_any = (mlm_weight > 0) or (x2_phylo_weight > 0) or (x2_protein_weight > 0) or (tree_loss_weight > 0)
+        if not _x2_any:
+            raise ValueError(
+                "All training losses are off (mlm=0, x2_phylo=0, x2_protein=0, tree_loss=0). "
+                "At least one loss weight must be > 0."
+            )
 
         # 保存所有 __init__ 参数到 self.hparams,便于 checkpoint 保存和恢复
         self.save_hyperparameters()
@@ -117,6 +155,10 @@ class MiCoFormerModule(L.LightningModule):
             use_phylo_pe=use_phylo_pe,
             phylo_pe_hidden=phylo_pe_hidden,
             pe_dim=pe_dim,
+            # X2 多任务:蛋白 PE 透传
+            use_protein_pe=use_protein_pe,
+            protein_pe_hidden=protein_pe_hidden,
+            protein_pe_dim=protein_pe_dim,
             grad_checkpointing=grad_checkpointing,
         )
 
@@ -154,6 +196,23 @@ class MiCoFormerModule(L.LightningModule):
                     persistent=False,
                 )
 
+        # ============ X2 多任务 heads(2026-05-28 夜) ============
+        # phylo_head: d_model → pe_dim;末层 zero-init(防 self-distillation 风格 collapse)
+        # protein_head: d_model → protein_pe_dim(条件创建,等 bacformer)
+        # weight=0 时不创建对应 head(避免 DDP find_unused)
+        self.phylo_head: Optional[PriorCoordHead] = None
+        if x2_phylo_weight > 0:
+            if pe_dim is None:
+                raise ValueError("x2_phylo_weight > 0 requires pe_dim.")
+            self.phylo_head = PriorCoordHead(
+                d_model=d_model, pe_dim=pe_dim, hidden=x2_head_hidden
+            )
+        self.protein_head: Optional[PriorCoordHead] = None
+        if x2_protein_weight > 0:
+            self.protein_head = PriorCoordHead(
+                d_model=d_model, pe_dim=protein_pe_dim, hidden=x2_head_hidden
+            )
+
         # ============ Tree loss helper(可选,默认 off) ============
         # tree_loss_weight=0:不创建 helper,_shared_step 中也跳过分支,与现状完全等价
         # tree_loss_weight>0:创建 helper,workflow 须在 inject_var_buffers 之后调
@@ -176,7 +235,13 @@ class MiCoFormerModule(L.LightningModule):
     # forward 与 step 辅助
     # ------------------------------------------------------------------
     def _encode(self, batch: Dict[str, torch.Tensor]):
-        """统一封装 encoder 调用,根据 abundance_encoding 等 flag 自适应。"""
+        """统一封装 encoder 调用,根据 abundance_encoding 等 flag 自适应。
+
+        X2 范式:当 x2_phylo_weight>0 或 x2_protein_weight>0 时,encoder forward
+        启用 mask_token_id_replace(mask 位置 token embed → genus_mask_token + PE 输出乘 0)
+        防止模型从 token_id 直接 lookup phylo/protein coord 答案。
+        """
+        x2_active = (self.hparams.x2_phylo_weight > 0) or (self.hparams.x2_protein_weight > 0)
         h = self.encoder(
             token_ids=batch["token_ids"],
             attention_mask=batch["attention_mask"],
@@ -184,6 +249,7 @@ class MiCoFormerModule(L.LightningModule):
             abund_values=batch.get("abund_values"),
             mask_positions=batch.get("mask_positions"),
             var_indices=batch.get("var_indices"),
+            mask_token_id_replace=x2_active,
         )
         return h
 
@@ -209,8 +275,9 @@ class MiCoFormerModule(L.LightningModule):
         h = self._encode(batch)
         h_token = h
 
-        # ============ MLM loss ============
+        # ============ MLM loss(mlm_weight=0 时跳过整段,但 head 已创建则前向看一眼避免 DDP 不参与) ============
         mask_pos = batch["mask_positions"]
+        mlm_w = float(self.hparams.mlm_weight)
         if self.hparams.abundance_loss == "huber":
             pred = self.mlm_head(h_token)               # [B, L]
             target = batch["labels_abund_values"]       # [B, L] float32
@@ -242,7 +309,7 @@ class MiCoFormerModule(L.LightningModule):
                 loss_mlm = torch.zeros((), device=h.device, dtype=h.dtype)
                 mae = None
 
-        # log MLM
+        # log MLM(始终记 raw loss 数值,即便 mlm_weight=0 也方便诊断)
         self.log(
             f"{stage}/loss_mlm", loss_mlm,
             prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
@@ -255,8 +322,51 @@ class MiCoFormerModule(L.LightningModule):
                 sync_dist=(stage == "val"),
             )
 
+        # ============ X2 phylo loss(2026-05-28 夜) ============
+        # mask 位置预测 phylo coord: target = encoder.phylo_pe.coords[token_ids] (frozen buffer)
+        loss_x2_phylo = torch.zeros((), device=h.device, dtype=h.dtype)
+        x2_phylo_w = float(self.hparams.x2_phylo_weight)
+        if x2_phylo_w > 0 and self.phylo_head is not None:
+            if self.encoder.phylo_pe is None or not self.encoder.phylo_pe._coords_loaded:
+                raise RuntimeError(
+                    "x2_phylo_weight>0 requires encoder.phylo_pe.coords loaded "
+                    "(call inject_var_buffers / phylo_pe.set_coords before forward())."
+                )
+            pred_phylo = self.phylo_head(h_token)                          # [B, L, pe_dim]
+            target_phylo = self.encoder.phylo_pe.coords[batch["token_ids"]]  # [B, L, pe_dim] frozen
+            if mask_pos.any():
+                loss_x2_phylo = F.mse_loss(
+                    pred_phylo[mask_pos], target_phylo[mask_pos], reduction="mean"
+                )
+            self.log(
+                f"{stage}/loss_x2_phylo", loss_x2_phylo,
+                prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
+                sync_dist=(stage == "val"),
+            )
+
+        # ============ X2 protein loss(2026-05-28 夜,phase 2) ============
+        # 镜像 X2 phylo:target = encoder.protein_pe.coords[token_ids]
+        loss_x2_protein = torch.zeros((), device=h.device, dtype=h.dtype)
+        x2_protein_w = float(self.hparams.x2_protein_weight)
+        if x2_protein_w > 0 and self.protein_head is not None:
+            if self.encoder.protein_pe is None or not self.encoder.protein_pe._coords_loaded:
+                raise RuntimeError(
+                    "x2_protein_weight>0 requires encoder.protein_pe.coords loaded."
+                )
+            pred_protein = self.protein_head(h_token)                          # [B, L, protein_pe_dim]
+            target_protein = self.encoder.protein_pe.coords[batch["token_ids"]]
+            if mask_pos.any():
+                loss_x2_protein = F.mse_loss(
+                    pred_protein[mask_pos], target_protein[mask_pos], reduction="mean"
+                )
+            self.log(
+                f"{stage}/loss_x2_protein", loss_x2_protein,
+                prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
+                sync_dist=(stage == "val"),
+            )
+
         # ============ Metadata loss ============
-        total_loss = loss_mlm
+        total_loss = mlm_w * loss_mlm + x2_phylo_w * loss_x2_phylo + x2_protein_w * loss_x2_protein
         if self.hparams.use_metadata_task:
             if "env_label" not in batch:
                 raise RuntimeError(
@@ -283,7 +393,7 @@ class MiCoFormerModule(L.LightningModule):
                 prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
                 sync_dist=(stage == "val"),
             )
-            total_loss = loss_mlm + float(self.hparams.metadata_loss_weight) * loss_meta
+            total_loss = total_loss + float(self.hparams.metadata_loss_weight) * loss_meta
 
         # ============ Tree loss(distance-preservation 辅助,可选) ============
         # 仅 train 阶段 + tree_loss_weight>0 + helper 已创建 时启用

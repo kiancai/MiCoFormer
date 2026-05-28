@@ -37,6 +37,38 @@ class AbundanceRegressionHead(nn.Module):
         return self.mlp(token_repr).squeeze(-1)
 
 
+class PriorCoordHead(nn.Module):
+    """X2 范式预测 head:从 token 表征解码到外部 prior 坐标(2026-05-28 夜)。
+
+    通用于 phylo / protein / 未来其他 vocab-level prior:
+      - input  : encoder 输出 token 序列 [B, L, d_model]
+      - output : 每个 token 位置在 prior 空间的预测坐标 [B, L, pe_dim]
+
+    设计:
+      - 2 层 MLP(Linear → GELU → Linear),hidden_dim 默认 128
+      - **末层 zero-init**(weight=0, bias=0):训练 step 0 预测全 0
+          → 配合 MSE loss,起步梯度方向来自 target 自身,主干自然吸收 prior 信号
+          → 跟 phylo_pe 末层 zero-init 对称,防 self-distillation 风格 collapse
+      - 不接 LayerNorm:输出空间是 prior 坐标(已 normalized),LN 会破坏自然量级
+    """
+
+    def __init__(self, d_model: int, pe_dim: int, hidden: int = 128) -> None:
+        super().__init__()
+        self.pe_dim = pe_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, pe_dim),
+        )
+        # 末层 zero-init(对称 phylo_pe.proj 末层 zero-init)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, token_repr: torch.Tensor) -> torch.Tensor:
+        # [B, L, d_model] → [B, L, pe_dim]
+        return self.mlp(token_repr)
+
+
 class MetadataHead(nn.Module):
     """V5 Metadata 多任务 head(EnvCategory 单标签分类)。
 
