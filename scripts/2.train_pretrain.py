@@ -123,7 +123,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # 2.2.模型主体参数的协议参数
     p.add_argument("--abundance_mode", type=str, default="abs_log_bins", choices=["abs_log_bins", "rank_bins"])
     p.add_argument("--min_abundance", type=float, default=4e-6)       # 最小丰度阈值
-    p.add_argument("--max_seq_len", type=int, default=1024)           # 每个样本保留的最大物种数 (截断长度)
+    p.add_argument("--max_seq_len", type=int, default=512)            # 每个样本保留的最大物种数 (截断长度);V5 主线一直用 512(cover 97.2%样本,p95=436);2026-05-29 default 1024→512(详 memory `seq_len_512_default`)
 
     # 3.1.预训练中的训练主体参数
     p.add_argument("--batch_size", type=int, default=32,

@@ -127,7 +127,7 @@ class MiCoDataModule(L.LightningDataModule):
         test_indices: Optional[Sequence[int]] = None,
         batch_size: int = 32,
         num_workers: int = 4,                  # 数据加载线程数
-        max_seq_len: Optional[int] = 1024,
+        max_seq_len: Optional[int] = 512,
         mask_prob: float = 0.15,
         num_abundance_bins: int = 40,          # 丰度分箱数量 (不含 PAD/MASK)
         min_abundance: float = 4e-6,           # 最小丰度阈值 (低于此值归入第一箱)

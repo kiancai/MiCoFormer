@@ -203,8 +203,11 @@ class MiCoFormerModule(L.LightningModule):
         self.huber_beta = huber_beta
 
         # ============ PMA(V5)或 mean_pool ============
+        # 2026-05-29:加 and use_metadata_task 条件 — 之前 PMA 仅 use_metadata_task=True 时被调用,
+        # 但 module __init__ 无条件创建,导致 phase 2 撤 metadata 时 PMA 是 1.1M dead params(不参与
+        # forward 也不被 optimizer 更新,但占显存 + 进 ckpt 状态)。现修复让 PMA 跟 metadata 同生死。
         self.pma: Optional[PMA] = None
-        if pooling_mode == "pma":
+        if pooling_mode == "pma" and use_metadata_task:
             self.pma = PMA(d_model=d_model, nhead_pma=pma_nhead, k=pma_k)
 
         # ============ Metadata head ============

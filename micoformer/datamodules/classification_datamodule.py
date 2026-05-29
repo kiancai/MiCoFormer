@@ -58,7 +58,7 @@ class ClassificationDataModule(L.LightningDataModule):
         test_indices: Optional[Sequence[int]] = None,
         batch_size: int = 32,
         num_workers: int = 4,
-        max_seq_len: Optional[int] = 1024,
+        max_seq_len: Optional[int] = 512,
         num_abundance_bins: int = 40,
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",

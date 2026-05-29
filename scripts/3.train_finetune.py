@@ -78,7 +78,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # 2.2.数据协议参数
     p.add_argument("--batch_size", type=int, default=32)              # 每个 batch 的样本数
-    p.add_argument("--max_seq_len", type=int, default=1024)           # 每个样本保留的最大物种数 (截断长度)
+    p.add_argument("--max_seq_len", type=int, default=512)            # 同 pretrain:V5 主线一直用 512(cover 97.2%样本);2026-05-29 default 1024→512
 
     # 3.1.微调中的训练主体参数
     p.add_argument("--lr_head", type=float, default=1e-3)             # 分类头学习率

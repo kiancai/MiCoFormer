@@ -92,7 +92,7 @@ class PretrainRunConfig:
     # 2.2. 模型主体参数的协议参数
     abundance_mode: str = "abs_log_bins"
     min_abundance: float = 4e-6
-    max_seq_len: int = 1024
+    max_seq_len: int = 512
 
     # 3.1. 预训练中的训练主体参数
     batch_size: int = 32

@@ -44,7 +44,7 @@ class FinetuneRunConfig:
 
     # 2.1. 数据协议参数
     batch_size: int = 32
-    max_seq_len: int = 1024
+    max_seq_len: int = 512
 
     # 3.1. 微调训练主体参数
     lr_head: float = 1e-3
