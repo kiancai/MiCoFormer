@@ -75,6 +75,10 @@ class PretrainRunConfig:
     # phylo_ce_tau:soft target 温度,推荐 6.5
     phylo_ce_weight: float = 0.0
     phylo_ce_tau: float = 6.5
+    # Phylo Tree-Wasserstein simplified(2026-05-29 phase 2,W-1 expected phylo distance loss)
+    # 数学:W(p, δ_v*) = Σ p(v) × d(v, v*) — closed-form when target one-hot,无 hyperparameter
+    # 跟 phylo_ce 共享 vocab_head + dist_matrix;两者互斥但允许同时(便于 ablation)
+    phylo_w_weight: float = 0.0
 
     # 2.1. 模型主体参数
     d_model: int = 256
@@ -232,9 +236,13 @@ def run_pretrain_once(
     # 同时从 datamodule 拿对应的距离矩阵（phylo 或 taxo），注入 encoder
     _n_vars = 0
     _dist_matrix_to_inject = None
-    # 2026-05-29:phylo_ce_weight>0 也需要 dist_matrix(即使 bias_type='none')
-    # 优先级:taxo bias → taxo_dist;phylo bias 或 phylo_ce → phylo_dist
-    _need_dist = config.bias_type != "none" or config.phylo_ce_weight > 0
+    # 2026-05-29:phylo_ce_weight 或 phylo_w_weight > 0 也需要 dist_matrix(即使 bias_type='none')
+    # 优先级:taxo bias → taxo_dist;phylo bias / phylo_ce / phylo_w → phylo_dist
+    _need_dist = (
+        config.bias_type != "none"
+        or config.phylo_ce_weight > 0
+        or config.phylo_w_weight > 0
+    )
     if _need_dist:
         if config.bias_type == "taxo":
             _dist_matrix_to_inject = dm.taxo_dist_matrix
@@ -326,6 +334,8 @@ def run_pretrain_once(
         # Phylo Soft-Target CE(2026-05-29)
         phylo_ce_weight=config.phylo_ce_weight,
         phylo_ce_tau=config.phylo_ce_tau,
+        # Phylo Tree-Wasserstein simplified(2026-05-29 phase 2)
+        phylo_w_weight=config.phylo_w_weight,
         n_vars=_n_vars,
         # V5
         abundance_encoding=config.abundance_encoding,

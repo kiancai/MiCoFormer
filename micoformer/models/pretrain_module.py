@@ -103,8 +103,18 @@ class MiCoFormerModule(L.LightningModule):
         #   需要:n_vars > 0 (encoder.dist_matrix buffer 必须创建);phylo_ce_weight>0 时自动 enforce
         # 设计依据:Wasserstein loss (Frogner 2015) + Tree-Wasserstein (Yamada 2021) 的 1st-order
         #   近似;CE-based 不会 mean collapse,且 phylo 强制进 loss
+        # 2026-05-29 phase 1 实测 phylo_ce 在 ep0 就达到 H(target)≈2.10 数学下界 → saturate
         phylo_ce_weight: float = 0.0,
         phylo_ce_tau: float = 6.5,
+        # Phylo Tree-Wasserstein simplified(2026-05-29 phase 2,替代 phylo-soft-CE):
+        #   phylo_w_weight: Wasserstein-1 expected distance loss 权重(0 关掉)
+        # 数学:当 target 是 one-hot at v* 时,W(p, δ_v*) = E_{v~p}[d(v, v*)] = Σ p(v) × d(v, v*)
+        #     即 expected phylo distance loss = strict Tree-Wasserstein W-1 closed form
+        #     (Yamada EACL 2021 / Le NeurIPS 2019)
+        # 优点 vs phylo_ce:① 无 hyperparameter τ ② hard target floor=0 不 saturate
+        #     ③ implementation 1 行(复用 dist_matrix buffer,无需 newick parse)
+        # 要求:跟 phylo_ce 同样需 n_vars > 0;两者互斥(同时>0 会触发 warning 但允许)
+        phylo_w_weight: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -138,19 +148,20 @@ class MiCoFormerModule(L.LightningModule):
         # 所有 weight 都 = 0 = 没 supervision,触发警告级 error
         _any_loss = (
             (mlm_weight > 0) or (x2_phylo_weight > 0) or (x2_protein_weight > 0)
-            or (tree_loss_weight > 0) or (phylo_ce_weight > 0)
+            or (tree_loss_weight > 0) or (phylo_ce_weight > 0) or (phylo_w_weight > 0)
         )
         if not _any_loss:
             raise ValueError(
-                "All training losses are off (mlm/x2_phylo/x2_protein/tree_loss/phylo_ce all=0). "
+                "All training losses are off (mlm/x2_phylo/x2_protein/tree_loss/phylo_ce/phylo_w all=0). "
                 "At least one loss weight must be > 0."
             )
 
-        # Phylo-soft-CE 需要 dist_matrix buffer + n_vars
-        if phylo_ce_weight > 0 and (n_vars is None or n_vars <= 0):
+        # Phylo-soft-CE / Phylo-W 都需要 dist_matrix buffer + n_vars
+        _need_dist = (phylo_ce_weight > 0) or (phylo_w_weight > 0)
+        if _need_dist and (n_vars is None or n_vars <= 0):
             raise ValueError(
-                "phylo_ce_weight > 0 requires n_vars > 0 to allocate encoder.dist_matrix buffer "
-                "(workflow 必须 inject 真实 dist_matrix 才能算 soft target)."
+                "phylo_ce_weight > 0 or phylo_w_weight > 0 requires n_vars > 0 "
+                "to allocate encoder.dist_matrix buffer (workflow 必须 inject 真实 dist_matrix)."
             )
 
         # 保存所有 __init__ 参数到 self.hparams,便于 checkpoint 保存和恢复
@@ -170,8 +181,8 @@ class MiCoFormerModule(L.LightningModule):
             bias_type=bias_type,
             phylo_mlp_hidden=phylo_mlp_hidden,
             phylo_bias_last_layer_bias=phylo_bias_last_layer_bias,
-            # n_vars 需要在 bias_type!='none' 或 phylo_ce_weight>0 时传入(后者 loss 需要 dist_matrix)
-            n_vars=n_vars if (bias_type != "none" or phylo_ce_weight > 0) else None,
+            # n_vars 需要在 bias_type!='none' 或 phylo_ce_weight/phylo_w_weight>0 时传入
+            n_vars=n_vars if (bias_type != "none" or phylo_ce_weight > 0 or phylo_w_weight > 0) else None,
             abundance_encoding=abundance_encoding,
             use_phylo_pe=use_phylo_pe,
             phylo_pe_hidden=phylo_pe_hidden,
@@ -234,12 +245,13 @@ class MiCoFormerModule(L.LightningModule):
                 d_model=d_model, pe_dim=protein_pe_dim, hidden=x2_head_hidden
             )
 
-        # ============ Phylo Soft-Target CE head(2026-05-29) ============
+        # ============ Phylo Soft-Target CE / Tree-Wasserstein head(2026-05-29) ============
         # vocab_head: d_model → genus_vocab_size(含 PAD/UNK 共 V_real+2 dim)
-        # loss 时只取 real genus 列(跳过 PAD/UNK),target 是 softmax(-dist_matrix/τ) soft 分布
-        # weight=0 时不创建(避免 DDP find_unused)
+        # phylo_ce: target 是 softmax(-dist/τ) soft 分布(KL loss)
+        # phylo_w : target 是 one-hot,loss = E_{v~p}[d(v, v*)] (expected phylo distance, W-1 simplified)
+        # 共享同一 vocab_head;weight=0 时不创建(避免 DDP find_unused)
         self.vocab_head: Optional[nn.Linear] = None
-        if phylo_ce_weight > 0:
+        if (phylo_ce_weight > 0) or (phylo_w_weight > 0):
             self.vocab_head = nn.Linear(d_model, genus_vocab_size)
 
         # ============ Tree loss helper(可选,默认 off) ============
@@ -394,40 +406,57 @@ class MiCoFormerModule(L.LightningModule):
                 sync_dist=(stage == "val"),
             )
 
-        # ============ Phylo Soft-Target CE loss(2026-05-29) ============
-        # mask 位置预测 vocab id(8114 真实 genus + PAD/UNK),target = softmax(-dist/tau) soft 分布
-        # CE-based 不会 mean collapse + phylo 强制进 loss(错预测远亲菌 cost 大)
+        # ============ Phylo Soft-Target CE / Tree-Wasserstein loss(2026-05-29) ============
+        # 两条 path 共享 vocab_head 计算 + dist_to_true,各算各的 loss
+        # phylo_ce: target = softmax(-dist/τ) soft 分布,loss = KL(soft target || pred)
+        # phylo_w : target = one-hot,loss = E_{v~p}[d(v, v*)] (W-1 expected phylo distance)
         loss_phylo_ce = torch.zeros((), device=h.device, dtype=h.dtype)
+        loss_phylo_w = torch.zeros((), device=h.device, dtype=h.dtype)
         phylo_ce_w = float(self.hparams.phylo_ce_weight)
-        if phylo_ce_w > 0 and self.vocab_head is not None:
+        phylo_w_w = float(self.hparams.phylo_w_weight)
+        if (phylo_ce_w > 0 or phylo_w_w > 0) and self.vocab_head is not None:
             if self.encoder.dist_matrix is None or not self.encoder._dist_matrix_loaded:
                 raise RuntimeError(
-                    "phylo_ce_weight>0 requires encoder.dist_matrix loaded "
+                    "phylo_ce_weight>0 or phylo_w_weight>0 requires encoder.dist_matrix loaded "
                     "(call inject_var_buffers with dist_matrix before forward())."
                 )
-            tau = float(self.hparams.phylo_ce_tau)
             # vocab id 约定:0=PAD, 1=UNK, 2~V_real+1 = real genus(var_index = vocab_id - 2)
-            mask_target_vocab = batch["token_ids"][mask_pos]   # [N] long, mask 位置原始 vocab id
-            # 只对 real genus(vocab_id >= 2)算 loss,跳过 UNK(=1)即 var_index=-1
-            valid_target = mask_target_vocab >= 2
+            mask_target_vocab = batch["token_ids"][mask_pos]   # [N] long
+            valid_target = mask_target_vocab >= 2              # 跳过 UNK
             if valid_target.any():
                 target_var_idx = (mask_target_vocab[valid_target] - 2).long()  # [n_valid]
-                # dist_matrix[target_var_idx]: [n_valid, V_real] phylo distance to all real genera
                 dist_to_true = self.encoder.dist_matrix[target_var_idx].float()  # [n_valid, V_real]
-                # soft target: softmax(-dist/tau) — 近亲 prob 高、远亲 prob 低
-                target_dist = F.softmax(-dist_to_true / tau, dim=-1)             # [n_valid, V_real]
-                # 模型 logits:vocab_head 输出 V_real+2 dim,只取 :V_real(跳过 PAD/UNK 列)
-                # 注意:vocab id [2, V_real+1] 对应 vocab_head 输出的 [2:V_real+2] 列
+                # 共用 logits 计算
                 logits_full = self.vocab_head(h_token)                            # [B, L, V_real+2]
                 mask_logits_full = logits_full[mask_pos]                          # [N, V_real+2]
                 logits_real = mask_logits_full[valid_target, 2:]                  # [n_valid, V_real]
-                log_probs = F.log_softmax(logits_real, dim=-1)                    # [n_valid, V_real]
-                loss_phylo_ce = -(target_dist * log_probs).sum(-1).mean()
-            self.log(
-                f"{stage}/loss_phylo_ce", loss_phylo_ce,
-                prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
-                sync_dist=(stage == "val"),
-            )
+
+                # phylo_ce branch
+                if phylo_ce_w > 0:
+                    tau = float(self.hparams.phylo_ce_tau)
+                    target_dist = F.softmax(-dist_to_true / tau, dim=-1)
+                    log_probs = F.log_softmax(logits_real, dim=-1)
+                    loss_phylo_ce = -(target_dist * log_probs).sum(-1).mean()
+
+                # phylo_w (Tree-W simplified) branch
+                # 数学:W(p, δ_v*) = Σ_v p(v) × d(v, v*),Yamada 2021 closed-form 当 target=one-hot
+                # hard target floor=0(when p=one-hot at v*),不 saturate vs phylo_ce ep0 plateau
+                if phylo_w_w > 0:
+                    pred_probs = F.softmax(logits_real, dim=-1)                   # [n_valid, V_real]
+                    loss_phylo_w = (pred_probs * dist_to_true).sum(-1).mean()
+
+            if phylo_ce_w > 0:
+                self.log(
+                    f"{stage}/loss_phylo_ce", loss_phylo_ce,
+                    prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
+                    sync_dist=(stage == "val"),
+                )
+            if phylo_w_w > 0:
+                self.log(
+                    f"{stage}/loss_phylo_w", loss_phylo_w,
+                    prog_bar=(stage == "train"), on_step=(stage == "train"), on_epoch=True,
+                    sync_dist=(stage == "val"),
+                )
 
         # ============ Metadata loss ============
         total_loss = (
@@ -435,6 +464,7 @@ class MiCoFormerModule(L.LightningModule):
             + x2_phylo_w * loss_x2_phylo
             + x2_protein_w * loss_x2_protein
             + phylo_ce_w * loss_phylo_ce
+            + phylo_w_w * loss_phylo_w
         )
         if self.hparams.use_metadata_task:
             if "env_label" not in batch:

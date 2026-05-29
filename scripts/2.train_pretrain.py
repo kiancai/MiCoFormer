@@ -83,6 +83,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--phylo_ce_tau", type=float, default=6.5,
                    help="Phylo Soft-Target CE 温度 τ:soft target = softmax(-dist/τ);"
                         "推荐 6.5 ≈ log1p(patristic_max=656),让近亲 vs 远亲 prob ratio 在 e^2~e^4")
+    p.add_argument("--phylo_w_weight", type=float, default=0.0,
+                   help="Phylo Tree-Wasserstein simplified loss 权重 — W-1 expected phylo distance;"
+                        "默认 0=关;phase 2 推荐 1.0(无 hyperparameter,不 ep0 saturate)")
 
     # V5 新增:三段相加 + PMA + metadata 多任务
     p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
@@ -206,6 +209,8 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         # Phylo Soft-Target CE(2026-05-29)
         phylo_ce_weight=args.phylo_ce_weight,
         phylo_ce_tau=args.phylo_ce_tau,
+        # Phylo Tree-Wasserstein simplified(2026-05-29 phase 2)
+        phylo_w_weight=args.phylo_w_weight,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,
