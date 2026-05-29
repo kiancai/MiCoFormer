@@ -176,6 +176,12 @@ class MiCoFormerEncoder(nn.Module):
                 torch.zeros((n_vars, n_vars), dtype=placeholder_dtype),
                 persistent=False,
             )
+            # 2026-05-30:phylo_w (Tree-W) loss = E[d] 量级 ≈ 距离矩阵尺度(分支长度,上百),
+            # 不归一化会淹没 mlm loss(~0.2)数百倍。dist_scale = 非零距离均值,
+            # 在 set_dist_matrix 注入真实矩阵时更新;loss 除以它后落到 ~1 量级,weight 才是真比例。
+            self.register_buffer(
+                "dist_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False
+            )
             self._dist_matrix_loaded = False
         else:
             if bias_type != "none":
@@ -209,6 +215,14 @@ class MiCoFormerEncoder(nn.Module):
         if matrix.dtype != expected_dtype:
             matrix = matrix.to(expected_dtype)
         self.register_buffer("dist_matrix", matrix.to(self.dist_matrix.device), persistent=False)
+        # 2026-05-30:用真实矩阵的非零距离均值刷新 dist_scale(phylo_w loss 归一化尺度)。
+        # taxo bucket(int8)不走 phylo_w,这里算出的尺度无意义但无害。
+        matrix_f = matrix.float()
+        nz = matrix_f[matrix_f > 0]
+        scale = nz.mean() if nz.numel() > 0 else matrix_f.new_tensor(1.0)
+        self.register_buffer(
+            "dist_scale", scale.detach().to(self.dist_matrix.device), persistent=False
+        )
         self._dist_matrix_loaded = True
 
     def _build_token_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:

@@ -446,7 +446,9 @@ class MiCoFormerModule(L.LightningModule):
                 # hard target floor=0(when p=one-hot at v*),不 saturate vs phylo_ce ep0 plateau
                 if phylo_w_w > 0:
                     pred_probs = F.softmax(logits_real, dim=-1)                   # [n_valid, V_real]
-                    loss_phylo_w = (pred_probs * dist_to_true).sum(-1).mean()
+                    # 2026-05-30:除以 dist_scale(非零距离均值)归一化到 ~1 量级,
+                    # 否则 E[d]~125 会淹没 mlm~0.2 数百倍,weight=1 名义五五开实则 660:1。
+                    loss_phylo_w = (pred_probs * dist_to_true).sum(-1).mean() / self.encoder.dist_scale
 
             if phylo_ce_w > 0:
                 self.log(
