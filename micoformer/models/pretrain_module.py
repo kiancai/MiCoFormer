@@ -304,6 +304,15 @@ class MiCoFormerModule(L.LightningModule):
         防止模型从 token_id 直接 lookup phylo/protein coord 答案。
         """
         x2_active = (self.hparams.x2_phylo_weight > 0) or (self.hparams.x2_protein_weight > 0)
+        # 2026-05-30 修泄露:phylo_ce/phylo_w/protein_w 也用 vocab_head 预测 mask 位置的 genus,
+        # 若不屏蔽被预测 token 的输入身份(genus_embed + phylo_PE + protein_PE),模型直接读自己的
+        # 输入 = 泄露(phylo_w/protein_w 退化成抄输入,非真任务)。故这些 loss 开启时同样需要
+        # mask_token_id_replace(置 genus_mask_token + PE 输出乘 0),与 x2 一致。
+        mask_id_replace = x2_active or (
+            (self.hparams.phylo_ce_weight > 0)
+            or (self.hparams.phylo_w_weight > 0)
+            or (self.hparams.protein_w_weight > 0)
+        )
         h = self.encoder(
             token_ids=batch["token_ids"],
             attention_mask=batch["attention_mask"],
@@ -311,7 +320,7 @@ class MiCoFormerModule(L.LightningModule):
             abund_values=batch.get("abund_values"),
             mask_positions=batch.get("mask_positions"),
             var_indices=batch.get("var_indices"),
-            mask_token_id_replace=x2_active,
+            mask_token_id_replace=mask_id_replace,
         )
         return h
 
