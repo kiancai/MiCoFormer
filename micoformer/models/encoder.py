@@ -54,6 +54,9 @@ class MiCoFormerEncoder(nn.Module):
         phylo_bias_last_layer_bias: bool = True,
         # 词表大小(用于在不持有 dist_matrix 时占位创建 buffer,避免 ckpt 加载时无 buffer)
         n_vars: Optional[int] = None,
+        # 2026-05-30:protein_w (蛋白 Tree-W) loss 需要蛋白距离矩阵 buffer。
+        # 镜像 dist_matrix:为 True 且 n_vars>0 时创建 [n_vars, n_vars] float32 buffer。
+        need_protein_dist: bool = False,
         # ---------------- V5 新增 ----------------
         abundance_encoding: str = "mlp",      # "mlp"(默认) | "bin"
         use_phylo_pe: bool = True,             # 启用 PhyloPE(V5 默认 True)
@@ -192,6 +195,23 @@ class MiCoFormerEncoder(nn.Module):
             self.dist_matrix = None
             self._dist_matrix_loaded = True
 
+        # 蛋白距离矩阵 buffer(2026-05-30,镜像 dist_matrix):persistent=False(不进 ckpt)。
+        # protein_w loss = E[protein_dist] 量级与 phylo 同理,需 protein_dist_scale 归一化。
+        # 与 dist_matrix 解耦:仅 need_protein_dist=True 且 n_vars>0 时创建。
+        if need_protein_dist and n_vars is not None and n_vars > 0:
+            self.register_buffer(
+                "protein_dist_matrix",
+                torch.zeros((n_vars, n_vars), dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "protein_dist_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False
+            )
+            self._protein_dist_loaded = False
+        else:
+            self.protein_dist_matrix = None
+            self._protein_dist_loaded = True
+
         self.layer_norm = nn.LayerNorm(d_model)
 
     def set_dist_matrix(self, matrix: torch.Tensor) -> None:
@@ -224,6 +244,36 @@ class MiCoFormerEncoder(nn.Module):
             "dist_scale", scale.detach().to(self.dist_matrix.device), persistent=False
         )
         self._dist_matrix_loaded = True
+
+    def set_protein_dist_matrix(self, matrix: torch.Tensor) -> None:
+        """注入真实的蛋白距离矩阵(2026-05-30,精确镜像 set_dist_matrix)。
+
+        前提是 encoder 构造时 need_protein_dist=True + n_vars>0 已经创建了 buffer。
+        protein_dist 是 [V_real, V_real] float32(对角=0、对称,无 PAD/UNK 前置)。
+        """
+        if self.protein_dist_matrix is None:
+            raise RuntimeError(
+                "encoder.protein_dist_matrix is None — pass need_protein_dist=True and "
+                "n_vars > 0 at encoder __init__ (needed for protein_w_weight > 0)."
+            )
+        if matrix.shape != self.protein_dist_matrix.shape:
+            raise ValueError(
+                f"protein_dist_matrix shape mismatch: expected {tuple(self.protein_dist_matrix.shape)}, "
+                f"got {tuple(matrix.shape)}."
+            )
+        if matrix.dtype != torch.float32:
+            matrix = matrix.to(torch.float32)
+        self.register_buffer(
+            "protein_dist_matrix", matrix.to(self.protein_dist_matrix.device), persistent=False
+        )
+        # 用真实矩阵的非零距离均值刷新 protein_dist_scale(protein_w loss 归一化尺度)。
+        matrix_f = matrix.float()
+        nz = matrix_f[matrix_f > 0]
+        scale = nz.mean() if nz.numel() > 0 else matrix_f.new_tensor(1.0)
+        self.register_buffer(
+            "protein_dist_scale", scale.detach().to(self.protein_dist_matrix.device), persistent=False
+        )
+        self._protein_dist_loaded = True
 
     def _build_token_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:
         # V5: 单 genus embedding

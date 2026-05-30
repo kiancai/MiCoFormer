@@ -197,15 +197,18 @@ def build_lr_scheduler(
 
 
 def inject_var_buffers(
-    encoder, dist_matrix=None, pe_coords_raw=None, protein_pe_coords_raw=None
+    encoder, dist_matrix=None, pe_coords_raw=None, protein_pe_coords_raw=None,
+    protein_dist_matrix=None,
 ) -> None:
-    """统一注入 encoder 的三个 var-level buffer:
-       dist_matrix(R2)+ phylo_pe.coords(V5 PE)+ protein_pe.coords(X2 phase 2)。
+    """统一注入 encoder 的 var-level buffer:
+       dist_matrix(R2)+ phylo_pe.coords(V5 PE)+ protein_pe.coords(X2 phase 2)
+       + protein_dist_matrix(protein_w loss,2026-05-30)。
 
     都是 persistent=False,不进 ckpt,所以每次创建/恢复 model 都必须重新注入。
     - dist_matrix:[V, V],仅当 encoder.bias_type != 'none' 时注入
     - pe_coords_raw:[V_real, pe_dim],仅当 encoder.phylo_pe 存在时注入(set_coords 会前置 PAD/UNK)
     - protein_pe_coords_raw:[V_real, protein_pe_dim],仅当 encoder.protein_pe 存在时注入
+    - protein_dist_matrix:[V_real, V_real],仅当 encoder.protein_dist_matrix buffer 存在时注入
     """
     # 2026-05-29:dist_matrix 注入条件改为基于 encoder buffer 是否存在(不基于 bias_type),
     # 因为 phylo_ce loss 也需要 dist_matrix 即使 bias_type='none'
@@ -215,6 +218,9 @@ def inject_var_buffers(
         encoder.phylo_pe.set_coords(pe_coords_raw)
     if protein_pe_coords_raw is not None and getattr(encoder, "protein_pe", None) is not None:
         encoder.protein_pe.set_coords(protein_pe_coords_raw)
+    # 2026-05-30:protein_w loss 用的蛋白距离矩阵(镜像 dist_matrix)
+    if protein_dist_matrix is not None and getattr(encoder, "protein_dist_matrix", None) is not None:
+        encoder.set_protein_dist_matrix(protein_dist_matrix)
 
 
 def extract_encoder_artifacts_from_ckpt(ckpt_path):

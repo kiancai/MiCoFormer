@@ -86,6 +86,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--phylo_w_weight", type=float, default=0.0,
                    help="Phylo Tree-Wasserstein simplified loss 权重 — W-1 expected phylo distance;"
                         "默认 0=关;phase 2 推荐 1.0(无 hyperparameter,不 ep0 saturate)")
+    # Protein Tree-Wasserstein simplified(2026-05-30,phylo_w 精确镜像,蛋白距离矩阵)
+    p.add_argument("--protein_w_weight", type=float, default=0.0,
+                   help="Protein Tree-Wasserstein simplified loss 权重 — W-1 expected protein distance;"
+                        "默认 0=关;镜像 phylo_w,需 --protein_dist_path")
+    p.add_argument("--protein_pe_path", type=str, default=None,
+                   help="protein_feat.npy 外部路径([V_real, 480]),给 protein PE embedding 输入用;"
+                        "use_protein_pe=True 时需要")
+    p.add_argument("--protein_dist_path", type=str, default=None,
+                   help="protein_dist.npy 外部路径([V_real, V_real] float32,对角=0、对称),"
+                        "给 protein_w loss 用;protein_w_weight>0 时需要")
 
     # V5 新增:三段相加 + PMA + metadata 多任务
     p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
@@ -211,6 +221,10 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         phylo_ce_tau=args.phylo_ce_tau,
         # Phylo Tree-Wasserstein simplified(2026-05-29 phase 2)
         phylo_w_weight=args.phylo_w_weight,
+        # Protein Tree-Wasserstein simplified(2026-05-30,phylo_w 镜像)
+        protein_w_weight=args.protein_w_weight,
+        protein_pe_path=args.protein_pe_path,
+        protein_dist_path=args.protein_dist_path,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

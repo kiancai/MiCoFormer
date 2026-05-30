@@ -6,6 +6,7 @@ import hashlib
 import os
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 import anndata as ad
 import lightning as L
@@ -69,6 +70,10 @@ class PretrainRunConfig:
     use_protein_pe: bool = False
     protein_pe_hidden: int = 128
     # protein_pe_dim 不在 config 里指定:由 datamodule 加载 varm['protein_pe'] 后自动决定
+    # protein_pe_path:protein_feat.npy 外部路径([V_real, 480]),给 protein_pe **embedding** 输入用
+    #   (我们的 protein_feat 在外部 npy,不在金标准语料 varm,所以走 workflow 传入而非 datamodule.varm)
+    #   use_protein_pe=True 时必须给定
+    protein_pe_path: Optional[str] = None
 
     # Phylo Soft-Target CE(2026-05-29,替代 X2 32d MSE — 实测 mean collapse)
     # phylo_ce_weight>0 时:① workflow 自动注入 dist_matrix(无论 bias_type) ② module 创建 vocab_head
@@ -79,6 +84,13 @@ class PretrainRunConfig:
     # 数学:W(p, δ_v*) = Σ p(v) × d(v, v*) — closed-form when target one-hot,无 hyperparameter
     # 跟 phylo_ce 共享 vocab_head + dist_matrix;两者互斥但允许同时(便于 ablation)
     phylo_w_weight: float = 0.0
+    # Protein Tree-Wasserstein simplified(2026-05-30,phylo_w 精确镜像,把 phylo dist 换成蛋白距离)
+    # protein_w_weight>0 时:① workflow 从 protein_dist_path 加载 protein_dist 并注入 encoder
+    #   ② module 创建/共享 vocab_head + encoder 创建 protein_dist_matrix buffer
+    # protein_dist_path:protein_dist.npy 外部路径([V_real, V_real] float32,对角=0、对称)
+    #   protein_w_weight>0 时必须给定
+    protein_w_weight: float = 0.0
+    protein_dist_path: Optional[str] = None
 
     # 2.1. 模型主体参数
     d_model: int = 256
@@ -280,19 +292,48 @@ def run_pretrain_once(
             f"{TAG} PhyloPE: pe_dim={_pe_dim}, coords shape={tuple(_pe_coords_to_inject.shape)}"
         )
 
-    # Protein PE coords 检查(X2 phase 2:use_protein_pe=True 时必须有 varm['protein_pe'])
+    # Protein PE coords 检查(X2 phase 2:use_protein_pe=True 时必须有 protein_feat)
+    # 优先用外部 protein_pe_path(.npy);否则回落到语料 varm['protein_pe']
     _protein_pe_coords_to_inject = None
     _protein_pe_dim = None
     if config.use_protein_pe:
-        if getattr(dm, "protein_pe_coords_raw", None) is None:
-            raise RuntimeError(
-                "use_protein_pe=True requires varm['protein_pe'] in h5ad, "
-                "but DataModule did not load it (likely bacformer_prior pipeline 未完成)."
+        if config.protein_pe_path is not None:
+            _ppe_arr = np.load(config.protein_pe_path).astype(np.float32)
+            _protein_pe_coords_to_inject = torch.from_numpy(_ppe_arr)
+            rank_zero_info(
+                f"{TAG} ProteinPE: loaded from external npy {config.protein_pe_path}, "
+                f"shape={tuple(_protein_pe_coords_to_inject.shape)}"
             )
-        _protein_pe_coords_to_inject = dm.protein_pe_coords_raw
+        elif getattr(dm, "protein_pe_coords_raw", None) is not None:
+            _protein_pe_coords_to_inject = dm.protein_pe_coords_raw
+            rank_zero_info(
+                f"{TAG} ProteinPE: loaded from varm['protein_pe'], "
+                f"shape={tuple(_protein_pe_coords_to_inject.shape)}"
+            )
+        else:
+            raise RuntimeError(
+                "use_protein_pe=True requires protein_pe_path (.npy) or varm['protein_pe'] in h5ad, "
+                "but neither was provided (likely bacformer_prior pipeline 未完成)."
+            )
         _protein_pe_dim = int(_protein_pe_coords_to_inject.shape[1])
+        rank_zero_info(f"{TAG} ProteinPE: pe_dim={_protein_pe_dim}")
+
+    # Protein dist matrix 检查(protein_w_weight>0 时必须有 protein_dist_path)
+    _protein_dist_to_inject = None
+    if config.protein_w_weight > 0:
+        if config.protein_dist_path is None:
+            raise RuntimeError(
+                "protein_w_weight > 0 requires protein_dist_path (.npy [V_real, V_real] float32), "
+                "but it was not provided."
+            )
+        _pd_arr = np.load(config.protein_dist_path).astype(np.float32)
+        _protein_dist_to_inject = torch.from_numpy(_pd_arr)
+        # protein_w 也需要 n_vars > 0(创建 protein_dist_matrix buffer)
+        if _n_vars == 0:
+            _n_vars = int(_protein_dist_to_inject.shape[0])
         rank_zero_info(
-            f"{TAG} ProteinPE: pe_dim={_protein_pe_dim}, coords shape={tuple(_protein_pe_coords_to_inject.shape)}"
+            f"{TAG} protein_dist: loaded from {config.protein_dist_path}, "
+            f"shape={tuple(_protein_dist_to_inject.shape)}, n_vars={_n_vars}"
         )
 
     # Metadata class weights
@@ -336,6 +377,8 @@ def run_pretrain_once(
         phylo_ce_tau=config.phylo_ce_tau,
         # Phylo Tree-Wasserstein simplified(2026-05-29 phase 2)
         phylo_w_weight=config.phylo_w_weight,
+        # Protein Tree-Wasserstein simplified(2026-05-30,phylo_w 镜像)
+        protein_w_weight=config.protein_w_weight,
         n_vars=_n_vars,
         # V5
         abundance_encoding=config.abundance_encoding,
@@ -363,11 +406,13 @@ def run_pretrain_once(
     )
 
     # 注入 var-level buffer:dist_matrix(R2) + phylo_pe coords(V5) + protein_pe coords(X2 phase 2)
+    #   + protein_dist_matrix(protein_w loss,2026-05-30)
     inject_var_buffers(
         model.encoder,
         _dist_matrix_to_inject,
         _pe_coords_to_inject,
         _protein_pe_coords_to_inject,
+        protein_dist_matrix=_protein_dist_to_inject,
     )
 
     # Tree loss helper 需要 phylo_dist 引用;在 encoder 注入之后立刻挂上

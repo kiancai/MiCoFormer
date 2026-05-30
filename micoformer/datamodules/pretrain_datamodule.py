@@ -176,6 +176,9 @@ class MiCoDataModule(L.LightningDataModule):
         # 模型层使用时通过 datamodule 拿,再由 workflow 注入 encoder 作为 buffer
         self.phylo_dist_matrix: Optional[torch.Tensor] = None  # [V, V] float32（patristic 连续距离）
         self.taxo_dist_matrix: Optional[torch.Tensor] = None   # [V, V] int8  （LCA 离散 hop 距离，0~6）
+        # protein_w loss 用的蛋白距离矩阵(2026-05-30,镜像 phylo_dist_matrix)。
+        # 不在金标准语料 varp 里,而是 workflow 从外部 .npy 路径加载后挂上来(见 workflows/pretrain.py)。
+        self.protein_dist_matrix: Optional[torch.Tensor] = None  # [V_real, V_real] float32
         self.phylo_pe_coords_raw: Optional[torch.Tensor] = None  # [V_real, pe_dim] float32 (V5)
         self.pe_dim: Optional[int] = None
         # X2 phase 2:蛋白 PE coords(等 bacformer_prior 出 varm['protein_pe'])
