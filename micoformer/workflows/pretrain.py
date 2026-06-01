@@ -138,6 +138,11 @@ class PretrainRunConfig:
     # 5. 运行与工程参数
     devices: int = 1
     num_nodes: int = 1                 # 多节点 DDP 节点数(单节点保持 1)
+    # 多卡 DDP find_unused_parameters 开关(默认 False=现状最快:所有参数都参与 forward)。
+    # 仅当某配置下有参数天然不参与 loss 时打开 —— 如纯 MLM 对照(phylo_w=protein_w=0)
+    # 关掉 mask_token_id_replace → genus_mask_token 闲置 → DDP reducer 报 unused-parameter。
+    # 打开只影响 DDP 梯度同步记账,不改 forward/loss/学习,数值等价。
+    ddp_find_unused_parameters: bool = False
     precision: str = "auto"
     seed: int = 42
     accumulate_grad_batches: int = 1
@@ -525,7 +530,7 @@ def run_pretrain_once(
     if _use_gpu and config.devices > 1:
         trainer_kwargs["strategy"] = DDPStrategy(
             broadcast_buffers=False,
-            find_unused_parameters=False,
+            find_unused_parameters=config.ddp_find_unused_parameters,
         )
     if config.budget_mode == "epoch":
         trainer_kwargs["max_epochs"] = config.max_epochs

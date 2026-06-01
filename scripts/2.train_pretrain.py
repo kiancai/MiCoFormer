@@ -174,6 +174,10 @@ def build_argparser() -> argparse.ArgumentParser:
     # 5. 运行与工程参数
     p.add_argument("--devices", type=int, default=1)                   # 使用的 GPU/设备 数量（单节点内卡数）
     p.add_argument("--num_nodes", type=int, default=1)                 # 多节点 DDP 节点数（单节点保持 1）
+    p.add_argument("--ddp_find_unused_parameters", action="store_true", default=False,
+                   help="多卡 DDP 打开 find_unused_parameters(默认关)。纯 MLM 对照(phylo_w=protein_w=0)下 "
+                        "genus_mask_token 等参数天然闲置会触发 DDP unused-parameter 报错,这时需打开;"
+                        "只影响梯度同步记账,数值等价")
     p.add_argument("--precision", type=str, default="auto", choices=["auto", "16-mixed", "32"])
     p.add_argument("--seed", type=int, default=42)                     # 随机种子，用于可复现
     p.add_argument("--accumulate_grad_batches", type=int, default=1)   # 梯度累积步数
@@ -253,6 +257,7 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         limit_val_batches=args.limit_val_batches,
         devices=args.devices,
         num_nodes=args.num_nodes,
+        ddp_find_unused_parameters=args.ddp_find_unused_parameters,
         precision=args.precision,
         seed=args.seed,
         accumulate_grad_batches=args.accumulate_grad_batches,
