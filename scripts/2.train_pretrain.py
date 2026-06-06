@@ -96,6 +96,42 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--protein_dist_path", type=str, default=None,
                    help="protein_dist.npy 外部路径([V_real, V_real] float32,对角=0、对称),"
                         "给 protein_w loss 用;protein_w_weight>0 时需要")
+    # 对比学习(2026-06-04,InfoNCE,保留 MLM 锚)
+    p.add_argument("--contrastive_weight", type=float, default=0.0,
+                   help="InfoNCE 对比 loss 权重 — 同样本两套 abund-mask 两视图拉近;默认 0=关,典型 0.1-0.5")
+    p.add_argument("--contrastive_temp", type=float, default=0.1, help="NT-Xent 温度 τ(典型 0.1)")
+    p.add_argument("--contrastive_proj_dim", type=int, default=128, help="projection head 输出维度")
+    p.add_argument("--contrastive_mask_prob", type=float, default=0.15, help="第二视图 abund-mask 比例")
+    # JEPA(2026-06-04,潜空间预测被遮 genus 含义向量;红线:坐标只当地址 query,target 是含义向量)
+    p.add_argument("--jepa_weight", type=float, default=0.0,
+                   help="JEPA latent-prediction loss 权重;默认 0=关,典型 1.0。需 use_phylo_pe/use_protein_pe;"
+                        "三卡须配 --ddp_find_unused_parameters(JEPA 模式 genus_mask_token 闲置)")
+    p.add_argument("--jepa_mask_ratio", type=float, default=0.5,
+                   help="target token 比例(从 context 移除、由 predictor 预测;典型 0.5)")
+    p.add_argument("--jepa_mlm_mask_prob", type=float, default=0.15,
+                   help="MLM 锚的 abund-mask 比例(在 context 内选;防塌锚,典型 0.15)")
+    p.add_argument("--jepa_ema_decay", type=float, default=0.996,
+                   help="target encoder EMA 起步衰减(0.996,训练中 linear ramp→1;I-JEPA)")
+    p.add_argument("--jepa_pred_dim", type=int, default=256,
+                   help="窄 bottleneck predictor 宽度(典型 256 = d_model 的 0.5x;bottleneck 是防塌主力)")
+    p.add_argument("--jepa_pred_depth", type=int, default=2, help="predictor transformer 层数(典型 2)")
+    p.add_argument("--jepa_pred_heads", type=int, default=4, help="predictor 注意力头数(pred_dim 须整除)")
+    p.add_argument("--jepa_vicreg_weight", type=float, default=0.0,
+                   help="VICReg variance 防塌正则权重(后备;起步 0,塌了抬,见 PLAN 防塌段)")
+    p.add_argument("--jepa_mask_mode", type=str, default="structured", choices=["random", "structured"],
+                   help="JEPA target 遮挡方式:random=随机遮 ~ratio;structured=按 phylo/protein 坐标"
+                        "样本内成簇遮(多种子,见 PLAN 结构化 mask);v2 默认 structured")
+    p.add_argument("--jepa_n_seeds", type=int, default=4,
+                   help="structured 模式多少个种子簇(I-JEPA multi-block;每簇遮 ratio/n_seeds 最近邻;v2 默认 4)")
+    # JEPA v2(2026-06-06,删 MLM + 双自监督 + 防塌升级)
+    p.add_argument("--jepa_global_weight", type=float, default=0.5,
+                   help="JEPA v2 全局对齐 loss 权重(student PMA vs teacher PMA;默认 0.5,0=关)")
+    p.add_argument("--jepa_n_reg_tokens", type=int, default=4,
+                   help="JEPA v2 register token 数(T-JEPA 防塌,encoder 前缀;默认 4,0=关)")
+    p.add_argument("--jepa_ratio_start", type=float, default=0.3,
+                   help="JEPA v2 structured mask ratio curriculum 起点(epoch 0;默认 0.3)")
+    p.add_argument("--jepa_ratio_end", type=float, default=0.5,
+                   help="JEPA v2 structured mask ratio curriculum 终点(末 epoch;默认 0.5)")
 
     # V5 新增:三段相加 + PMA + metadata 多任务
     p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
@@ -121,9 +157,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--huber_beta", type=float, default=1.0)
 
     # 2.1.模型主体参数
-    p.add_argument("--d_model", type=int, default=256)                # token embedding 的维度，也是模型中间层的维度
-    p.add_argument("--nhead", type=int, default=8)                    # 多头注意力中的头数
-    p.add_argument("--num_layers", type=int, default=6)               # Transformer Encoder 层数
+    p.add_argument("--d_model", type=int, default=512)                # token embedding 的维度，也是模型中间层的维度
+    p.add_argument("--nhead", type=int, default=16)                    # 多头注意力中的头数
+    p.add_argument("--num_layers", type=int, default=12)               # Transformer Encoder 层数
     p.add_argument("--ff_dim", type=int, default=None,
                    help="FeedForward 绝对维度，与 --ff_ratio 互斥。不指定时使用 ff_ratio。")
     p.add_argument("--ff_ratio", type=int, default=None,
@@ -229,6 +265,27 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         protein_w_weight=args.protein_w_weight,
         protein_pe_path=args.protein_pe_path,
         protein_dist_path=args.protein_dist_path,
+        # 对比学习(2026-06-04,InfoNCE)
+        contrastive_weight=args.contrastive_weight,
+        contrastive_temp=args.contrastive_temp,
+        contrastive_proj_dim=args.contrastive_proj_dim,
+        contrastive_mask_prob=args.contrastive_mask_prob,
+        # JEPA(2026-06-04,潜空间预测)
+        jepa_weight=args.jepa_weight,
+        jepa_mask_ratio=args.jepa_mask_ratio,
+        jepa_mlm_mask_prob=args.jepa_mlm_mask_prob,
+        jepa_ema_decay=args.jepa_ema_decay,
+        jepa_pred_dim=args.jepa_pred_dim,
+        jepa_pred_depth=args.jepa_pred_depth,
+        jepa_pred_heads=args.jepa_pred_heads,
+        jepa_vicreg_weight=args.jepa_vicreg_weight,
+        jepa_mask_mode=args.jepa_mask_mode,
+        jepa_n_seeds=args.jepa_n_seeds,
+        # JEPA v2(2026-06-06)
+        jepa_global_weight=args.jepa_global_weight,
+        jepa_n_reg_tokens=args.jepa_n_reg_tokens,
+        jepa_ratio_start=args.jepa_ratio_start,
+        jepa_ratio_end=args.jepa_ratio_end,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

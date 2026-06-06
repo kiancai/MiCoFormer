@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from micoformer.models.attn_bias import (
     BiasedTransformerEncoder,
@@ -67,10 +68,16 @@ class MiCoFormerEncoder(nn.Module):
         protein_pe_hidden: int = 128,
         protein_pe_dim: Optional[int] = None,  # protein PE 坐标维度;use_protein_pe=True 时必须
         grad_checkpointing: bool = False,       # 激活重算开关(以时间换显存),默认关
+        # JEPA v2 防塌(2026-06-06,T-JEPA register token):n_reg_tokens>0 时,序列**前缀**追加
+        # 这么多可学习 register token,参与 self-attention 但其输出在 forward 末尾被丢弃 —— 不对应
+        # 任何 genus、不被 mask/预测、不进 PMA/loss。默认 0=关(微调/纯 MLM 链路完全不受影响)。
+        # 因 target_encoder = deepcopy(encoder),register param 自然进 EMA 同步,两边共享同一实现。
+        n_reg_tokens: int = 0,
     ) -> None:
         super().__init__()
         self.pad_taxon_id = pad_taxon_id
         self.nhead = nhead
+        self.n_reg_tokens = int(n_reg_tokens)
 
         if bias_type not in _VALID_BIAS_TYPES:
             raise ValueError(
@@ -149,6 +156,14 @@ class MiCoFormerEncoder(nn.Module):
         # 防止模型从 token_id 直接 lookup phylo coord 答案(X2 任务的硬约束)
         # 默认零初始化,跟 abund_mask_token 一致
         self.genus_mask_token = nn.Parameter(torch.zeros(d_model))
+
+        # ============ JEPA v2 Register token(T-JEPA 防塌,2026-06-06) ============
+        # 序列前缀追加 n_reg_tokens 个可学习 token,只参与 attention、输出丢弃(详 forward)。
+        # normal std=0.02(类 ViT register / [CLS]);n_reg_tokens=0 时不创建(微调链路无此参数)。
+        self.reg_tokens: Optional[nn.Parameter] = None
+        if self.n_reg_tokens > 0:
+            self.reg_tokens = nn.Parameter(torch.empty(self.n_reg_tokens, d_model))
+            nn.init.normal_(self.reg_tokens, std=0.02)
 
         # ============ Transformer ============
         biased_layer = BiasedTransformerEncoderLayer(
@@ -357,6 +372,26 @@ class MiCoFormerEncoder(nn.Module):
                 )
             attn_bias = self.dist_bias(var_indices, self.dist_matrix)  # [B, nhead, L, L]
 
+        # ============ JEPA v2 Register token 前缀(2026-06-06) ============
+        # 把 n_reg_tokens 个可学习 register token 拼到序列**最前面**(prefix):
+        #   - x         : [B, n_reg+L, d]      register 行不带 abund/PE,纯可学习 token
+        #   - key_padding: register 列恒 valid(False=不屏蔽)→ genus token 能 attend register
+        #   - attn_bias : 若有(phylo bias),pad register 行/列为 0(register 与任何 token 无 phylo 偏置)
+        # forward 末尾切掉前 n_reg 行还原 [B, L, d] → 下游 target_mask/PMA/predictor 索引零偏移。
+        n_reg = self.n_reg_tokens
+        if n_reg > 0 and self.reg_tokens is not None:
+            B = x.shape[0]
+            reg = self.reg_tokens.view(1, n_reg, -1).expand(B, -1, -1).to(x.dtype)  # [B, n_reg, d]
+            x = torch.cat([reg, x], dim=1)                                          # [B, n_reg+L, d]
+            reg_kpm = torch.zeros(B, n_reg, dtype=key_padding_mask.dtype, device=key_padding_mask.device)
+            key_padding_mask = torch.cat([reg_kpm, key_padding_mask], dim=1)        # register 不屏蔽
+            if attn_bias is not None:
+                # attn_bias [B, nhead, L, L] → pad 成 [B, nhead, n_reg+L, n_reg+L],register 行列填 0
+                attn_bias = F.pad(attn_bias, (n_reg, 0, n_reg, 0), value=0.0)
+
         h = self.encoder(x, key_padding_mask=key_padding_mask, attn_bias=attn_bias)
         h = self.layer_norm(h)
+        # 丢弃 register 输出,还原原始 genus 序列布局(下游索引/池化对齐不被偏移破坏)
+        if n_reg > 0 and self.reg_tokens is not None:
+            h = h[:, n_reg:, :]
         return h

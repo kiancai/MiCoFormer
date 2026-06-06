@@ -91,11 +91,40 @@ class PretrainRunConfig:
     #   protein_w_weight>0 时必须给定
     protein_w_weight: float = 0.0
     protein_dist_path: Optional[str] = None
+    # 对比学习(2026-06-04,InfoNCE,保留 MLM 锚):contrastive_weight>0 开;两视图=同样本两套 abund-mask
+    contrastive_weight: float = 0.0
+    contrastive_temp: float = 0.1
+    contrastive_proj_dim: int = 128
+    contrastive_mask_prob: float = 0.15
+    # JEPA(2026-06-04,潜空间预测被遮 genus 含义向量;详见 pretrain_module + PLAN.md)
+    #   jepa_weight>0 开;target encoder=EMA 副本(看完整),predictor 用被遮 genus 坐标当地址 query。
+    #   红线:坐标只当地址,target 是含义向量非坐标(否则退化成已证伪的 X2_phylo)。
+    #   需 use_phylo_pe/use_protein_pe 提供 coords。
+    #   ⚠️ JEPA 模式 genus_mask_token 闲置(mask_token_id_replace=False)→ 三卡须开
+    #   ddp_find_unused_parameters=True(同纯 MLM 对照)。
+    jepa_weight: float = 0.0
+    jepa_mask_ratio: float = 0.5
+    jepa_mlm_mask_prob: float = 0.15
+    jepa_ema_decay: float = 0.996
+    jepa_pred_dim: int = 256
+    jepa_pred_depth: int = 2
+    jepa_pred_heads: int = 4
+    jepa_vicreg_weight: float = 0.0
+    jepa_mask_mode: str = "structured"      # v2 默认 structured(样本内成簇遮,见 PLAN 结构化 mask)
+    jepa_n_seeds: int = 4                    # structured 时多少种子簇(I-JEPA multi-block;v2 默认 4)
+    # JEPA v2(2026-06-06,删 MLM + 双自监督 + 防塌升级,详 pretrain_module)
+    #   jepa_global_weight : 全局对齐 loss 权重(student PMA vs teacher PMA;默认 0.5)
+    #   jepa_n_reg_tokens  : encoder 前缀 register token 数(T-JEPA 防塌;默认 4)
+    #   jepa_ratio_start/end: structured mask ratio curriculum,按 epoch 线性 start→end(0.3→0.5)
+    jepa_global_weight: float = 0.5
+    jepa_n_reg_tokens: int = 4
+    jepa_ratio_start: float = 0.3
+    jepa_ratio_end: float = 0.5
 
     # 2.1. 模型主体参数
-    d_model: int = 256
-    nhead: int = 8
-    num_layers: int = 6
+    d_model: int = 512          # 2026-06 对齐主线(旧默认 256;模型规模漏传后果严重故对齐 default)
+    nhead: int = 16             # 旧默认 8
+    num_layers: int = 12        # 旧默认 6
     # ff_dim 与 ff_ratio 互斥：指定其中一个，另一个保持 None
     ff_dim: int | None = None      # FeedForward 绝对维度
     ff_ratio: int | None = None    # FeedForward 比例（dim_ff = d_model × ff_ratio）；未指定时走默认 4
@@ -384,6 +413,27 @@ def run_pretrain_once(
         phylo_w_weight=config.phylo_w_weight,
         # Protein Tree-Wasserstein simplified(2026-05-30,phylo_w 镜像)
         protein_w_weight=config.protein_w_weight,
+        # 对比学习(2026-06-04,InfoNCE)
+        contrastive_weight=config.contrastive_weight,
+        contrastive_temp=config.contrastive_temp,
+        contrastive_proj_dim=config.contrastive_proj_dim,
+        contrastive_mask_prob=config.contrastive_mask_prob,
+        # JEPA(2026-06-04,潜空间预测)
+        jepa_weight=config.jepa_weight,
+        jepa_mask_ratio=config.jepa_mask_ratio,
+        jepa_mlm_mask_prob=config.jepa_mlm_mask_prob,
+        jepa_ema_decay=config.jepa_ema_decay,
+        jepa_pred_dim=config.jepa_pred_dim,
+        jepa_pred_depth=config.jepa_pred_depth,
+        jepa_pred_heads=config.jepa_pred_heads,
+        jepa_vicreg_weight=config.jepa_vicreg_weight,
+        jepa_mask_mode=config.jepa_mask_mode,
+        jepa_n_seeds=config.jepa_n_seeds,
+        # JEPA v2(2026-06-06)
+        jepa_global_weight=config.jepa_global_weight,
+        jepa_n_reg_tokens=config.jepa_n_reg_tokens,
+        jepa_ratio_start=config.jepa_ratio_start,
+        jepa_ratio_end=config.jepa_ratio_end,
         n_vars=_n_vars,
         # V5
         abundance_encoding=config.abundance_encoding,
