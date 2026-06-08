@@ -175,6 +175,12 @@ class MiCoFormerModule(L.LightningModule):
         jepa_n_reg_tokens: int = 4,
         jepa_ratio_start: float = 0.3,
         jepa_ratio_end: float = 0.5,
+        # ============ 去批次条件 MLM(2026-06-08;study = Project_ID)============
+        #   use_study_conditioning: 重建头额外加 study_embed[study_id](encoder/PMA 输出**不给** study →
+        #     逼样本级表征不必承载批次,scVI 式条件解码;study_embed 零初始化 = 起步等价纯 MLM、渐进涌现)
+        #   n_studies: study 词表大小(含 UNK=0;由 DataModule.n_studies 透传)
+        use_study_conditioning: bool = False,
+        n_studies: int = 0,
     ) -> None:
         super().__init__()
 
@@ -402,6 +408,18 @@ class MiCoFormerModule(L.LightningModule):
                 nn.GELU(),
                 nn.Linear(jepa_pred_dim, d_model),
             )
+
+        # ============ 去批次条件 MLM(2026-06-08,scVI 式)============
+        # study_embed 只加到重建头输入(_shared_step MLM 分支),encoder/PMA 输出保持 batch-free。
+        # 零初始化:起步 = 无 study bias = 等价纯 MLM,训练中渐进涌现(配 no_decay,见 configure_optimizers)。
+        self.study_embed: Optional[nn.Embedding] = None
+        if use_study_conditioning:
+            if n_studies is None or n_studies <= 0:
+                raise ValueError(
+                    "use_study_conditioning=True requires n_studies > 0 (透传 DataModule.n_studies)."
+                )
+            self.study_embed = nn.Embedding(n_studies, d_model)
+            nn.init.zeros_(self.study_embed.weight)
 
     # ------------------------------------------------------------------
     # forward 与 step 辅助
@@ -641,8 +659,13 @@ class MiCoFormerModule(L.LightningModule):
         mlm_w = float(self.hparams.mlm_weight)
         loss_mlm = torch.zeros((), device=h.device, dtype=h.dtype)
         if mlm_w > 0:
+            # 去批次条件 MLM(2026-06-08):重建头额外加 study bias(study_embed[study_id]),
+            # 只进重建头、不进 encoder/PMA 输出(后者保持 batch-free)。study_embed=None 时退化为纯 MLM。
+            mlm_feat = h_token
+            if self.study_embed is not None and "study_id" in batch:
+                mlm_feat = h_token + self.study_embed(batch["study_id"]).unsqueeze(1)
             if self.hparams.abundance_loss == "huber":
-                pred = self.mlm_head(h_token)               # [B, L]
+                pred = self.mlm_head(mlm_feat)              # [B, L]
                 target = batch["labels_abund_values"]       # [B, L] float32
                 if mask_pos.any():
                     loss_mlm = F.smooth_l1_loss(
@@ -653,7 +676,7 @@ class MiCoFormerModule(L.LightningModule):
                 else:
                     mae = torch.zeros((), device=h.device, dtype=h.dtype)
             else:
-                logits = self.mlm_head(h_token)              # [B, L, num_bins]
+                logits = self.mlm_head(mlm_feat)             # [B, L, num_bins]
                 labels = batch["labels_abund"]               # [B, L] long
                 if mask_pos.any():
                     m_logits = logits[mask_pos]
@@ -1059,6 +1082,7 @@ class MiCoFormerModule(L.LightningModule):
             "encoder.phylo_pe.", "encoder.dist_bias.",
             "jepa_predictor.",          # predictor 别被 WD 压死(检索:predictor 是防塌主力,弱了诱发塌缩)
             "jepa_global_predictor.",   # v2 全局对齐 predictor 同理(防塌主力,不压)
+            "study_embed.",             # 去批次 study bias:零初始化渐进涌现,WD 会压回 0(同 phylo_pe)
         )
         # encoder.reg_tokens(v2 register,ndim==2)默认会进 decay 组;它是类 [CLS] 可学 token,
         # 加进 no_decay_exact 跟 pma.query / mask_token 一致(零初始化偏小,WD 会压回弱化防塌作用)。

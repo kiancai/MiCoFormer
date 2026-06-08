@@ -148,4 +148,18 @@ class MiCoCollator:
             env_labels = torch.as_tensor([int(b["env_label"]) for b in batch], dtype=torch.long)
             batch_out["env_label"] = env_labels  # [B]
 
+        # 去批次:study_id(条件 MLM / study-balanced 对比用)。同 env_label 规则:batch 内全有或全无。
+        has_study = ["study_id" in b for b in batch]
+        if any(has_study):
+            if not all(has_study):
+                missing = sum(1 for x in has_study if not x)
+                raise RuntimeError(
+                    f"MiCoCollator: partial study_id batch ({missing}/{len(batch)} samples missing). "
+                    "All samples must consistently include study_id, or none. "
+                    "Check DataModule wraps Subset with study_ids for every split."
+                )
+            batch_out["study_id"] = torch.as_tensor(
+                [int(b["study_id"]) for b in batch], dtype=torch.long
+            )  # [B]
+
         return batch_out

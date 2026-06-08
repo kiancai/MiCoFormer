@@ -116,6 +116,88 @@ class _EnvLabelWrappedSubset(torch.utils.data.Dataset):
         return item
 
 
+def derive_study_id(project_id_series: pd.Series, min_size: int) -> Tuple[np.ndarray, int]:
+    """Project_ID → 整数 study_id(去批次用)。
+
+    样本数 >= min_size 的 study 各占一个 id(1..K);缺失 / 小尾巴 study → 0=UNK。
+    (实测全语料 Project_ID 0% 缺失、36k study、>=64 的 6k study 覆盖 80%;小尾巴并 UNK,
+     既缩小条件 MLM 的 study 表、又避免给 <min_size 的 study 学不可靠的 embedding。)
+    返回 (study_ids[N] int64, n_studies = K+1)。
+    """
+    s = project_id_series.astype(str)
+    bad = s.isin(["nan", "None", "", "NA", "<NA>"])
+    vc = s[~bad].value_counts()
+    big = sorted(vc[vc >= int(min_size)].index.tolist())
+    mapping = {pid: i + 1 for i, pid in enumerate(big)}        # 1..K;0 留给 UNK
+    ids = s.map(mapping).to_numpy()
+    ids = np.where(np.isnan(ids.astype(np.float64)), 0, ids).astype(np.int64)
+    return ids, len(big) + 1
+
+
+class StudyBalancedBatchSampler(torch.utils.data.Sampler):
+    """CONCORD 式 study-balanced 批采样:每个 batch 主要来自同一个 study(study_id>0),
+    逼对比损失只能靠生物差异区分、把 study 当 nuisance 对比掉;study_id==0(UNK/小 study)
+    的位置走随机混批(它们 <min_size、无法干净同-study,占比小)。每次 __iter__ 重洗。
+
+    study_per_pos: [N_train] 每个 train 位置(0..N_train-1)的 study_id。
+    """
+
+    def __init__(self, study_per_pos, batch_size: int, seed: int = 0, min_batch: int = 2):
+        self.study = np.asarray(study_per_pos, dtype=np.int64)
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.min_batch = int(min_batch)
+        self._epoch = 0
+        self._groups = [np.where(self.study == s)[0] for s in np.unique(self.study)]
+        self._nbatch = sum(
+            1
+            for pos in self._groups
+            for j in range(0, len(pos), self.batch_size)
+            if len(pos[j:j + self.batch_size]) >= self.min_batch
+        )
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self._nbatch
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self._epoch)
+        self._epoch += 1                                        # 每次 __iter__ 自动换种子重洗(兼容无 set_epoch)
+        batches = []
+        for pos in self._groups:
+            p = pos.copy()
+            rng.shuffle(p)
+            for j in range(0, len(p), self.batch_size):
+                b = p[j:j + self.batch_size]
+                if len(b) >= self.min_batch:
+                    batches.append(b.tolist())
+        for k in rng.permutation(len(batches)):
+            yield batches[k]
+
+
+class _LabelWrappedSubset(torch.utils.data.Dataset):
+    """包装 Subset,在 __getitem__ 按需附加 env_label / study_id,不改 AnnDataDataset。"""
+
+    def __init__(self, base_subset: Subset, env_labels=None, study_ids=None) -> None:
+        self.base_subset = base_subset
+        self.env_labels = env_labels
+        self.study_ids = study_ids
+
+    def __len__(self) -> int:
+        return len(self.base_subset)
+
+    def __getitem__(self, i: int) -> Dict[str, Any]:
+        item = self.base_subset[i]
+        global_idx = self.base_subset.indices[i]
+        if self.env_labels is not None:
+            item["env_label"] = int(self.env_labels[global_idx])
+        if self.study_ids is not None:
+            item["study_id"] = int(self.study_ids[global_idx])
+        return item
+
+
 class MiCoDataModule(L.LightningDataModule):
 
     def __init__(
@@ -137,6 +219,13 @@ class MiCoDataModule(L.LightningDataModule):
         abundance_value_transform: str = "rclr_sigma",  # V5 §4.2 present-only 写法（编码消融）
         use_metadata_task: bool = True,         # 是否派生 EnvCategory 并暴露 class_weights
         metadata_cache_dir: Optional[str] = None,  # 默认与 h5ad 同目录，文件名含 h5ad fingerprint
+        # 去批次(2026-06-08;默认全关=与现状等价)。study=Project_ID(唯一全覆盖批次粒度)。
+        #   study_balanced         : train 用 StudyBalancedBatchSampler(每 batch 同一 study,CONCORD 对比用)
+        #   use_study_conditioning : 派生 study_ids + 暴露 n_studies(条件 MLM 头用 study_embed)
+        #   study_min_size         : >= 此样本数的 study 各占一 id,小尾巴并 UNK(0)
+        study_balanced: bool = False,
+        use_study_conditioning: bool = False,
+        study_min_size: int = 64,
     ) -> None:
 
         super().__init__()
@@ -155,6 +244,13 @@ class MiCoDataModule(L.LightningDataModule):
 
         self.use_metadata_task = use_metadata_task
         self.metadata_cache_dir = metadata_cache_dir
+
+        # 去批次(study=Project_ID)。study_ids/n_studies 在 _peek_dataset_meta 里按需派生。
+        self.study_balanced = study_balanced
+        self.use_study_conditioning = use_study_conditioning
+        self.study_min_size = study_min_size
+        self.study_ids: Optional[np.ndarray] = None   # [N_obs] int64,0=UNK
+        self.n_studies: int = 0
 
         self.train_indices = train_indices
         self.val_indices = val_indices
@@ -264,6 +360,21 @@ class MiCoDataModule(L.LightningDataModule):
                         f"cached to {cache_path}"
                     )
                 self.env_class_weights = torch.from_numpy(weights_np)
+
+            # 去批次:派生 study_id(Project_ID),供条件 MLM / study-balanced 采样
+            if self.study_balanced or self.use_study_conditioning:
+                if "Project_ID" not in adata.obs.columns:
+                    raise RuntimeError(
+                        "study_balanced/use_study_conditioning=True 需要 obs['Project_ID'],但语料缺此列。"
+                    )
+                pid = adata.obs["Project_ID"].copy()
+                self.study_ids, self.n_studies = derive_study_id(pid, self.study_min_size)
+                n_unk = int((self.study_ids == 0).sum())
+                rank_zero_info(
+                    f"{TAG} Derived study_id (Project_ID, min_size={self.study_min_size}): "
+                    f"n_studies={self.n_studies} (含 UNK=0), UNK 样本={n_unk}/{len(self.study_ids)} "
+                    f"({100.0 * n_unk / max(1, len(self.study_ids)):.1f}%)"
+                )
         finally:
             # 及时关闭 backed 文件句柄，避免占用文件资源
             if getattr(adata, "file", None) is not None:
@@ -322,15 +433,20 @@ class MiCoDataModule(L.LightningDataModule):
         val_subset   = Subset(base_dataset, list(self.val_indices))   if self.val_indices   is not None else None
         test_subset  = Subset(base_dataset, list(self.test_indices))  if self.test_indices  is not None else None
 
-        # V5: 若启用 metadata 任务,用 _EnvLabelWrappedSubset 在 __getitem__ 时注入 env_label
-        if self.use_metadata_task and self.env_labels is not None:
-            self.train_dataset = _EnvLabelWrappedSubset(train_subset, self.env_labels) if train_subset is not None else None
-            self.val_dataset   = _EnvLabelWrappedSubset(val_subset,   self.env_labels) if val_subset   is not None else None
-            self.test_dataset  = _EnvLabelWrappedSubset(test_subset,  self.env_labels) if test_subset  is not None else None
-        else:
-            self.train_dataset = train_subset
-            self.val_dataset   = val_subset
-            self.test_dataset  = test_subset
+        # 在 __getitem__ 注入 env_label(metadata 任务)和/或 study_id(去批次)。两者按 flag 各自启用。
+        _env = self.env_labels if (self.use_metadata_task and self.env_labels is not None) else None
+        _study = self.study_ids if ((self.study_balanced or self.use_study_conditioning) and self.study_ids is not None) else None
+
+        def _wrap(sub):
+            if sub is None:
+                return None
+            if _env is None and _study is None:
+                return sub
+            return _LabelWrappedSubset(sub, env_labels=_env, study_ids=_study)
+
+        self.train_dataset = _wrap(train_subset)
+        self.val_dataset   = _wrap(val_subset)
+        self.test_dataset  = _wrap(test_subset)
 
         # 打印统计信息
         stats = []
@@ -341,26 +457,32 @@ class MiCoDataModule(L.LightningDataModule):
             rank_zero_info(f"{TAG} Split stats: {', '.join(stats)}")
 
     # DataLoaders 构建
-    def _create_dataloader(self, dataset, shuffle: bool) -> DataLoader:
+    def _create_dataloader(self, dataset, shuffle: bool, batch_sampler=None) -> DataLoader:
         collate_function = MiCoCollator(
             pad_taxon_id=self.special_ids["pad_taxon_id"],
             pad_bin_id=self.special_ids["pad_bin_id"],
             mask_bin_id=self.special_ids["mask_bin_id"],
             mask_prob=self.mask_prob,
         )
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=shuffle,
+        common = dict(
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers and self.num_workers > 0,
             collate_fn=collate_function,
         )
+        if batch_sampler is not None:
+            # batch_sampler 与 batch_size/shuffle/sampler/drop_last 互斥
+            return DataLoader(dataset, batch_sampler=batch_sampler, **common)
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle, **common)
 
     def train_dataloader(self) -> DataLoader:
         if self.train_dataset is None:
             raise RuntimeError("Train dataset is not loaded (train_indices is None).")
+        # 去批次:study-balanced 批采样(每 batch 同一 study);否则普通 shuffle
+        if self.study_balanced and self.study_ids is not None and self.train_indices is not None:
+            study_per_pos = self.study_ids[np.asarray(self.train_indices, dtype=np.int64)]
+            sampler = StudyBalancedBatchSampler(study_per_pos, self.batch_size, seed=0)
+            return self._create_dataloader(self.train_dataset, shuffle=False, batch_sampler=sampler)
         return self._create_dataloader(self.train_dataset, shuffle=True)
 
     def val_dataloader(self) -> DataLoader:

@@ -133,6 +133,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--jepa_ratio_end", type=float, default=0.5,
                    help="JEPA v2 structured mask ratio curriculum 终点(末 epoch;默认 0.5)")
 
+    # 去批次(2026-06-08;study=Project_ID;默认全关=与现状等价)
+    p.add_argument("--study_balanced", action="store_true", default=False,
+                   help="train 用 study-balanced 批采样(每 batch 同一 study,CONCORD 对比用)")
+    p.add_argument("--use_study_conditioning", action="store_true", default=False,
+                   help="条件 MLM 头:study_embed[study_id] 只进重建头(scVI 式),encoder/PMA 输出 batch-free")
+    p.add_argument("--study_min_size", type=int, default=64,
+                   help="样本数 >= 此值的 study 各占一 id,小尾巴并 UNK(0)")
+
     # V5 新增:三段相加 + PMA + metadata 多任务
     p.add_argument("--abundance_encoding", type=str, default="mlp", choices=["mlp", "bin"],
                    help="V5:abundance 输入编码方式;mlp=连续 MLP(默认),bin=旧离散 embedding")
@@ -286,6 +294,10 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         jepa_n_reg_tokens=args.jepa_n_reg_tokens,
         jepa_ratio_start=args.jepa_ratio_start,
         jepa_ratio_end=args.jepa_ratio_end,
+        # 去批次(默认关)
+        study_balanced=args.study_balanced,
+        use_study_conditioning=args.use_study_conditioning,
+        study_min_size=args.study_min_size,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.num_layers,

@@ -121,6 +121,14 @@ class PretrainRunConfig:
     jepa_ratio_start: float = 0.3
     jepa_ratio_end: float = 0.5
 
+    # 去批次(2026-06-08;study=Project_ID;默认全关=与现状等价):
+    #   study_balanced         : train 用 StudyBalancedBatchSampler(每 batch 同一 study,CONCORD 对比用)
+    #   use_study_conditioning : 条件 MLM 头(study_embed[study_id] 只进重建头,scVI 式);透传 dm.n_studies
+    #   study_min_size         : >= 此样本数的 study 各占一 id,小尾巴并 UNK(0)
+    study_balanced: bool = False
+    use_study_conditioning: bool = False
+    study_min_size: int = 64
+
     # 2.1. 模型主体参数
     d_model: int = 512          # 2026-06 对齐主线(旧默认 256;模型规模漏传后果严重故对齐 default)
     nhead: int = 16             # 旧默认 8
@@ -266,6 +274,10 @@ def run_pretrain_once(
         abundance_encoding=config.abundance_encoding,
         abundance_value_transform=config.abundance_value_transform,
         use_metadata_task=config.use_metadata_task,
+        # 去批次(默认关)
+        study_balanced=config.study_balanced,
+        use_study_conditioning=config.use_study_conditioning,
+        study_min_size=config.study_min_size,
     )
 
     # 2. 初始化模型
@@ -434,6 +446,9 @@ def run_pretrain_once(
         jepa_n_reg_tokens=config.jepa_n_reg_tokens,
         jepa_ratio_start=config.jepa_ratio_start,
         jepa_ratio_end=config.jepa_ratio_end,
+        # 去批次条件 MLM(2026-06-08;n_studies 由 DataModule 派生后透传)
+        use_study_conditioning=config.use_study_conditioning,
+        n_studies=dm.n_studies,
         n_vars=_n_vars,
         # V5
         abundance_encoding=config.abundance_encoding,
