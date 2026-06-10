@@ -12,14 +12,22 @@ from torchmetrics.classification import (
     MulticlassAUROC,
 )
 
-from micoformer.models.pretrain_module import MiCoFormerModule
 from micoformer.models.encoder import MiCoFormerEncoder
 from micoformer.models.heads import ClassificationHead
-from micoformer.utils.train_utils import build_lr_scheduler
+from micoformer.models.pma import PMA
+from micoformer.utils.train_utils import build_lr_scheduler, extract_encoder_artifacts_from_ckpt
+
+
+_VALID_FINETUNE_POOLING = {"pma", "mean_pool"}
 
 
 class MiCoFormerClassifier(L.LightningModule):
-    """多任务下游分类 Lightning Module。加载预训练 encoder，冻结或微调。"""
+    """多任务下游分类 Lightning Module。加载预训练 encoder,冻结或微调。
+
+    V5 改动:
+      - pooling_mode 限定 'pma' | 'mean_pool'（删除 'sample' / 'sample_and_mean',它们依赖 [SAMPLE] token,V5 默认无 [SAMPLE]）
+      - pooling_mode='pma' 时从预训练 ckpt 暖启动 PMA 权重(strict=True;失败回退 strict=False + 警告)
+    """
 
     def __init__(
         self,
@@ -27,7 +35,9 @@ class MiCoFormerClassifier(L.LightningModule):
         pretrained_ckpt_path: Optional[str] = None,
         task_configs: List[Dict[str, Any]],
         # 每项形如 {"name": "Phenotype", "num_classes": 2}
-        pooling_mode: str = "mean_pool",
+        pooling_mode: str = "pma",                # V5 默认 pma
+        pma_nhead: Optional[int] = None,           # None → 从 ckpt 继承
+        pma_k: Optional[int] = None,               # None → 从 ckpt 继承
         head_hidden_dim: int = 0,
         head_dropout: float = 0.1,
         freeze_encoder: bool = True,
@@ -40,38 +50,47 @@ class MiCoFormerClassifier(L.LightningModule):
         plateau_patience: int = 2,
         plateau_min_lr: float = 1e-6,
         monitor_metric: str = "val/loss_total",
-        # 从预训练 ckpt 提取的 encoder 架构参数（首次创建时自动填充，存入 hparams 以支持
+        # 从预训练 ckpt 提取的 encoder 架构参数（首次创建时自动填充,存入 hparams 以支持
         # 从微调 ckpt 直接恢复而无需预训练 ckpt 仍在原路径）
         _encoder_hparams: Optional[Dict] = None,
+        # V5: 从预训练 ckpt 提取的 PMA state_dict(首次创建时自动填充,存入 hparams 用于微调恢复)
+        _pma_state_dict: Optional[Dict] = None,
     ) -> None:
         super().__init__()
 
-        if pretrained_ckpt_path is not None:
-            # 首次创建：从预训练 ckpt 提取 encoder 架构参数和权重
-            pretrained_module = MiCoFormerModule.load_from_checkpoint(
-                pretrained_ckpt_path, map_location="cpu"
+        if pooling_mode not in _VALID_FINETUNE_POOLING:
+            raise ValueError(
+                f"V5 finetune pooling_mode must be one of {sorted(_VALID_FINETUNE_POOLING)}, "
+                f"got {pooling_mode!r}. Old 'sample' / 'sample_and_mean' rely on [SAMPLE] token, "
+                "which is removed by default in V5."
             )
-            _encoder_hparams = dict(pretrained_module.hparams)
-            _pretrained_encoder = pretrained_module.encoder
+
+        if pretrained_ckpt_path is not None:
+            # 首次创建:从 ckpt 提取 encoder 架构参数 + encoder/PMA 权重。
+            # helper 自动识别 pretrain(MiCoFormerModule)/ finetune(MiCoFormerClassifier)两种 ckpt,
+            # 后者支持 CC LOO 从 broad finetune ckpt 起跳(见 pipeline.md CC-LOO 段)。
+            _encoder_hparams, _pretrained_encoder_sd, _pma_state_dict = \
+                extract_encoder_artifacts_from_ckpt(pretrained_ckpt_path)
         elif _encoder_hparams is not None:
-            # 从微调 ckpt 恢复：_encoder_hparams 来自已保存的 hparams，
-            # Lightning 将从 state_dict 恢复 encoder 权重
-            _pretrained_encoder = None
+            # 从微调 ckpt 恢复:_encoder_hparams 来自已保存的 hparams,
+            # Lightning 将从 state_dict 恢复 encoder + pma 权重
+            _pretrained_encoder_sd = None
         else:
             raise RuntimeError(
                 "Cannot create MiCoFormerClassifier: provide pretrained_ckpt_path or _encoder_hparams. "
                 "Old checkpoints (before P1-1 fix) require the pretrain ckpt to still be accessible."
             )
 
-        # 保存 hparams（忽略 pretrained_ckpt_path，保留 _encoder_hparams 以支持独立恢复）
-        self.save_hyperparameters(ignore=["pretrained_ckpt_path"])
+        # 保存 hparams（忽略 pretrained_ckpt_path 与 _pma_state_dict;
+        # _pma_state_dict 含 Tensor,不能 YAML 序列化;微调 ckpt 自身的 state_dict
+        # 会包含 self.pma.* 权重,resume 时由 Lightning 直接恢复,无需 hparams 副本）
+        self.save_hyperparameters(ignore=["pretrained_ckpt_path", "_pma_state_dict"])
 
         d_model = _encoder_hparams["d_model"]
 
-        if pooling_mode not in {"sample", "mean_pool", "sample_and_mean"}:
-            raise ValueError(f"Unknown pooling_mode: {pooling_mode}")
-
-        # 从架构参数重建 encoder（无论是首次创建还是从微调 ckpt 恢复）
+        # ============ Encoder ============
+        # 从架构参数重建 encoder(无论是首次创建还是从微调 ckpt 恢复)
+        _bias_type = _encoder_hparams.get("bias_type", "none")
         self.encoder = MiCoFormerEncoder(
             genus_vocab_size=_encoder_hparams["genus_vocab_size"],
             total_abundance_bins=_encoder_hparams["total_abundance_bins"],
@@ -82,15 +101,29 @@ class MiCoFormerClassifier(L.LightningModule):
             dropout=_encoder_hparams.get("dropout", 0.1),
             pad_taxon_id=_encoder_hparams.get("pad_taxon_id", 0),
             pad_bin_id=_encoder_hparams.get("pad_bin_id", 0),
-            token_embedding_mode=_encoder_hparams["token_embedding_mode"],
             rank_vocab_sizes=dict(_encoder_hparams["rank_vocab_sizes"]),
-            use_taxonomy_bias=_encoder_hparams.get("use_taxonomy_bias", False),
-            bias_grad_every_k=_encoder_hparams.get("bias_grad_every_k", 1),
+            bias_type=_bias_type,
+            phylo_mlp_hidden=_encoder_hparams.get("phylo_mlp_hidden", 64),
+            n_vars=_encoder_hparams.get("n_vars", 0) if _bias_type != "none" else None,
+            # V5 flags(从预训练继承)
+            abundance_encoding=_encoder_hparams.get("abundance_encoding", "mlp"),
+            use_phylo_pe=_encoder_hparams.get("use_phylo_pe", True),
+            phylo_pe_hidden=_encoder_hparams.get("phylo_pe_hidden", 128),
+            pe_dim=_encoder_hparams.get("pe_dim", None),
         )
 
-        if _pretrained_encoder is not None:
-            # 首次创建：加载预训练权重
-            self.encoder.load_state_dict(_pretrained_encoder.state_dict())
+        if _pretrained_encoder_sd is not None:
+            # 首次创建:加载预训练 encoder 权重(strict=False 容忍 buffer 差异 / V5 新模块)
+            missing, unexpected = self.encoder.load_state_dict(
+                _pretrained_encoder_sd, strict=False,
+            )
+            if missing or unexpected:
+                import warnings
+                warnings.warn(
+                    f"[MiCoFormerClassifier] encoder load_state_dict non-strict: "
+                    f"missing={missing[:5]}{'...' if len(missing)>5 else ''}, "
+                    f"unexpected={unexpected[:5]}{'...' if len(unexpected)>5 else ''}"
+                )
         # else: Lightning 从微调 ckpt 的 state_dict 恢复 encoder 权重
 
         # 冻结 encoder
@@ -98,11 +131,30 @@ class MiCoFormerClassifier(L.LightningModule):
             for param in self.encoder.parameters():
                 param.requires_grad = False
 
-        # 根据 pooling 模式确定 head 输入维度
-        if pooling_mode == "sample_and_mean":
-            head_input_dim = 2 * d_model
-        else:
-            head_input_dim = d_model
+        # ============ PMA(V5 暖启动)============
+        self.pma: Optional[PMA] = None
+        if pooling_mode == "pma":
+            # 从 ckpt hparams 推断 PMA 参数(若未显式传)
+            ckpt_pma_nhead = _encoder_hparams.get("pma_nhead", None)
+            ckpt_pma_k = _encoder_hparams.get("pma_k", None)
+            actual_pma_nhead = pma_nhead if pma_nhead is not None else (ckpt_pma_nhead or 4)
+            actual_pma_k = pma_k if pma_k is not None else (ckpt_pma_k or 1)
+            self.pma = PMA(d_model=d_model, nhead_pma=actual_pma_nhead, k=actual_pma_k)
+            # 暖启动:加载预训练 PMA 权重
+            if _pma_state_dict is not None:
+                try:
+                    self.pma.load_state_dict(_pma_state_dict, strict=True)
+                except Exception as e:
+                    import warnings
+                    warnings.warn(
+                        f"[MiCoFormerClassifier] PMA strict load_state_dict failed: {e}. "
+                        "Retrying with strict=False."
+                    )
+                    self.pma.load_state_dict(_pma_state_dict, strict=False)
+            # 若 _pma_state_dict 为 None(预训练时没用 PMA),则 PMA 保持随机初始化
+
+        # V5: head 输入维度统一 d_model(无 sample_and_mean)
+        head_input_dim = d_model
 
         # 构建多任务分类 head
         self.heads = nn.ModuleDict()
@@ -148,27 +200,30 @@ class MiCoFormerClassifier(L.LightningModule):
             self.encoder.eval()
 
     def _pool(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """根据 pooling_mode 从 encoder 输出中提取样本表示。"""
+        """根据 pooling_mode 从 encoder 输出中提取样本表示(V5:pma / mean_pool)。
+
+        encoder 输出 h 为 [B, L, d],直接对整个序列做 pool。
+        """
+        h_token = h
+
         mode = self.hparams["pooling_mode"]
-        if mode == "sample":
-            return h[:, 0, :]
+        if mode == "pma":
+            key_padding_mask = ~attention_mask  # True=PAD
+            return self.pma(h_token, key_padding_mask=key_padding_mask)
         elif mode == "mean_pool":
-            # attention_mask [B, L]，h[:, 1:, :] 是 taxon token 部分
             mask = attention_mask.unsqueeze(-1).float()  # [B, L, 1]
-            return (h[:, 1:, :] * mask).sum(1) / mask.sum(1).clamp(min=1)
-        elif mode == "sample_and_mean":
-            mask = attention_mask.unsqueeze(-1).float()
-            mean = (h[:, 1:, :] * mask).sum(1) / mask.sum(1).clamp(min=1)
-            return torch.cat([h[:, 0, :], mean], dim=-1)
+            return (h_token * mask).sum(1) / mask.sum(1).clamp(min=1)
         else:
             raise ValueError(f"Unknown pooling_mode: {mode}")
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        h, _ = self.encoder(
+        h = self.encoder(
             token_ids=batch["token_ids"],
-            abund_bins=batch["abund_bins"],
-            taxon_path_ids=batch["taxon_path_ids"],
             attention_mask=batch["attention_mask"],
+            abund_bins=batch.get("abund_bins"),
+            abund_values=batch.get("abund_values"),
+            mask_positions=None,  # 微调时无 MLM mask
+            var_indices=batch.get("var_indices"),
         )
         pooled = self._pool(h, batch["attention_mask"])
         logits = {name: head(pooled) for name, head in self.heads.items()}
@@ -289,6 +344,22 @@ class MiCoFormerClassifier(L.LightningModule):
             {"params": head_decay, "lr": self.hparams["lr_head"], "weight_decay": self.hparams["weight_decay"]},
             {"params": head_no_decay, "lr": self.hparams["lr_head"], "weight_decay": 0.0},
         ]
+
+        # V5: PMA 是可训练 sample 聚合层(预训练暖启动后仍需微调)
+        # 与 head 同 lr (lr_head),与 encoder 解耦——即使 encoder 冻结,PMA 仍参与训练
+        if self.pma is not None:
+            pma_decay, pma_no_decay = [], []
+            for name, param in self.pma.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if any(nd in name for nd in no_decay_names):
+                    pma_no_decay.append(param)
+                else:
+                    pma_decay.append(param)
+            param_groups.extend([
+                {"params": pma_decay, "lr": self.hparams["lr_head"], "weight_decay": self.hparams["weight_decay"]},
+                {"params": pma_no_decay, "lr": self.hparams["lr_head"], "weight_decay": 0.0},
+            ])
 
         # 非冻结时加入 encoder 参数
         if not freeze_encoder:

@@ -16,8 +16,17 @@ TAG = "[dataset]"
 
 
 # taxonomy path 中使用的标准层级顺序
-RANK_COLUMNS = ("Phylum", "Class", "Order", "Family", "Genus")
+# Domain 列只有 d__Bacteria / d__Archaea 两个有效值，参数量增量可忽略，但补全了 6 级 GG2 路径
+RANK_COLUMNS = ("Domain", "Phylum", "Class", "Order", "Family", "Genus")
 _GENUS_COL_IDX = RANK_COLUMNS.index("Genus")
+
+# V5 §4.2:present-only abundance 数值写法（编码消融旋钮）。rclr_sigma = 现状默认。
+#   rclr_sigma : (log-μ)/σ          —— present-only CLR 再 ÷σ（现状）
+#   rclr       : log-μ              —— present-only CLR，去 σ
+#   rank       : present 内降序排名归一到 (0,1]，丰度越高越接近 1
+#   presence   : 全 1               —— 丢量级（MLM target 退化为常数，慎用）
+#   raw        : 相对丰度原值
+_VALID_VALUE_TRANSFORM = {"rclr_sigma", "rclr", "rank", "presence", "raw"}
 
 
 def _normalize_tax_label(value: Any) -> str:
@@ -34,7 +43,7 @@ def build_taxon_path_ids(
     # 从 adata.var 构建 taxon 的 taxonomy-path id 矩阵。
     # 强制执行严格模式：必须包含所有标准层级列，否则直接报错。
     # 返回:
-    #   - path_ids:        [n_taxa, 5]，顺序为 [Phylum, Class, Order, Family, Genus]
+    #   - path_ids:        [n_taxa, len(RANK_COLUMNS)]，顺序为 RANK_COLUMNS（V5 默认 6 列：Domain..Genus）
     #   - rank_vocab_sizes: 每个 rank 的词表大小（0=PAD，1=UNK，2~=真实值）
     #   - rank_mappings:   每个 rank 的完整 name→ID 字典（含 __PAD__ 和 __UNK__）
     n_taxa = len(var_df.index)
@@ -94,12 +103,27 @@ class AnnDataDataset:
         num_abundance_bins: int = 40,
         min_abundance: float = 4e-6,
         abundance_mode: str = "abs_log_bins",
+        # V5 新增:abundance 编码模式
+        #   "mlp" (默认): 输入侧用连续 MLP 编码 (encoder.abund_mlp);
+        #                 仍然计算 abund_bins(MLM bin 标签兼容路径用,实际只在 abundance_loss='bin_ce' 时被消费)
+        #   "bin":       旧路径,输入侧用 nn.Embedding 查表
+        # 两种模式 __getitem__ 始终返回 abund_values 与 abund_bins(由 collator/module 按 flag 选用)
+        abundance_encoding: str = "mlp",
+        # V5 §4.2:present-only abundance 数值写法（消融旋钮，详见 _VALID_VALUE_TRANSFORM）
+        abundance_value_transform: str = "rclr_sigma",
         backed: Optional[str] = None,
     ) -> None:
         if max_seq_len is not None and max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be > 0 when set, got {max_seq_len}")
         if abundance_mode not in {"abs_log_bins", "rank_bins"}:
             raise ValueError(f"Unknown abundance_mode: {abundance_mode}")
+        if abundance_encoding not in {"mlp", "bin"}:
+            raise ValueError(f"Unknown abundance_encoding: {abundance_encoding}")
+        if abundance_value_transform not in _VALID_VALUE_TRANSFORM:
+            raise ValueError(
+                f"Unknown abundance_value_transform: {abundance_value_transform!r}. "
+                f"Expected {sorted(_VALID_VALUE_TRANSFORM)}."
+            )
 
         # 读取 .h5ad 文件
         self.adata = ad.read_h5ad(h5ad_path, backed=backed)
@@ -117,6 +141,8 @@ class AnnDataDataset:
 
         # 配置参数
         self.abundance_mode = abundance_mode
+        self.abundance_encoding = abundance_encoding
+        self.abundance_value_transform = abundance_value_transform
 
         self.num_abundance_bins = num_abundance_bins   # 用户指定的真实 bin 数（不含 PAD/MASK）
         self.min_abundance = min_abundance
@@ -177,36 +203,76 @@ class AnnDataDataset:
     def __getitem__(self, i: int) -> Dict[str, Any]:
 
         idx, vals = self._row_nonzero(i)
-        
+
         # 处理空样本
         if idx.size == 0:
             taxon_ids = np.empty((0,), dtype=np.int64)
             abund_bins = np.empty((0,), dtype=np.int64)
+            abund_values = np.empty((0,), dtype=np.float32)
             taxon_path_ids = np.empty((0, len(RANK_COLUMNS)), dtype=np.int64)
+            # var_indices 是该 token 在 adata.var 中的行号（0~n_vars-1），
+            # 用于下游按 var 索引查全局矩阵（如 varp['phylo_dist'] / varp['taxo_dist']）
+            var_indices = np.empty((0,), dtype=np.int64)
         else:
             order = np.argsort(-vals)  # 按丰度值降序排列
             idx = idx[order]
             vals = vals[order]
 
+            # V5：per-sample mu/sigma 在“截断之前”用全部非零值算
+            # 这样 max_seq_len 改变时,保留 token 的 abund_values 尺度仍一致
+            # 公式与 design 文档 §2.2 一致：log(vals+ε) → (x - mean)/std
+            log_vals_full = np.log(vals.astype(np.float32) + 1e-10)
+            mu = float(log_vals_full.mean())
+            sigma = float(log_vals_full.std())
+            n_full = int(log_vals_full.shape[0])  # 截断前非零数（rank 归一分母，保截断不变尺度）
+
             # 截断序列到最大长度
             if self.max_seq_len is not None:
                 idx = idx[: self.max_seq_len]
                 vals = vals[: self.max_seq_len]
+                log_vals = log_vals_full[: self.max_seq_len]
+            else:
+                log_vals = log_vals_full
 
             # 两种模式统一用 Genus 列作为 taxon_ids（内容型 ID，语义稳定）
             # ID 约定：0=PAD，1=UNK（genus 无注释），2~=真实 genus
-            taxon_ids = self._rank_ids[idx, _GENUS_COL_IDX]  # shape [L]
-            taxon_path_ids = self._rank_ids[idx]              # shape [L, 5]
+            taxon_ids = self._rank_ids[idx, _GENUS_COL_IDX]   # shape [L]
+            taxon_path_ids = self._rank_ids[idx]               # shape [L, 6]
+            # 携带 var 行号（绝对索引，0~n_vars-1），供下游 phylo/taxo dist 查表
+            var_indices = idx.astype(np.int64)                 # shape [L]
 
             if self.abundance_mode == "abs_log_bins":
                 abund_bins = self._bin_abundance_abs(vals).astype(np.int64)
             else:
                 abund_bins = self._bin_abundance_rank(vals).astype(np.int64)
 
+            # V5 §4.2:按 abundance_value_transform 生成连续 abund_values（present-only）。
+            # 注意:abund_values 同时是 mlp 输入与 huber MLM target（collate 的
+            # labels_abund_values = 其 clone）→ 换写法 = 同时换"喂进去的数"与"重建目标"。
+            t = self.abundance_value_transform
+            if t in ("rclr_sigma", "rclr"):
+                centered = log_vals - mu                       # present-only CLR（去 σ 即 rclr）
+                if t == "rclr":
+                    abund_values = centered.astype(np.float32)
+                elif sigma < 1e-6:                             # 单 taxon 等极端 → 兜底防除零
+                    abund_values = np.zeros_like(log_vals, dtype=np.float32)
+                else:
+                    abund_values = (centered / (sigma + 1e-8)).astype(np.float32)
+            elif t == "rank":
+                # present 内降序排名归一（分母 n_full、保截断不变尺度）；丰度越高越接近 1
+                kept = log_vals.shape[0]
+                abund_values = ((n_full - np.arange(kept)) / float(n_full)).astype(np.float32)
+            elif t == "presence":                             # 丢量级，全 1（MLM 退化，慎用）
+                abund_values = np.ones_like(log_vals, dtype=np.float32)
+            else:                                             # raw：相对丰度原值（截断后）
+                abund_values = vals.astype(np.float32)
+
         return {
             "taxon_ids": taxon_ids,
-            "abund_bins": abund_bins,
-            "taxon_path_ids": taxon_path_ids,  # [L, 5]
+            "abund_bins": abund_bins,           # [L] int64 — bin 标签 / bin 输入路径用
+            "abund_values": abund_values,        # [L] float32 — mlp 输入 / 回归标签用
+            "taxon_path_ids": taxon_path_ids,    # [L, 6]
+            "var_indices": var_indices,          # [L]，var 行号（0~n_vars-1）
             "length": int(taxon_ids.shape[0]),
         }
 

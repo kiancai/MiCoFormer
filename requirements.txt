@@ -1,3 +1,8 @@
 torch==2.6.0
 lightning==2.5.6
 anndata==0.12.10
+torchmetrics==1.9.0
+scipy==1.17.1
+pandas==2.3.3
+scikit-learn==1.8.0
+numpy==1.26.4

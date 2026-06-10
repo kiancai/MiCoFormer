@@ -63,9 +63,14 @@ def build_argparser() -> argparse.ArgumentParser:
                        "示例：--label_values \"Phenotype=Health,Disease\" \"Smoking=Yes,No\""
                    ))
 
-    # 2.1.分类头 / pooling 参数
-    p.add_argument("--pooling_mode", type=str, default="mean_pool",
-                   choices=["sample", "mean_pool", "sample_and_mean"])
+    # 2.1.分类头 / pooling 参数(V5:删除 sample/sample_and_mean)
+    p.add_argument("--pooling_mode", type=str, default="pma",
+                   choices=["pma", "mean_pool"],
+                   help="V5:pma(默认) | mean_pool;sample/sample_and_mean 已删除")
+    p.add_argument("--pma_nhead", type=int, default=None,
+                   help="None=从预训练 ckpt 继承,否则覆盖")
+    p.add_argument("--pma_k", type=int, default=None,
+                   help="None=从预训练 ckpt 继承(默认 1)")
     p.add_argument("--head_hidden_dim", type=int, default=0)          # 0 表示线性分类头，>0 表示 MLP hidden dim
     p.add_argument("--head_dropout", type=float, default=0.1)         # 分类头 dropout
     p.add_argument("--freeze_encoder", type=str2bool, default=False,
@@ -73,7 +78,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # 2.2.数据协议参数
     p.add_argument("--batch_size", type=int, default=32)              # 每个 batch 的样本数
-    p.add_argument("--max_seq_len", type=int, default=1024)           # 每个样本保留的最大物种数 (截断长度)
+    p.add_argument("--max_seq_len", type=int, default=512)            # 同 pretrain:V5 主线一直用 512(cover 97.2%样本);2026-05-29 default 1024→512
 
     # 3.1.微调中的训练主体参数
     p.add_argument("--lr_head", type=float, default=1e-3)             # 分类头学习率
@@ -130,6 +135,8 @@ def _args_to_config(args: argparse.Namespace) -> FinetuneRunConfig:
         h5ad_path=args.h5ad_path,
         pretrained_ckpt=args.pretrained_ckpt,
         pooling_mode=args.pooling_mode,
+        pma_nhead=args.pma_nhead,
+        pma_k=args.pma_k,
         head_hidden_dim=args.head_hidden_dim,
         head_dropout=args.head_dropout,
         freeze_encoder=args.freeze_encoder,

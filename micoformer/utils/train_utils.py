@@ -8,7 +8,11 @@ import numpy as np
 import torch
 
 # 微调合法的 pooling 模式（validate_finetune_config 使用）
-_VALID_POOLING_MODES = frozenset({"sample", "mean_pool", "sample_and_mean"})
+# V5: 微调 pooling 模式只接受 "pma" 与 "mean_pool"（删除 "sample"/"sample_and_mean",依赖已删除的 [SAMPLE] token）
+_VALID_POOLING_MODES = frozenset({"pma", "mean_pool"})
+# 用于预训练 abundance loss / encoding 互斥校验
+_VALID_ABUNDANCE_ENCODING = frozenset({"mlp", "bin"})
+_VALID_ABUNDANCE_LOSS = frozenset({"huber", "bin_ce"})
 
 
 def choose_precision(precision: str) -> str:
@@ -192,6 +196,62 @@ def build_lr_scheduler(
     raise ValueError(f"Unknown scheduler_type: {scheduler_type!r}")
 
 
+def inject_var_buffers(
+    encoder, dist_matrix=None, pe_coords_raw=None, protein_pe_coords_raw=None,
+    protein_dist_matrix=None,
+) -> None:
+    """统一注入 encoder 的 var-level buffer:
+       dist_matrix(R2)+ phylo_pe.coords(V5 PE)+ protein_pe.coords(X2 phase 2)
+       + protein_dist_matrix(protein_w loss,2026-05-30)。
+
+    都是 persistent=False,不进 ckpt,所以每次创建/恢复 model 都必须重新注入。
+    - dist_matrix:[V, V],仅当 encoder.bias_type != 'none' 时注入
+    - pe_coords_raw:[V_real, pe_dim],仅当 encoder.phylo_pe 存在时注入(set_coords 会前置 PAD/UNK)
+    - protein_pe_coords_raw:[V_real, protein_pe_dim],仅当 encoder.protein_pe 存在时注入
+    - protein_dist_matrix:[V_real, V_real],仅当 encoder.protein_dist_matrix buffer 存在时注入
+    """
+    # 2026-05-29:dist_matrix 注入条件改为基于 encoder buffer 是否存在(不基于 bias_type),
+    # 因为 phylo_ce loss 也需要 dist_matrix 即使 bias_type='none'
+    if dist_matrix is not None and getattr(encoder, "dist_matrix", None) is not None:
+        encoder.set_dist_matrix(dist_matrix)
+    if pe_coords_raw is not None and getattr(encoder, "phylo_pe", None) is not None:
+        encoder.phylo_pe.set_coords(pe_coords_raw)
+    if protein_pe_coords_raw is not None and getattr(encoder, "protein_pe", None) is not None:
+        encoder.protein_pe.set_coords(protein_pe_coords_raw)
+    # 2026-05-30:protein_w loss 用的蛋白距离矩阵(镜像 dist_matrix)
+    if protein_dist_matrix is not None and getattr(encoder, "protein_dist_matrix", None) is not None:
+        encoder.set_protein_dist_matrix(protein_dist_matrix)
+
+
+def extract_encoder_artifacts_from_ckpt(ckpt_path):
+    """从 pretrain(MiCoFormerModule)或 finetune(MiCoFormerClassifier)ckpt 提取
+    encoder 复用三件套:(encoder_hparams, encoder_state_dict, pma_state_dict_or_None)。
+
+    自动识别 ckpt 类型:
+      - hparams 顶层有 'genus_vocab_size'  → pretrain ckpt,hparams 即 encoder_hparams
+      - hparams 顶层有 '_encoder_hparams'    → finetune ckpt,从该嵌套 dict 取
+    两种 ckpt 的 state_dict 都用 'encoder.' / 'pma.' 前缀,统一剥前缀。
+
+    直接 torch.load 读 ckpt,不走 Lightning load_from_checkpoint,
+    避免"必须能 instantiate model"的限制(finetune ckpt 无法当 pretrain module 加载)。
+    """
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    hp = raw.get("hyper_parameters", {})
+    sd = raw.get("state_dict", {})
+    if "genus_vocab_size" in hp:
+        encoder_hparams = dict(hp)                        # pretrain ckpt
+    elif hp.get("_encoder_hparams"):
+        encoder_hparams = dict(hp["_encoder_hparams"])    # finetune ckpt
+    else:
+        raise ValueError(
+            f"Cannot identify ckpt type (hparams has neither 'genus_vocab_size' "
+            f"nor '_encoder_hparams'): {ckpt_path}"
+        )
+    encoder_sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
+    pma_sd = {k[len("pma."):]: v for k, v in sd.items() if k.startswith("pma.")}
+    return encoder_hparams, encoder_sd, (pma_sd or None)
+
+
 def str2bool(v: str) -> bool:
     """argparse type= 辅助：支持 true/false/yes/no/1/0（大小写不敏感）。"""
     if v.lower() in ("yes", "true", "1"):
@@ -289,6 +349,34 @@ def validate_pretrain_config(config: Any) -> None:
 
     # 共享的 budget/scheduler 检验
     validate_budget_and_lr_config(config)
+
+    # ----- V5 新增互斥校验(若 config 含对应字段) -----
+    _abund_enc = getattr(config, "abundance_encoding", None)
+    _abund_loss = getattr(config, "abundance_loss", None)
+    if _abund_enc is not None and _abund_enc not in _VALID_ABUNDANCE_ENCODING:
+        raise ValueError(
+            f"abundance_encoding must be one of {sorted(_VALID_ABUNDANCE_ENCODING)}, got {_abund_enc!r}."
+        )
+    if _abund_loss is not None and _abund_loss not in _VALID_ABUNDANCE_LOSS:
+        raise ValueError(
+            f"abundance_loss must be one of {sorted(_VALID_ABUNDANCE_LOSS)}, got {_abund_loss!r}."
+        )
+    if _abund_enc and _abund_loss:
+        if _abund_enc == "mlp" and _abund_loss != "huber":
+            raise ValueError("abundance_encoding='mlp' must pair with abundance_loss='huber'.")
+        if _abund_enc == "bin" and _abund_loss != "bin_ce":
+            raise ValueError("abundance_encoding='bin' must pair with abundance_loss='bin_ce'.")
+
+    _pooling = getattr(config, "pooling_mode", None)
+    if _pooling is not None and _pooling not in {"pma", "mean_pool"}:
+        raise ValueError(
+            f"pretrain pooling_mode must be 'pma' or 'mean_pool', got {_pooling!r}."
+        )
+
+    if getattr(config, "use_metadata_task", False):
+        ml_weight = getattr(config, "metadata_loss_weight", None)
+        if ml_weight is not None and ml_weight < 0:
+            raise ValueError(f"metadata_loss_weight must be >= 0, got {ml_weight}.")
 
 
 def validate_finetune_config(config: Any) -> None:
