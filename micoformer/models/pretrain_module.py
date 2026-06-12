@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -162,6 +163,10 @@ class MiCoFormerModule(L.LightningModule):
         # 红线:坐标当"出题人/脚手架"(决定遮哪片),非被拟合的答案。
         jepa_mask_mode: str = "structured",
         jepa_n_seeds: int = 4,
+        # address query 用什么定位被遮 genus(2026-06-09):
+        #   'coords' = phylo/protein 坐标(历史;已证 phylo/protein 是"错的图"——进化/序列 ≠ 行为共变)
+        #   'genus'  = 被遮菌的 genus embedding 身份(Cell-JEPA 式;吃数据驱动的菌间共变结构,不用错图)
+        jepa_addr_mode: str = "coords",
         # ============ JEPA v2(2026-06-06,删 MLM + 双自监督 + 防塌升级)============
         # 依据 Point-JEPA(无序点云+坐标,最同构)/ I-JEPA / T-JEPA。删 MLM 锚后换 3 重防塌:
         #   ① global align(teacher PMA 池化 + LN + EMA detach,样本级潜空间预测)
@@ -175,6 +180,23 @@ class MiCoFormerModule(L.LightningModule):
         jepa_n_reg_tokens: int = 4,
         jepa_ratio_start: float = 0.3,
         jepa_ratio_end: float = 0.5,
+        # ============ JEPA v3(2026-06-11,全盘抄 GeneJEPA set 级范式)============
+        # jepa_setlevel : 开启纯 set 级 JEPA(GeneJEPA 式) —— student 看 context→PMA→z_s;
+        #   teacher(EMA)**只看 target 子集**→PMA→z_t(detach+LN);global_predictor(z_s) 对齐 z_t。
+        #   砍 token 级 predictor 路径(v1/v2 token-JEPA 已证失败);jepa_weight 当主 loss 权重。
+        # jepa_loss_type : 'cosine'(GeneJEPA 式,默认)| 'mse'(I-JEPA 式)
+        # jepa_ema_end   : EMA cosine 调度终点(GeneJEPA 0.9995;起点用 jepa_ema_decay=0.996)
+        # jepa_ema_warmup_steps : 前 N 步 teacher 冻结不更新(GeneJEPA=2000;0=不 warmup)
+        # jepa_student_vicreg_weight : student z_s 的 VICReg 权重(GeneJEPA 在 student_ctx 也加一遍防塌)
+        jepa_setlevel: bool = False,
+        jepa_loss_type: str = "cosine",
+        jepa_ema_end: float = 0.9995,
+        jepa_ema_warmup_steps: int = 0,
+        jepa_student_vicreg_weight: float = 0.0,
+        # jepa_predict_residual : token 级 JEPA target 减样本全局中心(predict residual,2026-06-11)
+        #   逼模型预测"被遮菌相对样本整体的偏差"——铲掉"看整体组成"捷径(ep0/ep1 诊断坐实模型停均值档),
+        #   残差只能靠相关邻居预测 = 强制学菌间共变(verify_sigma 证实结构存在但 JEPA 没学到)。
+        jepa_predict_residual: bool = False,
         # ============ 去批次条件 MLM(2026-06-08;study = Project_ID)============
         #   use_study_conditioning: 重建头额外加 study_embed[study_id](encoder/PMA 输出**不给** study →
         #     逼样本级表征不必承载批次,scVI 式条件解码;study_embed 零初始化 = 起步等价纯 MLM、渐进涌现)
@@ -286,7 +308,7 @@ class MiCoFormerModule(L.LightningModule):
         # forward 也不被 optimizer 更新,但占显存 + 进 ckpt 状态)。现修复让 PMA 跟 metadata 同生死。
         # 2026-06-06 JEPA v2:全局对齐(jepa_global_weight>0)也用 PMA 池化 student/teacher,
         #   故 JEPA global 开启时同样创建 PMA(MLM-free 范式下 use_metadata_task=False 也要有)。
-        _pma_needed = use_metadata_task or (jepa_weight > 0 and jepa_global_weight > 0)
+        _pma_needed = use_metadata_task or (jepa_weight > 0 and jepa_global_weight > 0) or (jepa_weight > 0 and jepa_setlevel)
         self.pma: Optional[PMA] = None
         if pooling_mode == "pma" and _pma_needed:
             self.pma = PMA(d_model=d_model, nhead_pma=pma_nhead, k=pma_k)
@@ -381,13 +403,17 @@ class MiCoFormerModule(L.LightningModule):
             self.target_encoder = copy.deepcopy(self.encoder)
             for p in self.target_encoder.parameters():
                 p.requires_grad_(False)
+        # token 级 predictor 仅非 setlevel(旧 v1/v2 token-JEPA)创建;setlevel 砍掉(避免 DDP unused)
+        if jepa_weight > 0 and not jepa_setlevel:
+            _addr_genus = (jepa_addr_mode == "genus")
             self.jepa_predictor = JEPAPredictor(
                 d_model=d_model,
                 pred_dim=jepa_pred_dim,
                 depth=jepa_pred_depth,
                 nhead=jepa_pred_heads,
-                phylo_pe_dim=(pe_dim if use_phylo_pe else None),
-                protein_pe_dim=(protein_pe_dim if use_protein_pe else None),
+                # genus 模式用身份地址,不建坐标投影(避免无用参数 / DDP unused)
+                phylo_pe_dim=(pe_dim if (use_phylo_pe and not _addr_genus) else None),
+                protein_pe_dim=(protein_pe_dim if (use_protein_pe and not _addr_genus) else None),
             )
 
         # ============ JEPA v2 全局对齐 predictor(2026-06-06) ============
@@ -396,17 +422,22 @@ class MiCoFormerModule(L.LightningModule):
         # (teacher 看完整样本、EMA detach)。红线:target 是 teacher 含义池化向量,非坐标。
         # 注意:全局对齐需要 PMA(student / teacher 都用 self.pma 池化);若 pma 不存在则 __init__ raise。
         self.jepa_global_predictor: Optional[nn.Module] = None
-        if jepa_weight > 0 and jepa_global_weight > 0:
+        if jepa_weight > 0 and (jepa_global_weight > 0 or jepa_setlevel):
             if self.pma is None:
                 raise ValueError(
-                    "jepa_global_weight>0 requires PMA pooling (self.pma) for sample-level "
-                    "alignment, but self.pma is None. Use pooling_mode='pma' + use_metadata_task=True, "
-                    "or set jepa_global_weight=0."
+                    "jepa_global_weight>0 / jepa_setlevel requires PMA pooling (self.pma) for "
+                    "sample-level alignment, but self.pma is None. Use pooling_mode='pma' + "
+                    "(use_metadata_task or jepa_setlevel), or set jepa_global_weight=0."
                 )
+            # BYOL/GeneJEPA 式 predictor:带 LN(防塌)+ 窄 bottleneck;student 侧非对称(teacher 无 predictor)
+            # 结尾 LN:稳住 pred_g 范数(≈√d),防 cosine 梯度含 1/‖pred‖ 在范数→0 时爆 NaN
             self.jepa_global_predictor = nn.Sequential(
+                nn.LayerNorm(d_model),
                 nn.Linear(d_model, jepa_pred_dim),
                 nn.GELU(),
+                nn.LayerNorm(jepa_pred_dim),
                 nn.Linear(jepa_pred_dim, d_model),
+                nn.LayerNorm(d_model),
             )
 
         # ============ 去批次条件 MLM(2026-06-08,scVI 式)============
@@ -533,20 +564,29 @@ class MiCoFormerModule(L.LightningModule):
         self._target_buffers_synced = True
 
     def _ema_decay_now(self) -> float:
-        """EMA 衰减 linear ramp:jepa_ema_decay(0.996)→ 1.0,贯穿整个训练(I-JEPA)。"""
+        """EMA 衰减调度:setlevel(GeneJEPA)用 cosine ramp jepa_ema_decay(0.996)→jepa_ema_end(0.9995);
+        否则 linear ramp jepa_ema_decay→1.0(I-JEPA)。"""
         base = float(self.hparams.jepa_ema_decay)
         try:
             total = max(1, int(self.trainer.estimated_stepping_batches))
         except Exception:
             total = 1
         frac = min(1.0, float(self.global_step) / total)
+        if getattr(self.hparams, "jepa_setlevel", False):
+            # GeneJEPA 式 cosine ramp:frac=0→base, frac=1→end(train.py:421-424 同式)
+            end = min(float(self.hparams.jepa_ema_end), 0.9999)
+            return end - (end - base) * (math.cos(math.pi * frac) + 1.0) / 2.0
         return base + (1.0 - base) * frac
 
     @torch.no_grad()
     def _ema_update_target(self) -> None:
-        """EMA 更新 target_encoder 参数(coords buffer 由 _sync_target_buffers 处理,不参与 EMA)。"""
+        """EMA 更新 target_encoder 参数(coords buffer 由 _sync_target_buffers 处理,不参与 EMA)。
+        setlevel warmup:前 jepa_ema_warmup_steps 步 teacher 冻结(GeneJEPA;先让 student 跑起来)。"""
         if self.target_encoder is None:
             return
+        warmup = int(getattr(self.hparams, "jepa_ema_warmup_steps", 0))
+        if warmup > 0 and self.global_step < warmup:
+            return                              # warmup 期 teacher 冻结不更新
         decay = self._ema_decay_now()
         for p_ctx, p_tgt in zip(self.encoder.parameters(), self.target_encoder.parameters()):
             p_tgt.mul_(decay).add_(p_ctx.detach(), alpha=1.0 - decay)
@@ -579,14 +619,34 @@ class MiCoFormerModule(L.LightningModule):
         """
         am = batch["attention_mask"]
         ratio = self._jepa_ratio_now()            # v2:动态 ratio(curriculum)
-        if getattr(self.hparams, "jepa_mask_mode", "random") == "structured":
-            target_mask = self._jepa_structured_target(batch["token_ids"], am, ratio)
+        mask_mode = getattr(self.hparams, "jepa_mask_mode", "random")
+        if mask_mode.startswith("structured"):
+            target_mask = self._jepa_structured_target(
+                batch["token_ids"],
+                am,
+                ratio,
+                abund_values=batch.get("abund_values"),
+                mode=mask_mode,
+            )
         else:
             target_mask = (torch.rand(am.shape, device=am.device) < ratio) & am
         ctx_mask = am & ~target_mask
-        # 防 context 全空(整样本被选成 target):该样本回退为全 context(不出 target)
-        empty_ctx = ~ctx_mask.any(dim=1, keepdim=True)
-        target_mask = target_mask & ~empty_ctx
+        # 兜底:每个有效样本必须既有 context 又有 target —— setlevel teacher 看 target 子集,
+        #   任一为空 → encoder 对全屏蔽样本 attention softmax 全 -inf → NaN(2026-06-11 修)。
+        valid_row = am.any(dim=1)
+        no_tgt = valid_row & ~target_mask.any(dim=1)          # 有效但无 target
+        if no_tgt.any():
+            sc = torch.rand(am.shape, device=am.device).masked_fill(~am, -1.0)
+            pick = sc.argmax(1)                               # 每样本随机选 1 个有效位置
+            rows = torch.nonzero(no_tgt, as_tuple=False).flatten()
+            target_mask[rows, pick[rows]] = True
+        ctx_mask = am & ~target_mask
+        no_ctx = valid_row & ~ctx_mask.any(dim=1)             # 有效但无 context(target 占满)
+        if no_ctx.any():
+            sc = torch.rand(am.shape, device=am.device).masked_fill(~target_mask, -1.0)
+            pick = sc.argmax(1)                               # 从 target 里挪 1 个回 context
+            rows = torch.nonzero(no_ctx, as_tuple=False).flatten()
+            target_mask[rows, pick[rows]] = False
         ctx_mask = am & ~target_mask
         # MLM 锚(v2:mlm_weight==0 时彻底关掉,jepa_mlm_mask_prob 失效;>0 才寄生)
         if float(self.hparams.mlm_weight) > 0:
@@ -599,18 +659,28 @@ class MiCoFormerModule(L.LightningModule):
         ctx_batch["mask_positions"] = abund_mask
         return ctx_batch, {"target_mask": target_mask, "ctx_mask": ctx_mask, "full_mask": am}
 
-    def _jepa_structured_target(self, token_ids, am, ratio):
+    def _jepa_structured_target(self, token_ids, am, ratio, abund_values=None, mode="structured"):
         """结构化 mask(糙版):按 phylo/protein 坐标成簇遮——多种子,每种子遮样本内最近一撮。
         样本内现算坐标距离(坐标已在 encoder buffer,零注入);phylo/protein 每 batch 随机交替。
-        见 PLAN.md"结构化 mask"。坐标当"出题人/脚手架"(决定遮哪片),非被拟合答案(红线)。"""
+        见 PLAN.md"结构化 mask"。坐标当"出题人/脚手架"(决定遮哪片),非被拟合答案(红线)。
+
+        structured_hi*:2026-06-11 新诊断分支。seed 不再随机抽,而从样本内高丰度 token
+        开始,再沿 phylo/protein 邻域扩成 multi-block。目的:让结构化 mask 遮到 pooled 表征
+        真正在乎的主导菌群,同时仍不把 phylo/protein 当 target/loss。
+        """
         B, L = am.shape
         device = am.device
         n_seeds = max(1, int(getattr(self.hparams, "jepa_n_seeds", 3)))
         # phylo/protein 交替(每 batch 随机选一个坐标源;便宜门显示 protein 更成簇)
-        use_protein = bool(
-            self.hparams.use_protein_pe and self.encoder.protein_pe is not None
-            and (torch.rand(1).item() < 0.5)
-        )
+        if mode.endswith("_phylo"):
+            use_protein = False
+        elif mode.endswith("_protein"):
+            use_protein = True
+        else:
+            use_protein = bool(
+                self.hparams.use_protein_pe and self.encoder.protein_pe is not None
+                and (torch.rand(1).item() < 0.5)
+            )
         pe = self.encoder.protein_pe if use_protein else self.encoder.phylo_pe
         if pe is None or not getattr(pe, "_coords_loaded", False):
             return (torch.rand(am.shape, device=device) < ratio) & am   # 坐标没加载 → 回退随机
@@ -621,9 +691,16 @@ class MiCoFormerModule(L.LightningModule):
         target_total = (ratio * n_valid.float()).long().clamp(min=1)
         per_seed = (target_total.float() / n_seeds).ceil().long().clamp(min=1)  # [B] 每簇遮几个
         target_mask = torch.zeros_like(am)
-        for _ in range(n_seeds):
-            seed_score = torch.rand(B, L, device=device).masked_fill(~am, -1.0)
-            seed = seed_score.argmax(1)                                  # [B] 每样本随机有效种子
+        high_abund_seed = mode.startswith("structured_hi") and abund_values is not None
+        if high_abund_seed:
+            # rclr_sigma 可正可负,但排序仍表示样本内相对主导程度。每个 seed 取下一高丰度 token。
+            seed_order = abund_values.float().masked_fill(~am, -1e9).argsort(dim=1, descending=True)
+        for seed_i in range(n_seeds):
+            if high_abund_seed:
+                seed = seed_order[:, min(seed_i, L - 1)]
+            else:
+                seed_score = torch.rand(B, L, device=device).masked_fill(~am, -1.0)
+                seed = seed_score.argmax(1)                                  # [B] 每样本随机有效种子
             Dseed = D.gather(1, seed.view(B, 1, 1).expand(B, 1, L)).squeeze(1)  # [B, L] 到种子距离
             rank = Dseed.argsort(1).argsort(1)                           # [B, L] 距种子名次(0=种子自己)
             target_mask = target_mask | ((rank < per_seed.view(B, 1)) & am)    # 最近 per_seed 个
@@ -911,7 +988,61 @@ class MiCoFormerModule(L.LightningModule):
         # 红线:坐标只当地址 query,target = EMA target encoder 看完整样本的含义向量(LN + stop-grad)。
         # h_token 是 context forward(target 屏蔽)的输出;predictor 在 target 位置用坐标 query 预测。
         # v2 双自监督:per-token JEPA(loss_jepa)+ 全局对齐(loss_jepa_global,student/teacher PMA)。
-        if jepa_on:
+        # ============ JEPA v3 set 级(2026-06-11,全盘抄 GeneJEPA)============
+        # student 看 context(h_token)→PMA→z_s;teacher(EMA)**只看 target 子集**→PMA→z_t(LN+detach);
+        #   global_predictor(z_s) cosine 对齐 z_t。无坐标地址、无 token 级 predictor(v1/v2 已证失败)。
+        if jepa_on and self.hparams.jepa_setlevel:
+            jepa_w = float(self.hparams.jepa_weight)
+            target_mask = jepa_ctx["target_mask"]
+            ctx_mask = jepa_ctx["ctx_mask"]
+            d_m = h_token.shape[-1]
+            # student:context 池化(h_token=context forward 输出,target 已屏蔽)
+            z_s = self._pool(h_token, ctx_mask)                       # [B, d]
+            # teacher(EMA, no_grad):只让 target 子集可见 → 池化 → LN + detach(零泄露:teacher 没看 context)
+            with torch.no_grad():
+                h_tgt_raw = self.target_encoder(
+                    token_ids=orig_batch["token_ids"],
+                    attention_mask=target_mask,
+                    abund_bins=orig_batch.get("abund_bins"),
+                    abund_values=orig_batch.get("abund_values"),
+                    mask_positions=None,
+                    var_indices=orig_batch.get("var_indices"),
+                    mask_token_id_replace=False,
+                )
+                z_t = self._pool(h_tgt_raw.to(h_token.dtype), target_mask)
+                z_t = F.layer_norm(z_t.float(), (d_m,)).to(h_token.dtype)
+            z_s_ln = F.layer_norm(z_s.float(), (d_m,)).to(h_token.dtype)
+            pred_g = self.jepa_global_predictor(z_s_ln)               # BYOL/GeneJEPA predictor(带 LN)
+            if self.hparams.jepa_loss_type == "cosine":
+                # GeneJEPA 式稳健 cosine:显式 normalize(eps=1e-6,比 cosine_similarity 的 1e-8 稳)
+                p_n = F.normalize(pred_g.float(), dim=-1, eps=1e-6)
+                t_n = F.normalize(z_t.detach().float(), dim=-1, eps=1e-6)
+                loss_jepa = (1.0 - (p_n * t_n).sum(dim=-1)).mean().to(h_token.dtype)
+            else:
+                loss_jepa = F.mse_loss(pred_g, z_t.detach())
+            total_loss = total_loss + jepa_w * loss_jepa
+            self.log(f"{stage}/loss_jepa", loss_jepa,
+                     prog_bar=True, on_step=(stage == "train"), on_epoch=True, sync_dist=(stage == "val"))
+            # 防塌 VICReg(GeneJEPA 起步就开):predictor 输出 + student z_s 各加 var+cov
+            vw = float(self.hparams.jepa_vicreg_weight)
+            if vw > 0:
+                var_p, cov_p = self._vicreg_var_cov(pred_g.float())
+                total_loss = total_loss + vw * (var_p + cov_p).to(h.dtype)
+                self.log(f"{stage}/loss_jepa_var", var_p, on_step=(stage == "train"), on_epoch=True, sync_dist=(stage == "val"))
+                self.log(f"{stage}/loss_jepa_cov", cov_p, on_step=(stage == "train"), on_epoch=True, sync_dist=(stage == "val"))
+            vw_s = float(self.hparams.jepa_student_vicreg_weight)
+            if vw_s > 0:
+                var_s, cov_s = self._vicreg_var_cov(z_s_ln.float())
+                total_loss = total_loss + vw_s * (var_s + cov_s).to(h.dtype)
+            # 防塌监控:teacher 池化向量每维 std(→0=塌)+ 有效秩(→1=维度塌)
+            with torch.no_grad():
+                _tgt_std = z_t.detach().float().std(dim=0).mean()
+                _eff_rank = self._effective_rank(z_t.detach().float())
+            self.log(f"{stage}/global_tgt_std", _tgt_std, prog_bar=True, on_step=(stage == "train"), on_epoch=True, sync_dist=(stage == "val"))
+            self.log(f"{stage}/jepa_eff_rank", _eff_rank, prog_bar=True, on_step=(stage == "train"), on_epoch=True, sync_dist=(stage == "val"))
+
+        # ---- 旧 token 级 + global(v1/v2;jepa_setlevel=False 时走这里,保留对照)----
+        if jepa_on and not self.hparams.jepa_setlevel:
             jepa_w = float(self.hparams.jepa_weight)
             am = jepa_ctx["full_mask"]
             target_mask = jepa_ctx["target_mask"]
@@ -926,18 +1057,32 @@ class MiCoFormerModule(L.LightningModule):
                     var_indices=orig_batch.get("var_indices"),
                     mask_token_id_replace=False,
                 )
+                # predict residual(2026-06-11):target 减样本全局中心 → 预测被遮菌相对整体的偏差。
+                #   铲掉"看整体组成"捷径(ep0/ep1 诊断 shuf/norm≈1.05→1.10=模型停均值档,没学共变);
+                #   残差只编码"该菌偏离样本中心多少",只能靠相关邻居推断。全局用 valid token 均值(detach)。
+                if self.hparams.jepa_predict_residual:
+                    _m = am.unsqueeze(-1).to(h_tgt_raw.dtype)            # [B, L, 1] valid mask
+                    _g = (h_tgt_raw * _m).sum(1, keepdim=True) / _m.sum(1, keepdim=True).clamp(min=1.0)
+                    h_tgt_raw = h_tgt_raw - _g                          # [B, L, d] 减样本全局 → 残差
                 # target 归一化(parameter-free LN,I-JEPA/data2vec):稳定回归尺度
                 h_tgt = F.layer_norm(h_tgt_raw.float(), (h_tgt_raw.shape[-1],)).to(h_token.dtype)
-            # 坐标地址 query(frozen coords;红线:地址不是答案)
-            phylo_coords = (
-                self.encoder.phylo_pe.coords[orig_batch["token_ids"]]
-                if (self.hparams.use_phylo_pe and self.encoder.phylo_pe is not None) else None
-            )
-            protein_coords = (
-                self.encoder.protein_pe.coords[orig_batch["token_ids"]]
-                if (self.hparams.use_protein_pe and self.encoder.protein_pe is not None) else None
-            )
-            pred = self.jepa_predictor(h_token, target_mask, am, phylo_coords, protein_coords)
+            # 地址 query(红线:地址不是答案,target 才是 EMA 含义向量)
+            if self.hparams.jepa_addr_mode == "genus":
+                # Cell-JEPA 式:用被遮菌的 genus embedding 身份当地址(吃数据驱动菌间共变,不用 phylo/protein 错图)
+                # detach = frozen 身份地址(沿用"地址不可学"精神);genus_embed 仍经 encoder 路径更新
+                genus_query = self.encoder.genus_embed(orig_batch["token_ids"]).detach()
+                phylo_coords = protein_coords = None
+            else:
+                genus_query = None
+                phylo_coords = (
+                    self.encoder.phylo_pe.coords[orig_batch["token_ids"]]
+                    if (self.hparams.use_phylo_pe and self.encoder.phylo_pe is not None) else None
+                )
+                protein_coords = (
+                    self.encoder.protein_pe.coords[orig_batch["token_ids"]]
+                    if (self.hparams.use_protein_pe and self.encoder.protein_pe is not None) else None
+                )
+            pred = self.jepa_predictor(h_token, target_mask, am, phylo_coords, protein_coords, genus_query)
             if target_mask.any():
                 loss_jepa = F.mse_loss(pred[target_mask], h_tgt[target_mask].detach())
             else:

@@ -111,6 +111,7 @@ class PretrainRunConfig:
     jepa_pred_heads: int = 4
     jepa_vicreg_weight: float = 0.0
     jepa_mask_mode: str = "structured"      # v2 默认 structured(样本内成簇遮,见 PLAN 结构化 mask)
+    jepa_addr_mode: str = "coords"          # 'coords'(历史,phylo/protein 错图) | 'genus'(Cell-JEPA 身份地址,2026-06-09)
     jepa_n_seeds: int = 4                    # structured 时多少种子簇(I-JEPA multi-block;v2 默认 4)
     # JEPA v2(2026-06-06,删 MLM + 双自监督 + 防塌升级,详 pretrain_module)
     #   jepa_global_weight : 全局对齐 loss 权重(student PMA vs teacher PMA;默认 0.5)
@@ -120,6 +121,13 @@ class PretrainRunConfig:
     jepa_n_reg_tokens: int = 4
     jepa_ratio_start: float = 0.3
     jepa_ratio_end: float = 0.5
+    # JEPA v3(2026-06-11,set 级,全盘抄 GeneJEPA)
+    jepa_setlevel: bool = False
+    jepa_loss_type: str = "cosine"
+    jepa_ema_end: float = 0.9995
+    jepa_ema_warmup_steps: int = 0
+    jepa_student_vicreg_weight: float = 0.0
+    jepa_predict_residual: bool = False
 
     # 去批次(2026-06-08;study=Project_ID;默认全关=与现状等价):
     #   study_balanced         : train 用 StudyBalancedBatchSampler(每 batch 同一 study,CONCORD 对比用)
@@ -440,12 +448,20 @@ def run_pretrain_once(
         jepa_pred_heads=config.jepa_pred_heads,
         jepa_vicreg_weight=config.jepa_vicreg_weight,
         jepa_mask_mode=config.jepa_mask_mode,
+        jepa_addr_mode=config.jepa_addr_mode,
         jepa_n_seeds=config.jepa_n_seeds,
         # JEPA v2(2026-06-06)
         jepa_global_weight=config.jepa_global_weight,
         jepa_n_reg_tokens=config.jepa_n_reg_tokens,
         jepa_ratio_start=config.jepa_ratio_start,
         jepa_ratio_end=config.jepa_ratio_end,
+        # JEPA v3(2026-06-11,set 级)
+        jepa_setlevel=config.jepa_setlevel,
+        jepa_loss_type=config.jepa_loss_type,
+        jepa_ema_end=config.jepa_ema_end,
+        jepa_ema_warmup_steps=config.jepa_ema_warmup_steps,
+        jepa_student_vicreg_weight=config.jepa_student_vicreg_weight,
+        jepa_predict_residual=config.jepa_predict_residual,
         # 去批次条件 MLM(2026-06-08;n_studies 由 DataModule 派生后透传)
         use_study_conditioning=config.use_study_conditioning,
         n_studies=dm.n_studies,

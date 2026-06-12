@@ -83,12 +83,15 @@ class JEPAPredictor(nn.Module):
         full_mask: torch.Tensor,        # [B, L]  bool,所有有效位置(True=valid,含 ctx+target)
         phylo_coords: Optional[torch.Tensor] = None,    # [B, L, phylo_pe_dim]  frozen 地址
         protein_coords: Optional[torch.Tensor] = None,  # [B, L, protein_pe_dim]
+        genus_query: Optional[torch.Tensor] = None,     # [B, L, d_model]  被遮菌身份地址(Cell-JEPA 式)
     ) -> torch.Tensor:
         """Returns: [B, L, d_model];调用方取 target_mask 位置当预测。"""
         B, L, d = h_ctx.shape
 
-        # 1) 构造 target 位置的 mask query = mask_token + 坐标地址投影
+        # 1) 构造 target 位置的 mask query = mask_token + 地址(genus 身份 或 坐标)
         query = self.mask_token.view(1, 1, d).expand(B, L, d)
+        if genus_query is not None:                       # Cell-JEPA 式:用"哪个 genus"(身份)定位被遮位置
+            query = query + genus_query
         if self.coord_proj_phylo is not None and phylo_coords is not None:
             query = query + self.coord_proj_phylo(phylo_coords)
         if self.coord_proj_protein is not None and protein_coords is not None:

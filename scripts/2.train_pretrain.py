@@ -118,9 +118,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--jepa_pred_heads", type=int, default=4, help="predictor 注意力头数(pred_dim 须整除)")
     p.add_argument("--jepa_vicreg_weight", type=float, default=0.0,
                    help="VICReg variance 防塌正则权重(后备;起步 0,塌了抬,见 PLAN 防塌段)")
-    p.add_argument("--jepa_mask_mode", type=str, default="structured", choices=["random", "structured"],
+    p.add_argument("--jepa_mask_mode", type=str, default="structured",
+                   choices=[
+                       "random", "structured",
+                       "structured_hi", "structured_hi_phylo", "structured_hi_protein",
+                   ],
                    help="JEPA target 遮挡方式:random=随机遮 ~ratio;structured=按 phylo/protein 坐标"
-                        "样本内成簇遮(多种子,见 PLAN 结构化 mask);v2 默认 structured")
+                        "样本内成簇遮;structured_hi*=高丰度 token 作 seed 后沿 phylo/protein 扩块,"
+                        "只把先验当出题人,不作 target/loss")
+    p.add_argument("--jepa_addr_mode", type=str, default="coords", choices=["coords", "genus"],
+                   help="JEPA address query:coords=phylo/protein 坐标(历史,已证'错图');"
+                        "genus=被遮菌 genus 身份(Cell-JEPA 式,吃数据驱动菌间共变,2026-06-09)")
     p.add_argument("--jepa_n_seeds", type=int, default=4,
                    help="structured 模式多少个种子簇(I-JEPA multi-block;每簇遮 ratio/n_seeds 最近邻;v2 默认 4)")
     # JEPA v2(2026-06-06,删 MLM + 双自监督 + 防塌升级)
@@ -132,6 +140,20 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="JEPA v2 structured mask ratio curriculum 起点(epoch 0;默认 0.3)")
     p.add_argument("--jepa_ratio_end", type=float, default=0.5,
                    help="JEPA v2 structured mask ratio curriculum 终点(末 epoch;默认 0.5)")
+    # JEPA v3(2026-06-11,全盘抄 GeneJEPA set 级范式)
+    p.add_argument("--jepa_setlevel", action="store_true", default=False,
+                   help="开纯 set 级 JEPA(GeneJEPA 式):student context→PMA→z_s,teacher 只看 target 子集→PMA→z_t,"
+                        "predictor 对齐;砍 token 级 predictor。配 --jepa_mask_mode random")
+    p.add_argument("--jepa_loss_type", type=str, default="cosine", choices=["cosine", "mse"],
+                   help="set 级对齐 loss:cosine(GeneJEPA 式,默认)| mse(I-JEPA 式)")
+    p.add_argument("--jepa_ema_end", type=float, default=0.9995,
+                   help="setlevel EMA cosine 调度终点(GeneJEPA 0.9995;起点=jepa_ema_decay)")
+    p.add_argument("--jepa_ema_warmup_steps", type=int, default=0,
+                   help="setlevel EMA warmup:前 N 步 teacher 冻结(GeneJEPA 2000;0=不 warmup)")
+    p.add_argument("--jepa_student_vicreg_weight", type=float, default=0.0,
+                   help="setlevel student z_s 的 VICReg 权重(GeneJEPA 在 student_ctx 也加防塌)")
+    p.add_argument("--jepa_predict_residual", action="store_true", default=False,
+                   help="token 级 JEPA target 减样本全局中心(predict residual):逼预测被遮菌相对整体偏差,铲'看整体'捷径")
 
     # 去批次(2026-06-08;study=Project_ID;默认全关=与现状等价)
     p.add_argument("--study_balanced", action="store_true", default=False,
@@ -288,12 +310,20 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         jepa_pred_heads=args.jepa_pred_heads,
         jepa_vicreg_weight=args.jepa_vicreg_weight,
         jepa_mask_mode=args.jepa_mask_mode,
+        jepa_addr_mode=args.jepa_addr_mode,
         jepa_n_seeds=args.jepa_n_seeds,
         # JEPA v2(2026-06-06)
         jepa_global_weight=args.jepa_global_weight,
         jepa_n_reg_tokens=args.jepa_n_reg_tokens,
         jepa_ratio_start=args.jepa_ratio_start,
         jepa_ratio_end=args.jepa_ratio_end,
+        # JEPA v3(2026-06-11,set 级)
+        jepa_setlevel=args.jepa_setlevel,
+        jepa_loss_type=args.jepa_loss_type,
+        jepa_ema_end=args.jepa_ema_end,
+        jepa_ema_warmup_steps=args.jepa_ema_warmup_steps,
+        jepa_student_vicreg_weight=args.jepa_student_vicreg_weight,
+        jepa_predict_residual=args.jepa_predict_residual,
         # 去批次(默认关)
         study_balanced=args.study_balanced,
         use_study_conditioning=args.use_study_conditioning,
