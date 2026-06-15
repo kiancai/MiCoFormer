@@ -44,6 +44,7 @@ DISEASE_MERGE: Dict[str, List[str]] = {
     "Influenza": ["Influenza A Virus", "Influenza B Virus", "Influenza"],
     "RTI":       ["Respiratory Tract Infectious Disorder"],  # §3.3: 不合并 LRTI / RRI
     "LatentTB":  ["Latent Tuberculosis Infection"],
+    "Pneumonia": ["Pneumonia"],  # 2026-06-15 补:之前漏掉(单独 CC=3 达阈值;见 report cc_disease_selection.csv)
 }
 
 
@@ -156,6 +157,7 @@ def sanity_print(
         "Influenza": ("3",  "574",   "398"),
         "RTI":       ("3",  "896",   "1,788"),
         "LatentTB":  ("3",  "89",    "85"),
+        "Pneumonia": ("3",  "77",    "90"),
     }
     print(f"{'disease':<11s}  {'CC':>4s}  {'case':>8s}  {'ctrl':>8s}    {'CC_exp':>6s}  {'case_exp':>9s}  {'ctrl_exp':>9s}")
     for d in DISEASE_MERGE.keys():
