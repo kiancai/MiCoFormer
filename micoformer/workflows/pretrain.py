@@ -214,6 +214,8 @@ class PretrainRunConfig:
     sample_view_loss_weight: float = 0.0
     sample_view_loss_weights: Optional[list[float]] = None
     sample_view_protein_feat_path: Optional[str] = None
+    shuffle_sample_targets: bool = False
+    sample_target_shuffle_seed: int = 0
     sample_view_diversity_weight: float = 1e-3
     sample_view_close_weight: float = 1e-3
     use_metadata_task: bool = True
@@ -294,6 +296,8 @@ def run_pretrain_once(
         abundance_target_transform=config.abundance_target_transform,
         sample_view_heads=config.sample_view_heads,
         sample_view_protein_feat_path=config.sample_view_protein_feat_path,
+        shuffle_sample_targets=config.shuffle_sample_targets,
+        sample_target_shuffle_seed=config.sample_target_shuffle_seed,
         use_metadata_task=config.use_metadata_task,
         # 去批次(默认关)
         study_balanced=config.study_balanced,
@@ -600,6 +604,8 @@ def run_pretrain_once(
             str(config.abundance_target_transform),
             ",".join(sample_view_names),
             str(config.sample_view_loss_weight),
+            str(config.shuffle_sample_targets),
+            str(config.sample_target_shuffle_seed),
         ]
     )
     _fp = hashlib.md5(_fp_src.encode("utf-8")).hexdigest()[:10]
@@ -609,6 +615,13 @@ def run_pretrain_once(
 
     # 显式指定 dirpath，避免依赖 "第一个 logger 的 save_dir" 这种隐式行为
     ckpt_dir = os.path.join(config.log_dir, log_subdir, run_version, "checkpoints")
+    if config.shuffle_sample_targets:
+        dm.sample_target_shuffle_manifest_path = os.path.join(
+            config.log_dir,
+            log_subdir,
+            run_version,
+            "shuffle_manifest.json",
+        )
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         monitor="val/loss",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -221,6 +222,9 @@ class MiCoDataModule(L.LightningDataModule):
         abundance_target_transform: Optional[str] = None,
         sample_view_heads: Optional[Sequence[str] | str] = None,
         sample_view_protein_feat_path: Optional[str] = None,
+        shuffle_sample_targets: bool = False,
+        sample_target_shuffle_seed: int = 0,
+        sample_target_shuffle_manifest_path: Optional[str] = None,
         use_metadata_task: bool = True,         # 是否派生 EnvCategory 并暴露 class_weights
         metadata_cache_dir: Optional[str] = None,  # 默认与 h5ad 同目录，文件名含 h5ad fingerprint
         # 去批次(2026-06-08;默认全关=与现状等价)。study=Project_ID(唯一全覆盖批次粒度)。
@@ -249,6 +253,10 @@ class MiCoDataModule(L.LightningDataModule):
         self.abundance_target_transform = abundance_target_transform
         self.sample_view_heads = normalize_sample_view_names(sample_view_heads)
         self.sample_view_protein_feat_path = sample_view_protein_feat_path
+        self.shuffle_sample_targets = bool(shuffle_sample_targets)
+        self.sample_target_shuffle_seed = int(sample_target_shuffle_seed)
+        self.sample_target_shuffle_manifest_path = sample_target_shuffle_manifest_path
+        self.sample_view_target_index_map: Optional[np.ndarray] = None
 
         self.use_metadata_task = use_metadata_task
         self.metadata_cache_dir = metadata_cache_dir
@@ -288,6 +296,7 @@ class MiCoDataModule(L.LightningDataModule):
         # X2 phase 2:蛋白 PE coords(等 bacformer_prior 出 varm['protein_pe'])
         # 默认 None,workflow 自行判断 use_protein_pe 是否要求其存在
         self.protein_pe_coords_raw: Optional[torch.Tensor] = None  # [V_real, protein_pe_dim] float32
+        self.n_obs: int = 0
         self.n_vars: int = 0
 
         # EnvCategory 派生结果(V5)
@@ -307,6 +316,7 @@ class MiCoDataModule(L.LightningDataModule):
         # 同时一次性把 varp / varm / obs 关键字段 materialize 到内存
         adata = ad.read_h5ad(self.h5ad_path, backed="r")
         try:
+            self.n_obs = int(adata.n_obs)
             self.n_vars = int(adata.n_vars)
             # 构建 rank 词表，两种 embedding 模式均需要；rank_mappings 此处不需要
             _, rank_vocab_sizes, _ = build_taxon_path_ids(adata.var)
@@ -392,6 +402,92 @@ class MiCoDataModule(L.LightningDataModule):
         # genus_vocab_size：Genus 词表大小（0=PAD, 1=UNK, 2~=真实 genus）
         return rank_vocab_sizes["Genus"], rank_vocab_sizes
 
+    def _build_sample_target_index_map(self) -> Optional[np.ndarray]:
+        if not (self.sample_view_heads and self.shuffle_sample_targets):
+            return None
+        if self.n_obs <= 0:
+            raise RuntimeError("n_obs is not initialized; _peek_dataset_meta must run before shuffle map construction.")
+        mapping = np.arange(self.n_obs, dtype=np.int64)
+        rng = np.random.default_rng(self.sample_target_shuffle_seed)
+        for split_indices in (self.train_indices, self.val_indices, self.test_indices):
+            if split_indices is None:
+                continue
+            idx = np.asarray(split_indices, dtype=np.int64)
+            if idx.size <= 1:
+                continue
+            perm = idx.copy()
+            rng.shuffle(perm)
+            fixed = np.flatnonzero(perm == idx)
+            if fixed.size == idx.size:
+                perm = np.roll(perm, 1)
+            elif fixed.size == 1:
+                swap_j = 0 if fixed[0] != 0 else 1
+                perm[fixed[0]], perm[swap_j] = perm[swap_j], perm[fixed[0]]
+            elif fixed.size > 1:
+                perm[fixed] = np.roll(perm[fixed], 1)
+            mapping[idx] = perm
+        return mapping
+
+    @staticmethod
+    def _sha256_int64(values: np.ndarray) -> str:
+        arr = np.asarray(values, dtype=np.int64)
+        return hashlib.sha256(arr.tobytes()).hexdigest()
+
+    def _write_sample_target_shuffle_manifest(self) -> None:
+        path = self.sample_target_shuffle_manifest_path
+        mapping = self.sample_view_target_index_map
+        if not path or mapping is None:
+            return
+        if int(os.environ.get("RANK", "0")) != 0:
+            return
+
+        def _split_manifest(name: str, split_indices: Optional[Sequence[int]]) -> Dict[str, Any]:
+            if split_indices is None:
+                return {
+                    "name": name,
+                    "n": 0,
+                    "present": False,
+                }
+            idx = np.asarray(split_indices, dtype=np.int64)
+            mapped = mapping[idx].astype(np.int64, copy=False)
+            idx_set = set(int(x) for x in idx.tolist())
+            mapped_set = set(int(x) for x in mapped.tolist())
+            preview_n = min(10, int(idx.shape[0]))
+            return {
+                "name": name,
+                "present": True,
+                "n": int(idx.shape[0]),
+                "indices_sha256": self._sha256_int64(idx),
+                "mapped_indices_sha256": self._sha256_int64(mapped),
+                "split_internal_permutation": idx_set == mapped_set,
+                "fixed_points": int(np.sum(idx == mapped)),
+                "preview_pairs": [
+                    [int(idx[i]), int(mapped[i])]
+                    for i in range(preview_n)
+                ],
+            }
+
+        manifest = {
+            "shuffle_sample_targets": True,
+            "sample_target_shuffle_seed": self.sample_target_shuffle_seed,
+            "sample_view_heads": list(self.sample_view_heads),
+            "n_obs": int(self.n_obs),
+            "mapping_sha256": self._sha256_int64(mapping),
+            "shuffle_axis": "sample",
+            "feature_shuffle": False,
+            "batch_local_shuffle": False,
+            "splits": {
+                "train": _split_manifest("train", self.train_indices),
+                "val": _split_manifest("val", self.val_indices),
+                "test": _split_manifest("test", self.test_indices),
+            },
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+        rank_zero_info(f"{TAG} Wrote sample-target shuffle manifest to {path}")
+
     def _env_cache_path(self, adata: ad.AnnData) -> str:
         # 缓存文件名含 h5ad 路径 + obs 形状的指纹,避免不同数据混用
         base_dir = self.metadata_cache_dir or os.path.dirname(os.path.abspath(self.h5ad_path)) or "."
@@ -428,6 +524,8 @@ class MiCoDataModule(L.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None) -> None:
         # setup 方法在每个进程上都会被调用
+        self.sample_view_target_index_map = self._build_sample_target_index_map()
+        self._write_sample_target_shuffle_manifest()
         base_dataset = AnnDataDataset(
             h5ad_path=self.h5ad_path,
             max_seq_len=self.max_seq_len,
@@ -440,6 +538,7 @@ class MiCoDataModule(L.LightningDataModule):
             abundance_target_transform=self.abundance_target_transform,
             sample_view_heads=self.sample_view_heads,
             protein_feat_path=self.sample_view_protein_feat_path,
+            sample_view_target_index_map=self.sample_view_target_index_map,
         )
 
         # Subset：直接使用初始化时传入的索引划分数据集

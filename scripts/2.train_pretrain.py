@@ -197,6 +197,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="repr shaping:每个 view 的相对权重,顺序对应 --sample_view_heads。默认全 1。")
     p.add_argument("--sample_view_protein_feat_path", type=str, default=None,
                    help="repr shaping:func_bacformer sample target 使用的 protein_feat.npy 路径。")
+    p.add_argument("--shuffle_sample_targets", action="store_true", default=False,
+                   help="repr shaping control:在 train/val 各 split 内固定打乱 sample-view target 对应。")
+    p.add_argument("--sample_target_shuffle_seed", type=int, default=0,
+                   help="repr shaping control:sample target 固定 permutation seed。")
     p.add_argument("--sample_view_diversity_weight", type=float, default=1e-3,
                    help="repr shaping:不同 PMA seed 输出的 off-diagonal cosine^2 正则权重。")
     p.add_argument("--sample_view_close_weight", type=float, default=1e-3,
@@ -404,6 +408,8 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         sample_view_loss_weight=args.sample_view_loss_weight,
         sample_view_loss_weights=args.sample_view_loss_weights,
         sample_view_protein_feat_path=args.sample_view_protein_feat_path,
+        shuffle_sample_targets=args.shuffle_sample_targets,
+        sample_target_shuffle_seed=args.sample_target_shuffle_seed,
         sample_view_diversity_weight=args.sample_view_diversity_weight,
         sample_view_close_weight=args.sample_view_close_weight,
         use_metadata_task=not args.no_metadata_task,

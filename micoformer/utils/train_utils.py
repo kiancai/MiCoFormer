@@ -408,6 +408,9 @@ def validate_pretrain_config(config: Any) -> None:
             raise ValueError("sample_view_loss_weights length must match sample_view_heads length.")
         if float(getattr(config, "sample_view_loss_weight", 0.0)) < 0:
             raise ValueError("sample_view_loss_weight must be >= 0.")
+    elif getattr(config, "shuffle_sample_targets", False):
+        raise ValueError("shuffle_sample_targets requires sample_view_heads.")
+
     if getattr(config, "use_metadata_task", False):
         ml_weight = getattr(config, "metadata_loss_weight", None)
         if ml_weight is not None and ml_weight < 0:
