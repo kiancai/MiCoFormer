@@ -2,7 +2,7 @@
 
 来自 Lee et al. 2019 "Set Transformer"。
 设计要点(design 文档 §3):
-  - 一个 learnable query 向量(k=1 起步,本期不实现 k>1)
+  - 一个或多个 learnable query 向量(k=1 保持历史 sample-vector 接口)
   - 通过 multihead attention 让 query 去"问"每个 token 重要性
   - 输出是所有 token 的加权和(权重由 attention 给出)
   - key_padding_mask 只屏蔽 PAD,不屏蔽 MLM mask 位置(§3.4)
@@ -22,13 +22,13 @@ class PMA(nn.Module):
     Args:
         d_model:    encoder 输出维度
         nhead_pma:  PMA 内 attention 头数(独立于 encoder 的 nhead,默认 4)
-        k:          query 数量(本期固定 1,k>1 留待后续 ablation)
+        k:          query 数量。k=1 时保持旧接口返回 [B, d_model]；k>1 返回 [B, k, d_model]。
     """
 
     def __init__(self, d_model: int, nhead_pma: int = 4, k: int = 1) -> None:
         super().__init__()
-        if k != 1:
-            raise ValueError(f"PMA currently only supports k=1, got k={k}. (k>1 planned for future ablation)")
+        if k <= 0:
+            raise ValueError(f"PMA k must be > 0, got {k}.")
         self.d_model = d_model
         self.nhead_pma = nhead_pma
         self.k = k
@@ -45,11 +45,14 @@ class PMA(nn.Module):
     ) -> torch.Tensor:
         """
         Returns:
-            sample_repr: [B, d_model] (k=1 时已 squeeze)
+            sample_repr: [B, d_model] when k=1, otherwise [B, k, d_model].
         """
         B = h.size(0)
         # query: [k, d_model] → [B, k, d_model]
         q = self.query.unsqueeze(0).expand(B, -1, -1)
         out, _ = self.mha(q, h, h, key_padding_mask=key_padding_mask)
-        # k=1 时 squeeze 中间维 → [B, d_model]
-        return self.norm(out).squeeze(1)
+        out = self.norm(out)
+        # k=1 时保持历史接口 → [B, d_model]
+        if self.k == 1:
+            return out.squeeze(1)
+        return out
