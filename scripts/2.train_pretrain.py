@@ -188,6 +188,19 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="V5:sample-level pooling;pma(默认) | mean_pool")
     p.add_argument("--pma_nhead", type=int, default=4)
     p.add_argument("--pma_k", type=int, default=1)
+    p.add_argument("--sample_view_heads", nargs="*", default=None,
+                   choices=["raw", "rclr_sigma", "rclr", "rank", "func", "func_bacformer", "phylo", "phylo_32coord"],
+                   help="repr shaping:启用 sample-level view heads。B1 用 raw rclr_sigma rank func_bacformer phylo_32coord。")
+    p.add_argument("--sample_view_loss_weight", type=float, default=0.0,
+                   help="repr shaping:sample-view 联合 loss 总权重。0=关闭 loss。")
+    p.add_argument("--sample_view_loss_weights", type=float, nargs="*", default=None,
+                   help="repr shaping:每个 view 的相对权重,顺序对应 --sample_view_heads。默认全 1。")
+    p.add_argument("--sample_view_protein_feat_path", type=str, default=None,
+                   help="repr shaping:func_bacformer sample target 使用的 protein_feat.npy 路径。")
+    p.add_argument("--sample_view_diversity_weight", type=float, default=1e-3,
+                   help="repr shaping:不同 PMA seed 输出的 off-diagonal cosine^2 正则权重。")
+    p.add_argument("--sample_view_close_weight", type=float, default=1e-3,
+                   help="repr shaping:PMA query seed 靠近正则权重。")
     p.add_argument("--no_metadata_task", action="store_true", default=False,
                    help="V5:禁用 EnvCategory 多任务监督(默认启用)")
     p.add_argument("--metadata_loss_weight", type=float, default=0.3,
@@ -387,6 +400,12 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         pooling_mode=args.pooling_mode,
         pma_nhead=args.pma_nhead,
         pma_k=args.pma_k,
+        sample_view_heads=args.sample_view_heads,
+        sample_view_loss_weight=args.sample_view_loss_weight,
+        sample_view_loss_weights=args.sample_view_loss_weights,
+        sample_view_protein_feat_path=args.sample_view_protein_feat_path,
+        sample_view_diversity_weight=args.sample_view_diversity_weight,
+        sample_view_close_weight=args.sample_view_close_weight,
         use_metadata_task=not args.no_metadata_task,
         metadata_loss_weight=args.metadata_loss_weight,
         huber_beta=args.huber_beta,

@@ -171,4 +171,26 @@ class MiCoCollator:
                 [int(b["study_id"]) for b in batch], dtype=torch.long
             )  # [B]
 
+        # Repr shaping:可选 sample-level 多 view targets。每个 view 是固定宽度 dense 向量。
+        has_sample_views = ["sample_view_targets" in b for b in batch]
+        if any(has_sample_views):
+            if not all(has_sample_views):
+                missing = sum(1 for x in has_sample_views if not x)
+                raise RuntimeError(
+                    f"MiCoCollator: partial sample_view_targets batch ({missing}/{len(batch)} samples missing). "
+                    "All samples must consistently include sample_view_targets, or none."
+                )
+            view_names = list(batch[0]["sample_view_targets"].keys())
+            targets = {}
+            for view in view_names:
+                rows = [
+                    torch.as_tensor(b["sample_view_targets"][view], dtype=torch.float32)
+                    for b in batch
+                ]
+                width = rows[0].numel()
+                if any(r.numel() != width for r in rows):
+                    raise RuntimeError(f"sample_view target {view!r} has inconsistent width within batch.")
+                targets[view] = torch.stack(rows, dim=0)
+            batch_out["sample_view_targets"] = targets
+
         return batch_out

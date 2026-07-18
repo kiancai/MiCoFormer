@@ -89,6 +89,21 @@ class MetadataHead(nn.Module):
         return self.mlp(sample_repr)
 
 
+class SampleViewLinearHead(nn.Module):
+    """sample-level view 回归 head。
+
+    输入是某个 view 专用 PMA seed 的 sample representation [B, d_model]，
+    输出该 view 的完整 sample target 向量。保持线性，避免 head 自己吸收非线性可读性。
+    """
+
+    def __init__(self, d_model: int, out_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, out_dim)
+
+    def forward(self, sample_repr: torch.Tensor) -> torch.Tensor:
+        return self.proj(sample_repr)
+
+
 class ClassificationHead(nn.Module):
     """下游分类 head。hidden_dim=0 时为 linear probe，>0 时为两层 MLP。"""
 

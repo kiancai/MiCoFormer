@@ -14,6 +14,7 @@ _VALID_POOLING_MODES = frozenset({"pma", "mean_pool"})
 _VALID_ABUNDANCE_ENCODING = frozenset({"mlp", "bin"})
 _VALID_ABUNDANCE_LOSS = frozenset({"huber", "bin_ce"})
 _VALID_ABUNDANCE_VALUE_TRANSFORM = frozenset({"rclr_sigma", "rclr", "rank", "presence", "raw"})
+_VALID_SAMPLE_VIEW_TARGETS = frozenset({"raw", "rclr_sigma", "rclr", "rank", "func", "func_bacformer", "phylo", "phylo_32coord"})
 
 
 def choose_precision(precision: str) -> str:
@@ -384,6 +385,29 @@ def validate_pretrain_config(config: Any) -> None:
             f"pretrain pooling_mode must be 'pma' or 'mean_pool', got {_pooling!r}."
         )
 
+    sample_views = getattr(config, "sample_view_heads", None) or []
+    if isinstance(sample_views, str):
+        sample_views = [x for x in sample_views.replace(",", " ").split() if x]
+    if sample_views:
+        bad = [v for v in sample_views if v not in _VALID_SAMPLE_VIEW_TARGETS]
+        if bad:
+            raise ValueError(
+                f"sample_view_heads contains unknown targets {bad!r}; expected {sorted(_VALID_SAMPLE_VIEW_TARGETS)}."
+            )
+        if getattr(config, "pooling_mode", None) != "pma":
+            raise ValueError("sample_view_heads requires pooling_mode='pma'.")
+        pma_k = int(getattr(config, "pma_k", 0))
+        if pma_k != len(sample_views):
+            raise ValueError(
+                f"sample_view_heads requires one PMA seed per view: pma_k={pma_k}, n_views={len(sample_views)}."
+            )
+        if any(v in {"func", "func_bacformer"} for v in sample_views) and not getattr(config, "sample_view_protein_feat_path", None):
+            raise ValueError("func_bacformer sample view requires sample_view_protein_feat_path.")
+        weights = getattr(config, "sample_view_loss_weights", None)
+        if weights is not None and len(weights) != len(sample_views):
+            raise ValueError("sample_view_loss_weights length must match sample_view_heads length.")
+        if float(getattr(config, "sample_view_loss_weight", 0.0)) < 0:
+            raise ValueError("sample_view_loss_weight must be >= 0.")
     if getattr(config, "use_metadata_task", False):
         ml_weight = getattr(config, "metadata_loss_weight", None)
         if ml_weight is not None and ml_weight < 0:

@@ -11,7 +11,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from micoformer.data.datasets import AnnDataDataset, build_taxon_path_ids
+from micoformer.data.datasets import AnnDataDataset, build_taxon_path_ids, normalize_sample_view_names
 from micoformer.data.pretrain_collate import MiCoCollator
 from lightning.pytorch.utilities import rank_zero_info
 
@@ -219,6 +219,8 @@ class MiCoDataModule(L.LightningDataModule):
         abundance_value_transform: str = "rclr_sigma",  # 旧参数：未显式解耦时同时控制输入和目标
         abundance_input_transform: Optional[str] = None,
         abundance_target_transform: Optional[str] = None,
+        sample_view_heads: Optional[Sequence[str] | str] = None,
+        sample_view_protein_feat_path: Optional[str] = None,
         use_metadata_task: bool = True,         # 是否派生 EnvCategory 并暴露 class_weights
         metadata_cache_dir: Optional[str] = None,  # 默认与 h5ad 同目录，文件名含 h5ad fingerprint
         # 去批次(2026-06-08;默认全关=与现状等价)。study=Project_ID(唯一全覆盖批次粒度)。
@@ -245,6 +247,8 @@ class MiCoDataModule(L.LightningDataModule):
         self.abundance_value_transform = abundance_value_transform
         self.abundance_input_transform = abundance_input_transform
         self.abundance_target_transform = abundance_target_transform
+        self.sample_view_heads = normalize_sample_view_names(sample_view_heads)
+        self.sample_view_protein_feat_path = sample_view_protein_feat_path
 
         self.use_metadata_task = use_metadata_task
         self.metadata_cache_dir = metadata_cache_dir
@@ -284,6 +288,7 @@ class MiCoDataModule(L.LightningDataModule):
         # X2 phase 2:蛋白 PE coords(等 bacformer_prior 出 varm['protein_pe'])
         # 默认 None,workflow 自行判断 use_protein_pe 是否要求其存在
         self.protein_pe_coords_raw: Optional[torch.Tensor] = None  # [V_real, protein_pe_dim] float32
+        self.n_vars: int = 0
 
         # EnvCategory 派生结果(V5)
         self.env_labels: Optional[np.ndarray] = None        # [N_obs] int64
@@ -302,6 +307,7 @@ class MiCoDataModule(L.LightningDataModule):
         # 同时一次性把 varp / varm / obs 关键字段 materialize 到内存
         adata = ad.read_h5ad(self.h5ad_path, backed="r")
         try:
+            self.n_vars = int(adata.n_vars)
             # 构建 rank 词表，两种 embedding 模式均需要；rank_mappings 此处不需要
             _, rank_vocab_sizes, _ = build_taxon_path_ids(adata.var)
 
@@ -432,6 +438,8 @@ class MiCoDataModule(L.LightningDataModule):
             abundance_value_transform=self.abundance_value_transform,
             abundance_input_transform=self.abundance_input_transform,
             abundance_target_transform=self.abundance_target_transform,
+            sample_view_heads=self.sample_view_heads,
+            protein_feat_path=self.sample_view_protein_feat_path,
         )
 
         # Subset：直接使用初始化时传入的索引划分数据集

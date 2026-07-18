@@ -16,6 +16,7 @@ from micoformer.models.heads import (
     AbundanceRegressionHead,
     MetadataHead,
     PriorCoordHead,
+    SampleViewLinearHead,
 )
 from micoformer.models.pma import PMA
 from micoformer.utils.train_utils import build_lr_scheduler
@@ -24,6 +25,33 @@ from micoformer.utils.tree_loss import TreeLossHelper
 
 _VALID_ABUNDANCE_LOSS = {"huber", "bin_ce"}
 _VALID_POOLING_MODE = {"pma", "mean_pool"}
+_VALID_SAMPLE_VIEW_TARGETS = {"raw", "rclr_sigma", "rank", "func_bacformer", "phylo_32coord"}
+_SAMPLE_VIEW_ALIASES = {
+    "rclr": "rclr_sigma",
+    "func": "func_bacformer",
+    "phylo": "phylo_32coord",
+}
+
+
+def _normalize_sample_view_names(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = [x.strip() for x in value.replace(",", " ").split()]
+    else:
+        raw = [str(x).strip() for x in value]
+    out: list[str] = []
+    for name in raw:
+        if not name:
+            continue
+        canonical = _SAMPLE_VIEW_ALIASES.get(name, name)
+        if canonical not in _VALID_SAMPLE_VIEW_TARGETS:
+            raise ValueError(
+                f"Unknown sample-view target {name!r}. Expected one of {sorted(_VALID_SAMPLE_VIEW_TARGETS)}."
+            )
+        if canonical not in out:
+            out.append(canonical)
+    return out
 
 
 class MiCoFormerModule(L.LightningModule):
@@ -63,6 +91,14 @@ class MiCoFormerModule(L.LightningModule):
         pooling_mode: str = "pma",             # "pma" | "mean_pool"
         pma_nhead: int = 4,
         pma_k: int = 1,
+        sample_view_heads: Optional[List[str]] = None,
+        sample_view_loss_weight: float = 0.0,
+        sample_view_loss_weights: Optional[List[float]] = None,
+        sample_view_n_vars: Optional[int] = None,
+        sample_view_func_dim: Optional[int] = None,
+        sample_view_phylo_dim: Optional[int] = None,
+        sample_view_diversity_weight: float = 1e-3,
+        sample_view_close_weight: float = 1e-3,
         use_metadata_task: bool = True,
         metadata_loss_weight: float = 0.3,
         metadata_num_classes: int = 6,
@@ -220,6 +256,34 @@ class MiCoFormerModule(L.LightningModule):
         if abundance_encoding == "bin" and abundance_loss != "bin_ce":
             raise ValueError("abundance_encoding='bin' must pair with abundance_loss='bin_ce'.")
 
+        sample_view_names = _normalize_sample_view_names(sample_view_heads)
+        sample_view_active = bool(sample_view_names) and float(sample_view_loss_weight) > 0
+        if sample_view_names:
+            if pooling_mode != "pma":
+                raise ValueError("sample_view_heads requires pooling_mode='pma'.")
+            if pma_k != len(sample_view_names):
+                raise ValueError(
+                    "sample_view_heads uses one independent PMA seed per view; "
+                    f"pma_k must equal len(sample_view_heads)={len(sample_view_names)}, got {pma_k}."
+                )
+            if any(v in sample_view_names for v in ("raw", "rclr_sigma", "rank")) and (
+                sample_view_n_vars is None or sample_view_n_vars <= 0
+            ):
+                raise ValueError("raw/rclr_sigma/rank sample views require sample_view_n_vars > 0.")
+            if "func_bacformer" in sample_view_names and (
+                sample_view_func_dim is None or sample_view_func_dim <= 0
+            ):
+                raise ValueError("func_bacformer sample view requires sample_view_func_dim > 0.")
+            if "phylo_32coord" in sample_view_names and (
+                sample_view_phylo_dim is None or sample_view_phylo_dim <= 0
+            ):
+                raise ValueError("phylo_32coord sample view requires sample_view_phylo_dim > 0.")
+            if sample_view_loss_weights is not None and len(sample_view_loss_weights) != len(sample_view_names):
+                raise ValueError(
+                    "sample_view_loss_weights length must match sample_view_heads length: "
+                    f"{len(sample_view_loss_weights)} != {len(sample_view_names)}."
+                )
+
         # X2 多任务一致性校验(2026-05-28 夜)
         if x2_phylo_weight > 0 and not use_phylo_pe:
             raise ValueError(
@@ -237,7 +301,7 @@ class MiCoFormerModule(L.LightningModule):
         _any_loss = (
             (mlm_weight > 0) or (x2_phylo_weight > 0) or (x2_protein_weight > 0)
             or (tree_loss_weight > 0) or (phylo_ce_weight > 0) or (phylo_w_weight > 0)
-            or (protein_w_weight > 0) or (jepa_weight > 0)
+            or (protein_w_weight > 0) or (jepa_weight > 0) or sample_view_active
         )
         if not _any_loss:
             raise ValueError(
@@ -262,6 +326,7 @@ class MiCoFormerModule(L.LightningModule):
 
         # 保存所有 __init__ 参数到 self.hparams,便于 checkpoint 保存和恢复
         self.save_hyperparameters()
+        self.sample_view_names = sample_view_names
 
         self.encoder = MiCoFormerEncoder(
             genus_vocab_size=genus_vocab_size,
@@ -308,10 +373,45 @@ class MiCoFormerModule(L.LightningModule):
         # forward 也不被 optimizer 更新,但占显存 + 进 ckpt 状态)。现修复让 PMA 跟 metadata 同生死。
         # 2026-06-06 JEPA v2:全局对齐(jepa_global_weight>0)也用 PMA 池化 student/teacher,
         #   故 JEPA global 开启时同样创建 PMA(MLM-free 范式下 use_metadata_task=False 也要有)。
-        _pma_needed = use_metadata_task or (jepa_weight > 0 and jepa_global_weight > 0) or (jepa_weight > 0 and jepa_setlevel)
+        _pma_needed = (
+            use_metadata_task
+            or (jepa_weight > 0 and jepa_global_weight > 0)
+            or (jepa_weight > 0 and jepa_setlevel)
+        )
         self.pma: Optional[PMA] = None
         if pooling_mode == "pma" and _pma_needed:
-            self.pma = PMA(d_model=d_model, nhead_pma=pma_nhead, k=pma_k)
+            self.pma = PMA(d_model=d_model, nhead_pma=pma_nhead, k=1)
+
+        # ============ sample-level multi-view shaping heads ============
+        self.sample_view_pmas: Optional[nn.ModuleDict] = None
+        self.sample_view_heads: Optional[nn.ModuleDict] = None
+        self.sample_view_loss_weights: Optional[torch.Tensor] = None
+        if sample_view_names:
+            self.sample_view_pmas = nn.ModuleDict(
+                {view: PMA(d_model=d_model, nhead_pma=pma_nhead, k=1) for view in sample_view_names}
+            )
+            dims = {
+                "raw": int(sample_view_n_vars or 0),
+                "rclr_sigma": int(sample_view_n_vars or 0),
+                "rank": int(sample_view_n_vars or 0),
+                "func_bacformer": int(sample_view_func_dim or 0),
+                "phylo_32coord": int(sample_view_phylo_dim or 0),
+            }
+            self.sample_view_heads = nn.ModuleDict(
+                {view: SampleViewLinearHead(d_model=d_model, out_dim=dims[view]) for view in sample_view_names}
+            )
+            weights = sample_view_loss_weights or [1.0 for _ in sample_view_names]
+            self.register_buffer(
+                "_sample_view_loss_weights",
+                torch.tensor(weights, dtype=torch.float32),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "_sample_view_loss_weights",
+                torch.ones(0, dtype=torch.float32),
+                persistent=False,
+            )
 
         # ============ Metadata head ============
         self.metadata_head: Optional[MetadataHead] = None
@@ -488,11 +588,29 @@ class MiCoFormerModule(L.LightningModule):
         h_token = h
         key_padding_mask = ~attention_mask  # True = PAD
         if self.hparams.pooling_mode == "pma":
-            return self.pma(h_token, key_padding_mask=key_padding_mask)
+            if self.pma is None:
+                raise RuntimeError("pooling_mode='pma' requires self.pma for this code path.")
+            pooled = self.pma(h_token, key_padding_mask=key_padding_mask)
+            if pooled.ndim == 3:
+                return pooled[:, 0, :]
+            return pooled
         # mean_pool: 对非 PAD 位置求平均
         mask_f = attention_mask.float().unsqueeze(-1)
         denom = mask_f.sum(dim=1).clamp(min=1.0)
         return (h_token * mask_f).sum(dim=1) / denom
+
+    def _pool_sample_views(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Return view-specific sample vectors from independent PMA(k=1) modules."""
+        if not self.sample_view_names or self.sample_view_pmas is None:
+            raise RuntimeError("sample-view pooling requested but sample_view_pmas is not initialized.")
+        key_padding_mask = ~attention_mask  # True = PAD
+        pooled = []
+        for view in self.sample_view_names:
+            z = self.sample_view_pmas[view](h, key_padding_mask=key_padding_mask)
+            if z.ndim != 2:
+                raise RuntimeError(f"sample-view PMA {view!r} expected [B, d_model], got {tuple(z.shape)}.")
+            pooled.append(z)
+        return torch.stack(pooled, dim=1)
 
     @staticmethod
     def _info_nce(p1: torch.Tensor, p2: torch.Tensor, temp: float) -> torch.Tensor:
@@ -540,6 +658,19 @@ class MiCoFormerModule(L.LightningModule):
         p = s / s.sum()
         ent = -(p * torch.log(p + 1e-12)).sum()
         return torch.exp(ent)
+
+    @staticmethod
+    def _top_singular_fraction(mat: torch.Tensor) -> torch.Tensor:
+        if mat.shape[0] < 2 or mat.numel() == 0:
+            return mat.new_tensor(1.0)
+        try:
+            s = torch.linalg.svdvals(mat)
+        except Exception:
+            return mat.new_tensor(1.0)
+        total = s.sum()
+        if not torch.isfinite(total) or total <= 0:
+            return mat.new_tensor(1.0)
+        return s.max() / total
 
     # ------------------------------------------------------------------
     # JEPA 辅助(2026-06-04)
@@ -713,6 +844,7 @@ class MiCoFormerModule(L.LightningModule):
         self,
         batch: Dict[str, torch.Tensor],
         stage: str,  # "train" / "val"
+        batch_idx: Optional[int] = None,
     ) -> torch.Tensor:
         # ============ JEPA 预处理(2026-06-04) ============
         # jepa_weight>0:先把有效 genus 分 context/target,context encoder 只看 context(target
@@ -923,6 +1055,107 @@ class MiCoFormerModule(L.LightningModule):
             + phylo_w_w * loss_phylo_w
             + protein_w_w * loss_protein_w
         )
+
+        # ============ Sample-level multi-view shaping loss ============
+        sample_view_w = float(getattr(self.hparams, "sample_view_loss_weight", 0.0))
+        if self.sample_view_names and sample_view_w > 0:
+            if self.sample_view_pmas is None or self.sample_view_heads is None:
+                raise RuntimeError("sample_view_heads requires sample_view_pmas and sample_view_heads modules.")
+            if "sample_view_targets" not in batch:
+                raise RuntimeError(
+                    "sample_view_heads is enabled but batch does not contain sample_view_targets. "
+                    "Check MiCoDataModule sample_view_heads / sample_view_protein_feat_path settings."
+                )
+            pooled_views = self._pool_sample_views(h_token, batch["attention_mask"])
+            if pooled_views.ndim != 3 or pooled_views.shape[1] != len(self.sample_view_names):
+                raise RuntimeError(
+                    "sample_view_heads expects PMA output [B, n_views, d_model], got "
+                    f"{tuple(pooled_views.shape)} for n_views={len(self.sample_view_names)}."
+                )
+            view_losses = []
+            weights = self._sample_view_loss_weights.to(device=h.device, dtype=torch.float32)
+            for view_i, view in enumerate(self.sample_view_names):
+                if view not in batch["sample_view_targets"]:
+                    raise RuntimeError(f"Missing sample-view target {view!r} in batch.")
+                z_view = pooled_views[:, view_i, :]
+                pred_view = self.sample_view_heads[view](z_view)
+                target_view = batch["sample_view_targets"][view].to(
+                    device=pred_view.device,
+                    dtype=pred_view.dtype,
+                    non_blocking=True,
+                )
+                loss_view = F.mse_loss(pred_view.float(), target_view.float(), reduction="mean")
+                view_losses.append(loss_view * weights[view_i])
+                self.log(
+                    f"{stage}/loss_sample_view_{view}",
+                    loss_view,
+                    prog_bar=False,
+                    on_step=(stage == "train"),
+                    on_epoch=True,
+                    sync_dist=(stage == "val"),
+                )
+            loss_sample_views = sum(view_losses) / weights.sum().clamp(min=1e-6)
+            total_loss = total_loss + sample_view_w * loss_sample_views
+            self.log(
+                f"{stage}/loss_sample_views",
+                loss_sample_views,
+                prog_bar=(stage == "train"),
+                on_step=(stage == "train"),
+                on_epoch=True,
+                sync_dist=(stage == "val"),
+            )
+
+            div_w = float(getattr(self.hparams, "sample_view_diversity_weight", 0.0))
+            if div_w > 0 and pooled_views.shape[1] > 1:
+                z = F.normalize(pooled_views.float(), dim=-1, eps=1e-6)
+                sim = torch.einsum("bvd,bwd->bvw", z, z)
+                eye = torch.eye(sim.shape[-1], device=sim.device, dtype=torch.bool).unsqueeze(0)
+                offdiag = ~eye.expand_as(sim)
+                loss_view_div = sim[offdiag].pow(2).mean()
+                total_loss = total_loss + div_w * loss_view_div.to(total_loss.dtype)
+                self.log(
+                    f"{stage}/loss_sample_view_div",
+                    loss_view_div,
+                    on_step=(stage == "train"),
+                    on_epoch=True,
+                    sync_dist=(stage == "val"),
+                )
+
+            close_w = float(getattr(self.hparams, "sample_view_close_weight", 0.0))
+            if close_w > 0 and self.sample_view_pmas is not None and len(self.sample_view_pmas) > 1:
+                q = torch.stack([self.sample_view_pmas[view].query.squeeze(0) for view in self.sample_view_names], dim=0).float()
+                loss_view_close = (q - q.mean(dim=0, keepdim=True)).pow(2).mean()
+                total_loss = total_loss + close_w * loss_view_close.to(total_loss.dtype)
+                self.log(
+                    f"{stage}/loss_sample_view_close",
+                    loss_view_close,
+                    on_step=(stage == "train"),
+                    on_epoch=True,
+                    sync_dist=(stage == "val"),
+                )
+
+            if stage == "val" and batch_idx == 0 and ((int(self.current_epoch) + 1) % 5 == 0):
+                with torch.no_grad():
+                    for view_i, view in enumerate(self.sample_view_names):
+                        z_rank = pooled_views[:, view_i, :].detach().float()
+                        z_rank = z_rank[torch.isfinite(z_rank).all(dim=1)]
+                        erank = self._effective_rank(z_rank)
+                        top_frac = self._top_singular_fraction(z_rank)
+                        self.log(
+                            f"{stage}/erank_sample_view_{view}",
+                            erank,
+                            on_step=False,
+                            on_epoch=True,
+                            sync_dist=(stage == "val"),
+                        )
+                        self.log(
+                            f"{stage}/top_singular_frac_sample_view_{view}",
+                            top_frac,
+                            on_step=False,
+                            on_epoch=True,
+                            sync_dist=(stage == "val"),
+                        )
+
         if self.hparams.use_metadata_task:
             if "env_label" not in batch:
                 raise RuntimeError(
@@ -1186,10 +1419,10 @@ class MiCoFormerModule(L.LightningModule):
         return total_loss
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        return self._shared_step(batch, "train")
+        return self._shared_step(batch, "train", batch_idx=batch_idx)
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        self._shared_step(batch, "val")
+        self._shared_step(batch, "val", batch_idx=batch_idx)
 
     # ------------------------------------------------------------------
     # JEPA lifecycle hooks(2026-06-04)

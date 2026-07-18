@@ -18,6 +18,7 @@ from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.utilities import rank_zero_info
 
 from micoformer.datamodules.pretrain_datamodule import MiCoDataModule
+from micoformer.data.datasets import normalize_sample_view_names
 from micoformer.models.pretrain_module import MiCoFormerModule
 from micoformer.utils.train_utils import (
     choose_precision,
@@ -209,6 +210,12 @@ class PretrainRunConfig:
     pooling_mode: str = "pma"                   # "pma" | "mean_pool"
     pma_nhead: int = 4
     pma_k: int = 1
+    sample_view_heads: Optional[list[str]] = None
+    sample_view_loss_weight: float = 0.0
+    sample_view_loss_weights: Optional[list[float]] = None
+    sample_view_protein_feat_path: Optional[str] = None
+    sample_view_diversity_weight: float = 1e-3
+    sample_view_close_weight: float = 1e-3
     use_metadata_task: bool = True
     metadata_loss_weight: float = 0.3
     metadata_num_classes: int = 6
@@ -285,6 +292,8 @@ def run_pretrain_once(
         abundance_value_transform=config.abundance_value_transform,
         abundance_input_transform=config.abundance_input_transform,
         abundance_target_transform=config.abundance_target_transform,
+        sample_view_heads=config.sample_view_heads,
+        sample_view_protein_feat_path=config.sample_view_protein_feat_path,
         use_metadata_task=config.use_metadata_task,
         # 去批次(默认关)
         study_balanced=config.study_balanced,
@@ -375,6 +384,28 @@ def run_pretrain_once(
             )
         _protein_pe_dim = int(_protein_pe_coords_to_inject.shape[1])
         rank_zero_info(f"{TAG} ProteinPE: pe_dim={_protein_pe_dim}")
+
+    sample_view_names = normalize_sample_view_names(config.sample_view_heads)
+    _sample_view_func_dim = None
+    if "func_bacformer" in sample_view_names:
+        if config.sample_view_protein_feat_path is None:
+            raise RuntimeError("sample_view_heads includes func_bacformer but sample_view_protein_feat_path was not provided.")
+        _func_arr = np.load(config.sample_view_protein_feat_path, mmap_mode="r")
+        if int(_func_arr.shape[0]) != int(dm.n_vars):
+            raise RuntimeError(
+                f"sample_view protein_feat first dimension {int(_func_arr.shape[0])} != h5ad n_vars {int(dm.n_vars)}."
+            )
+        _sample_view_func_dim = int(_func_arr.shape[1])
+        rank_zero_info(
+            f"{TAG} sample-view func_bacformer target: protein_feat={config.sample_view_protein_feat_path}, "
+            f"dim={_sample_view_func_dim}"
+        )
+    _sample_view_phylo_dim = None
+    if "phylo_32coord" in sample_view_names:
+        if dm.pe_dim is None:
+            raise RuntimeError("sample_view_heads includes phylo_32coord but h5ad lacks varm['position_encoding'].")
+        _sample_view_phylo_dim = int(dm.pe_dim)
+        rank_zero_info(f"{TAG} sample-view phylo_32coord target dim={_sample_view_phylo_dim}")
 
     # Protein dist matrix 检查(protein_w_weight>0 时必须有 protein_dist_path)
     _protein_dist_to_inject = None
@@ -480,6 +511,14 @@ def run_pretrain_once(
         pooling_mode=config.pooling_mode,
         pma_nhead=config.pma_nhead,
         pma_k=config.pma_k,
+        sample_view_heads=sample_view_names,
+        sample_view_loss_weight=config.sample_view_loss_weight,
+        sample_view_loss_weights=config.sample_view_loss_weights,
+        sample_view_n_vars=int(dm.n_vars) if sample_view_names else None,
+        sample_view_func_dim=_sample_view_func_dim,
+        sample_view_phylo_dim=_sample_view_phylo_dim,
+        sample_view_diversity_weight=config.sample_view_diversity_weight,
+        sample_view_close_weight=config.sample_view_close_weight,
         use_metadata_task=config.use_metadata_task,
         metadata_loss_weight=config.metadata_loss_weight,
         metadata_num_classes=config.metadata_num_classes,
@@ -559,6 +598,8 @@ def run_pretrain_once(
             config.abundance_value_transform,
             str(config.abundance_input_transform),
             str(config.abundance_target_transform),
+            ",".join(sample_view_names),
+            str(config.sample_view_loss_weight),
         ]
     )
     _fp = hashlib.md5(_fp_src.encode("utf-8")).hexdigest()[:10]
