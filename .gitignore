@@ -15,6 +15,9 @@ tests/
 !tests/
 tests/*
 !tests/test_pma_multiquery.py
+!tests/relation_pretraining/
+tests/relation_pretraining/*
+!tests/relation_pretraining/test_*.py
 design/
 
 *.ipynb
