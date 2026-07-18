@@ -168,8 +168,16 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="V5:abundance 输入编码方式;mlp=连续 MLP(默认),bin=旧离散 embedding")
     p.add_argument("--abundance_value_transform", type=str, default="rclr_sigma",
                    choices=["rclr_sigma", "rclr", "rank", "presence", "raw"],
-                   help="V5 §4.2:present-only abundance 数值写法(编码消融);rclr_sigma=现状默认,"
-                        "rclr=去σ,rank=排名,presence=只打勾(MLM退化、慎用),raw=相对丰度原值")
+                   help="Legacy fallback:未显式传 input/target transform 时,同时控制 encoder 输入和 MLM 目标。"
+                        "rclr_sigma=现状默认,rclr=去σ,rank=排名,presence=只打勾(MLM退化、慎用),raw=相对丰度原值")
+    p.add_argument("--abundance_input_transform", type=str, default=None,
+                   choices=["rclr_sigma", "rclr", "rank", "presence", "raw"],
+                   help="encoder 连续丰度输入写法。None 表示沿用 --abundance_value_transform。"
+                        "repr shaping 主线应固定为 rclr_sigma。")
+    p.add_argument("--abundance_target_transform", type=str, default=None,
+                   choices=["rclr_sigma", "rclr", "rank", "presence", "raw"],
+                   help="Huber MLM 回归目标写法。None 表示沿用 --abundance_value_transform。"
+                        "只改输出实验用它切换 raw/rank/rclr_sigma。")
     p.add_argument("--abundance_loss", type=str, default="huber", choices=["huber", "bin_ce"],
                    help="V5:abundance MLM loss;huber=连续回归(默认),bin_ce=旧 bin 分类")
     p.add_argument("--no_phylo_pe", action="store_true", default=False,
@@ -371,6 +379,8 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         # V5
         abundance_encoding=args.abundance_encoding,
         abundance_value_transform=args.abundance_value_transform,
+        abundance_input_transform=args.abundance_input_transform,
+        abundance_target_transform=args.abundance_target_transform,
         abundance_loss=args.abundance_loss,
         use_phylo_pe=not args.no_phylo_pe,
         phylo_pe_hidden=args.phylo_pe_hidden,

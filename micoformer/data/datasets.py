@@ -109,8 +109,12 @@ class AnnDataDataset:
         #   "bin":       旧路径,输入侧用 nn.Embedding 查表
         # 两种模式 __getitem__ 始终返回 abund_values 与 abund_bins(由 collator/module 按 flag 选用)
         abundance_encoding: str = "mlp",
-        # V5 §4.2:present-only abundance 数值写法（消融旋钮，详见 _VALID_VALUE_TRANSFORM）
+        # V5 §4.2:present-only abundance 数值写法（旧消融旋钮，详见 _VALID_VALUE_TRANSFORM）。
+        # 默认兼容旧行为：同一个写法同时用于 encoder 输入和 MLM 回归目标。
         abundance_value_transform: str = "rclr_sigma",
+        # 2026-07 repr shaping:显式解耦输入和目标。None 表示沿用 abundance_value_transform。
+        abundance_input_transform: Optional[str] = None,
+        abundance_target_transform: Optional[str] = None,
         backed: Optional[str] = None,
     ) -> None:
         if max_seq_len is not None and max_seq_len <= 0:
@@ -122,6 +126,18 @@ class AnnDataDataset:
         if abundance_value_transform not in _VALID_VALUE_TRANSFORM:
             raise ValueError(
                 f"Unknown abundance_value_transform: {abundance_value_transform!r}. "
+                f"Expected {sorted(_VALID_VALUE_TRANSFORM)}."
+            )
+        abundance_input_transform = abundance_input_transform or abundance_value_transform
+        abundance_target_transform = abundance_target_transform or abundance_value_transform
+        if abundance_input_transform not in _VALID_VALUE_TRANSFORM:
+            raise ValueError(
+                f"Unknown abundance_input_transform: {abundance_input_transform!r}. "
+                f"Expected {sorted(_VALID_VALUE_TRANSFORM)}."
+            )
+        if abundance_target_transform not in _VALID_VALUE_TRANSFORM:
+            raise ValueError(
+                f"Unknown abundance_target_transform: {abundance_target_transform!r}. "
                 f"Expected {sorted(_VALID_VALUE_TRANSFORM)}."
             )
 
@@ -143,6 +159,8 @@ class AnnDataDataset:
         self.abundance_mode = abundance_mode
         self.abundance_encoding = abundance_encoding
         self.abundance_value_transform = abundance_value_transform
+        self.abundance_input_transform = abundance_input_transform
+        self.abundance_target_transform = abundance_target_transform
 
         self.num_abundance_bins = num_abundance_bins   # 用户指定的真实 bin 数（不含 PAD/MASK）
         self.min_abundance = min_abundance
@@ -200,6 +218,31 @@ class AnnDataDataset:
         )
         return bins + 2
 
+    @staticmethod
+    def _make_abundance_values(
+        transform: str,
+        *,
+        log_vals: np.ndarray,
+        vals: np.ndarray,
+        mu: float,
+        sigma: float,
+        n_full: int,
+    ) -> np.ndarray:
+        if transform in ("rclr_sigma", "rclr"):
+            centered = log_vals - mu                       # present-only CLR（去 σ 即 rclr）
+            if transform == "rclr":
+                return centered.astype(np.float32)
+            if sigma < 1e-6:                               # 单 taxon 等极端 → 兜底防除零
+                return np.zeros_like(log_vals, dtype=np.float32)
+            return (centered / (sigma + 1e-8)).astype(np.float32)
+        if transform == "rank":
+            # present 内降序排名归一（分母 n_full、保截断不变尺度）；丰度越高越接近 1
+            kept = log_vals.shape[0]
+            return ((n_full - np.arange(kept)) / float(n_full)).astype(np.float32)
+        if transform == "presence":                        # 丢量级，全 1（MLM 退化，慎用）
+            return np.ones_like(log_vals, dtype=np.float32)
+        return vals.astype(np.float32)                      # raw：相对丰度原值
+
     def __getitem__(self, i: int) -> Dict[str, Any]:
 
         idx, vals = self._row_nonzero(i)
@@ -209,6 +252,7 @@ class AnnDataDataset:
             taxon_ids = np.empty((0,), dtype=np.int64)
             abund_bins = np.empty((0,), dtype=np.int64)
             abund_values = np.empty((0,), dtype=np.float32)
+            target_abund_values = np.empty((0,), dtype=np.float32)
             taxon_path_ids = np.empty((0, len(RANK_COLUMNS)), dtype=np.int64)
             # var_indices 是该 token 在 adata.var 中的行号（0~n_vars-1），
             # 用于下游按 var 索引查全局矩阵（如 varp['phylo_dist'] / varp['taxo_dist']）
@@ -246,31 +290,30 @@ class AnnDataDataset:
             else:
                 abund_bins = self._bin_abundance_rank(vals).astype(np.int64)
 
-            # V5 §4.2:按 abundance_value_transform 生成连续 abund_values（present-only）。
-            # 注意:abund_values 同时是 mlp 输入与 huber MLM target（collate 的
-            # labels_abund_values = 其 clone）→ 换写法 = 同时换"喂进去的数"与"重建目标"。
-            t = self.abundance_value_transform
-            if t in ("rclr_sigma", "rclr"):
-                centered = log_vals - mu                       # present-only CLR（去 σ 即 rclr）
-                if t == "rclr":
-                    abund_values = centered.astype(np.float32)
-                elif sigma < 1e-6:                             # 单 taxon 等极端 → 兜底防除零
-                    abund_values = np.zeros_like(log_vals, dtype=np.float32)
-                else:
-                    abund_values = (centered / (sigma + 1e-8)).astype(np.float32)
-            elif t == "rank":
-                # present 内降序排名归一（分母 n_full、保截断不变尺度）；丰度越高越接近 1
-                kept = log_vals.shape[0]
-                abund_values = ((n_full - np.arange(kept)) / float(n_full)).astype(np.float32)
-            elif t == "presence":                             # 丢量级，全 1（MLM 退化，慎用）
-                abund_values = np.ones_like(log_vals, dtype=np.float32)
-            else:                                             # raw：相对丰度原值（截断后）
-                abund_values = vals.astype(np.float32)
+            # 2026-07 repr shaping:encoder 输入和 MLM 回归目标显式解耦。
+            # 旧参数不传新字段时仍等价于 input_transform == target_transform == abundance_value_transform。
+            abund_values = self._make_abundance_values(
+                self.abundance_input_transform,
+                log_vals=log_vals,
+                vals=vals,
+                mu=mu,
+                sigma=sigma,
+                n_full=n_full,
+            )
+            target_abund_values = self._make_abundance_values(
+                self.abundance_target_transform,
+                log_vals=log_vals,
+                vals=vals,
+                mu=mu,
+                sigma=sigma,
+                n_full=n_full,
+            )
 
         return {
             "taxon_ids": taxon_ids,
             "abund_bins": abund_bins,           # [L] int64 — bin 标签 / bin 输入路径用
-            "abund_values": abund_values,        # [L] float32 — mlp 输入 / 回归标签用
+            "abund_values": abund_values,        # [L] float32 — mlp 输入用
+            "target_abund_values": target_abund_values,  # [L] float32 — huber MLM 回归标签用
             "taxon_path_ids": taxon_path_ids,    # [L, 6]
             "var_indices": var_indices,          # [L]，var 行号（0~n_vars-1）
             "length": int(taxon_ids.shape[0]),

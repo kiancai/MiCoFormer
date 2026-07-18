@@ -216,7 +216,9 @@ class MiCoDataModule(L.LightningDataModule):
         abundance_mode: str = "abs_log_bins",  # 丰度编码方式："abs_log_bins" 或 "rank_bins"
         # V5 新增 ↓
         abundance_encoding: str = "mlp",       # "mlp"(默认) | "bin"
-        abundance_value_transform: str = "rclr_sigma",  # V5 §4.2 present-only 写法（编码消融）
+        abundance_value_transform: str = "rclr_sigma",  # 旧参数：未显式解耦时同时控制输入和目标
+        abundance_input_transform: Optional[str] = None,
+        abundance_target_transform: Optional[str] = None,
         use_metadata_task: bool = True,         # 是否派生 EnvCategory 并暴露 class_weights
         metadata_cache_dir: Optional[str] = None,  # 默认与 h5ad 同目录，文件名含 h5ad fingerprint
         # 去批次(2026-06-08;默认全关=与现状等价)。study=Project_ID(唯一全覆盖批次粒度)。
@@ -241,6 +243,8 @@ class MiCoDataModule(L.LightningDataModule):
         self.abundance_mode = abundance_mode
         self.abundance_encoding = abundance_encoding
         self.abundance_value_transform = abundance_value_transform
+        self.abundance_input_transform = abundance_input_transform
+        self.abundance_target_transform = abundance_target_transform
 
         self.use_metadata_task = use_metadata_task
         self.metadata_cache_dir = metadata_cache_dir
@@ -426,6 +430,8 @@ class MiCoDataModule(L.LightningDataModule):
             abundance_mode=self.abundance_mode,
             abundance_encoding=self.abundance_encoding,
             abundance_value_transform=self.abundance_value_transform,
+            abundance_input_transform=self.abundance_input_transform,
+            abundance_target_transform=self.abundance_target_transform,
         )
 
         # Subset：直接使用初始化时传入的索引划分数据集

@@ -13,6 +13,7 @@ _VALID_POOLING_MODES = frozenset({"pma", "mean_pool"})
 # 用于预训练 abundance loss / encoding 互斥校验
 _VALID_ABUNDANCE_ENCODING = frozenset({"mlp", "bin"})
 _VALID_ABUNDANCE_LOSS = frozenset({"huber", "bin_ce"})
+_VALID_ABUNDANCE_VALUE_TRANSFORM = frozenset({"rclr_sigma", "rclr", "rank", "presence", "raw"})
 
 
 def choose_precision(precision: str) -> str:
@@ -361,6 +362,16 @@ def validate_pretrain_config(config: Any) -> None:
         raise ValueError(
             f"abundance_loss must be one of {sorted(_VALID_ABUNDANCE_LOSS)}, got {_abund_loss!r}."
         )
+    for field_name in (
+        "abundance_value_transform",
+        "abundance_input_transform",
+        "abundance_target_transform",
+    ):
+        value = getattr(config, field_name, None)
+        if value is not None and value not in _VALID_ABUNDANCE_VALUE_TRANSFORM:
+            raise ValueError(
+                f"{field_name} must be one of {sorted(_VALID_ABUNDANCE_VALUE_TRANSFORM)}, got {value!r}."
+            )
     if _abund_enc and _abund_loss:
         if _abund_enc == "mlp" and _abund_loss != "huber":
             raise ValueError("abundance_encoding='mlp' must pair with abundance_loss='huber'.")

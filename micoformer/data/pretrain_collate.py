@@ -68,9 +68,17 @@ class MiCoCollator:
         # 将样本中的 taxon_ids 与 abund_bins 转为 Tensor
         taxon_seqs = [torch.as_tensor(b["taxon_ids"], dtype=torch.long) for b in batch]
         abund_seqs = [torch.as_tensor(b["abund_bins"], dtype=torch.long) for b in batch]
-        # V5：连续 abund_values（Dataset 始终返回；若缺则零填充，向后兼容）
+        # V5：连续 abund_values 是 encoder 输入；target_abund_values 是 Huber MLM 目标。
+        # target 缺失时回退到 abund_values，兼容旧 dataset / 历史产物。
         abund_value_seqs = [
             torch.as_tensor(b.get("abund_values", torch.zeros(len(b["taxon_ids"]))), dtype=torch.float32)
+            for b in batch
+        ]
+        target_abund_value_seqs = [
+            torch.as_tensor(
+                b.get("target_abund_values", b.get("abund_values", torch.zeros(len(b["taxon_ids"])))),
+                dtype=torch.float32,
+            )
             for b in batch
         ]
         # AnnDataDataset 始终返回 taxon_path_ids，无需条件检查
@@ -83,6 +91,7 @@ class MiCoCollator:
         token_ids = pad_sequences(taxon_seqs, self.pad_taxon_id)
         abund_bins = pad_sequences(abund_seqs, self.pad_bin_id)
         abund_values = pad_float_sequences(abund_value_seqs, pad_value=0.0)  # V5
+        target_abund_values = pad_float_sequences(target_abund_value_seqs, pad_value=0.0)
         taxon_path_ids = pad_matrix_sequences(taxon_path_seqs, pad_value=0)
         var_indices = pad_sequences(var_index_seqs, pad_value=0)
 
@@ -117,9 +126,9 @@ class MiCoCollator:
 
         # 应用 Mask，将被选中的位置的 abund_bins 替换为特殊的 mask_bin_id
         abund_bins = abund_bins.masked_fill(mask_positions, self.mask_bin_id)
-        # V5：abund_values 不在 collator 替换 MASK，encoder 内部用 abund_mask_token 替换
-        # 但保留原始值用作 huber 回归 label（labels_abund_values = mask 前的 abund_values）
-        labels_abund_values = abund_values.clone()
+        # V5：abund_values 不在 collator 替换 MASK，encoder 内部用 abund_mask_token 替换。
+        # labels_abund_values 来自 target_abund_values，允许只改预测目标、不改 encoder 输入。
+        labels_abund_values = target_abund_values.clone()
 
         # 组装输出
         batch_out = {
