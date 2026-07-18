@@ -411,6 +411,9 @@ def validate_pretrain_config(config: Any) -> None:
     elif getattr(config, "shuffle_sample_targets", False):
         raise ValueError("shuffle_sample_targets requires sample_view_heads.")
 
+    if getattr(config, "init_from_ckpt", None) and getattr(config, "resume_from_checkpoint", None):
+        raise ValueError("Use either init_from_ckpt or resume_from_checkpoint, not both.")
+
     if getattr(config, "use_metadata_task", False):
         ml_weight = getattr(config, "metadata_loss_weight", None)
         if ml_weight is not None and ml_weight < 0:

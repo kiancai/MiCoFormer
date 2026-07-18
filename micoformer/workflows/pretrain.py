@@ -228,6 +228,8 @@ class PretrainRunConfig:
     # DAPT/续训用:从已有 ckpt 加载初始 state_dict(非 trainer resume,仅初始化权重)
     # None=正常从头训练;指定路径=load_state_dict(strict=False),允许 buffer 缺失
     init_from_ckpt: str | None = None
+    # Lightning trainer resume:恢复 optimizer/scheduler/global_step,用于同一训练 run 续跑。
+    resume_from_checkpoint: str | None = None
 
 
 # 执行一次完整的预训练流程，返回结果字典
@@ -687,7 +689,7 @@ def run_pretrain_once(
 
     # 5. 开始训练
     rank_zero_info(f"{TAG} Starting training...")
-    trainer.fit(model, datamodule=dm)
+    trainer.fit(model, datamodule=dm, ckpt_path=config.resume_from_checkpoint)
 
     best_score = checkpoint_callback.best_model_score
     best_model_path = checkpoint_callback.best_model_path

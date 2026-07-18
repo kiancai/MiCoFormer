@@ -290,6 +290,10 @@ def build_argparser() -> argparse.ArgumentParser:
         "--init_from_ckpt", type=str, default=None,
         help="从该 ckpt 加载初始 state_dict;buffer 缺失会自动跳过(strict=False)。用于 DAPT 二阶段。",
     )
+    p.add_argument(
+        "--resume_from_checkpoint", type=str, default=None,
+        help="从 Lightning checkpoint 恢复 trainer 状态，包括 optimizer/scheduler/global_step。用于同一训练 run 续跑。",
+    )
 
     return p
 
@@ -416,6 +420,7 @@ def _args_to_config(args: argparse.Namespace) -> PretrainRunConfig:
         metadata_loss_weight=args.metadata_loss_weight,
         huber_beta=args.huber_beta,
         init_from_ckpt=args.init_from_ckpt,
+        resume_from_checkpoint=args.resume_from_checkpoint,
     )
 
 
