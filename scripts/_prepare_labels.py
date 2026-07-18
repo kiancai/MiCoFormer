@@ -1,20 +1,24 @@
-"""Generate derived label fields for V5 finetune stages.
+"""Generate legacy V2-style label fields in a full h5ad copy.
 
-Reads V2 corpus, derives 12 fields:
+Reads corpus, derives label fields:
   - IsExternalControl              (bool)
   - BroadFinetune_eligible         (bool)
-  - Role_<disease>                 (str: 'case' / 'control' / 'none') × 10
+  - Role_<disease>                 (str: 'case' / 'control' / 'none') × 11
 
-Writes a new labeled.h5ad. Original h5ad untouched.
+Writes a new labeled h5ad. The original h5ad is untouched. Current V3 disease
+evaluation uses ``data/MCFCorpusV3/_src/build_v3_rm_cc_loso11.py`` and its compact sidecar instead;
+this tool does not apply the V3 RM/QC eligibility contract.
 
-See .claude/docs/micoformer/current/data.md (微调数据筛选 / 疾病清单 / Role 字段 / prepare_labels) for full spec.
+The output path is deliberately required for non-dry runs so the historical
+10-disease V2 fixed asset cannot be overwritten by the current 11-disease rules.
 
 Usage:
     # 先 dry-run 验证 case/control 数对得上 §3.2
     python MiCoFormer/scripts/_prepare_labels.py --dry_run
 
-    # 正式产出
-    python MiCoFormer/scripts/_prepare_labels.py
+    # 正式产出必须显式指定新文件
+    python MiCoFormer/scripts/_prepare_labels.py \
+        --output data/gg2/MCFCorpusV2.gg2.labeled_11diseases.h5ad
 """
 from __future__ import annotations
 
@@ -51,12 +55,12 @@ DISEASE_MERGE: Dict[str, List[str]] = {
 def derive_labels(
     obs: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, Dict[str, Set[str]], Set[str]]:
-    """按 data.md(微调数据 / 标签派生)派生 12 个新字段。
+    """按 data.md(微调数据 / 标签派生)派生 label 字段。
 
     返回:
-      new_obs: 含 12 个派生字段的 obs 副本
+      new_obs: 含 13 个派生字段的 obs 副本
       cc_studies_per_disease: {disease: set of CC Project_IDs}
-      broad_excluded: 全部 10 个 disease CC studies 的并集
+      broad_excluded: 全部 11 个 disease CC studies 的并集
     """
     obs = obs.copy()
 
@@ -115,7 +119,7 @@ def derive_labels(
     for col, val in role_cols.items():
         obs[col] = val
 
-    # ---- Step 4: broad_excluded_studies = 10 disease CC studies 的并集 ----
+    # ---- Step 4: broad_excluded_studies = 11 disease CC studies 的并集 ----
     broad_excluded: Set[str] = set().union(*cc_studies_per_disease.values())
 
     # ---- Step 5: BroadFinetune_eligible ----
@@ -186,13 +190,20 @@ def sanity_print(
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--input",  default="data/gg2/MCFCorpusV2.gg2.h5ad")
-    p.add_argument("--output", default="data/gg2/MCFCorpusV2.gg2.labeled.h5ad")
+    p.add_argument(
+        "--output",
+        default=None,
+        help="Required for non-dry runs; must name a new labeled h5ad explicitly.",
+    )
     p.add_argument("--dry_run", action="store_true",
                    help="Only compute and print sanity check, do not write output h5ad")
     args = p.parse_args()
 
+    if not args.dry_run and args.output is None:
+        p.error("--output is required unless --dry_run is used")
+
     in_path = Path(args.input)
-    out_path = Path(args.output)
+    out_path = Path(args.output) if args.output is not None else None
     if not in_path.exists():
         raise FileNotFoundError(in_path)
 
@@ -220,6 +231,7 @@ def main():
         print(f"\n[dry_run] Output not written. Total: {time.time() - t0:.1f}s")
         return
 
+    assert out_path is not None
     print(f"\n[3/3] Writing {out_path} ...")
     adata.obs = new_obs
     out_path.parent.mkdir(parents=True, exist_ok=True)
