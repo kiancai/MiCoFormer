@@ -20,6 +20,9 @@ tests/relation_pretraining/*
 !tests/relation_structure_pretraining/
 tests/relation_structure_pretraining/*
 !tests/relation_structure_pretraining/test_*.py
+!tests/mpc_relation_adaptation/
+tests/mpc_relation_adaptation/*
+!tests/mpc_relation_adaptation/test_*.py
 design/
 
 *.ipynb
