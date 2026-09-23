@@ -58,6 +58,7 @@ class QueryOutput:
     positive_continuous: Tensor
     positive_target: Tensor
     positive_count: int
+    sample_h: Tensor
 
 
 class MPCForwardOutput(NamedTuple):
@@ -75,6 +76,7 @@ class MPCForwardOutput(NamedTuple):
     mlm_count: int
     continuous_count: int
     presence_count: int
+    query_sample_h: Tensor
 
 
 class ConcatQueryHead(nn.Module):
@@ -240,6 +242,7 @@ class MPCPretrainingModel(nn.Module):
             positive_continuous=positive_continuous,
             positive_target=rclr[query_mask].float(),
             positive_count=int(positive_ids.numel()),
+            sample_h=sample_h,
         )
 
     @staticmethod
@@ -283,6 +286,7 @@ class MPCPretrainingModel(nn.Module):
             mlm_count=mlm_count,
             continuous_count=continuous_count,
             presence_count=presence_count,
+            query_sample_h=query.sample_h,
         )
 
     def component_loss(
