@@ -35,15 +35,15 @@ def main() -> None:
         description="Select MCFCorpusV3.1 analysis_primary samples and create "
         f"random training/validation splits ({VALIDATION_FRACTION:.1%} validation, "
         f"seed {SEED}).",
-        epilog="Example: python scripts/prepare_data.py "
-        "--corpus /path/to/MCFCorpusV3.1.gg2.h5ad --output data/prepared",
+        epilog="Run from the repository root: python -m scripts.prepare_data",
     )
     parser.add_argument(
         "--corpus",
         type=Path,
-        required=True,
-        help="Required path to the MCFCorpusV3.1 H5AD file; "
-        "its version and SHA256 are checked.",
+        default=Path("data/corpus/MCFCorpusV3.1.gg2.h5ad"),
+        help="Path to the MCFCorpusV3.1 H5AD file (default: %(default)s). "
+        "Its version and SHA256 are checked. "
+        "Relative paths start from the current working directory.",
     )
     parser.add_argument(
         "--output",
