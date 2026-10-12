@@ -32,7 +32,6 @@ class ModelConfig:
     mlm_head_hidden_dim: int = 64
     dropout: float = 0.1
     max_seq_len: int = field(default=512, init=False)
-    grad_checkpointing: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
