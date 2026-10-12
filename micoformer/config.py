@@ -21,7 +21,7 @@ REFERENCE_LAMBDAS = {
 }
 
 @dataclass(frozen=True)
-class MPCModelConfig:
+class ModelConfig:
     identity_type: Literal["fixed", "learned"] = "fixed"
     vocab_size: int = field(default=8116, init=False)
     d_model: int = field(default=512, init=False)
@@ -38,7 +38,7 @@ class MPCModelConfig:
         return asdict(self)
 
     @classmethod
-    def from_checkpoint_dict(cls, payload: Mapping[str, Any]) -> MPCModelConfig:
+    def from_checkpoint_dict(cls, payload: Mapping[str, Any]) -> ModelConfig:
         # Fixed fields are recorded but cannot be constructor arguments.
         # 固定字段仍保存在权重记录中，恢复时核对后不传给构造函数。
         for item in fields(cls):
@@ -48,7 +48,7 @@ class MPCModelConfig:
 
 
 @dataclass(frozen=True)
-class MPCTrainConfig:
+class TrainConfig:
     # Per-GPU batch size supplied by train.py. / 由 train.py 提供的每卡批大小。
     batch_size_per_rank: int
     # CPU data-loading subprocesses per training process (one process per GPU).
@@ -69,24 +69,22 @@ class MPCTrainConfig:
 
 
 @dataclass(frozen=True)
-class MPCDataConfig:
+class DataConfig:
     corpus: Path
     train_rows: Path
     val_rows: Path
-    prior_assets: Path
-    prior_sha256: str
-    preparation_manifest: Path | None = None
+    preparation_manifest: Path
 
 
 @dataclass(frozen=True)
-class MPCRunConfig:
-    data: MPCDataConfig
+class RunConfig:
+    data: DataConfig
     output_root: Path
-    training: MPCTrainConfig
-    model: MPCModelConfig
+    training: TrainConfig
+    model: ModelConfig
 
     # Return a copy with absolute paths. / 返回路径转为绝对路径的副本。
-    def normalized(self) -> MPCRunConfig:
+    def normalized(self) -> RunConfig:
         return replace(
             self,
             data=replace(
@@ -94,12 +92,7 @@ class MPCRunConfig:
                 corpus=Path(self.data.corpus).resolve(),
                 train_rows=Path(self.data.train_rows).resolve(),
                 val_rows=Path(self.data.val_rows).resolve(),
-                prior_assets=Path(self.data.prior_assets).resolve(),
-                preparation_manifest=(
-                    Path(self.data.preparation_manifest).resolve()
-                    if self.data.preparation_manifest
-                    else None
-                ),
+                preparation_manifest=Path(self.data.preparation_manifest).resolve(),
             ),
             output_root=Path(self.output_root).resolve(),
         )
@@ -108,11 +101,6 @@ class MPCRunConfig:
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["output_root"] = str(value["output_root"])
-        for key in ("corpus", "train_rows", "val_rows", "prior_assets"):
+        for key in ("corpus", "train_rows", "val_rows", "preparation_manifest"):
             value["data"][key] = str(value["data"][key])
-        value["data"]["preparation_manifest"] = (
-            str(value["data"]["preparation_manifest"])
-            if value["data"]["preparation_manifest"]
-            else None
-        )
         return value

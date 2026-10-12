@@ -4,13 +4,12 @@
 """
 from __future__ import annotations
 import argparse
-import json
 from pathlib import Path
 from micoformer.config import (
-    MPCModelConfig,
-    MPCTrainConfig,
-    MPCDataConfig,
-    MPCRunConfig,
+    ModelConfig,
+    TrainConfig,
+    DataConfig,
+    RunConfig,
 )
 
 
@@ -18,29 +17,24 @@ def make_config(
     corpus: Path,
     prepared: Path,
     output: Path,
-) -> MPCRunConfig:
+) -> RunConfig:
     """Collect data paths, model parameters, and training settings.
     汇总数据路径、模型参数和训练设置。
     """
-    model = MPCModelConfig()
+    model = ModelConfig()
     # Set per-GPU batch size here. / 在这里设置每卡批大小。
-    training = MPCTrainConfig(
+    training = TrainConfig(
         batch_size_per_rank=128,
     )
 
-    prior = prepared / "prior_assets.npz"
-    # Read the recorded hash from preparation. / 读取先验准备时保存的哈希。
-    prior_record = json.loads(prior.with_suffix(".json").read_text(encoding="utf-8"))
-    data = MPCDataConfig(
+    data = DataConfig(
         corpus=corpus,
         train_rows=prepared / "train_rows.npy",
         val_rows=prepared / "val_rows.npy",
-        prior_assets=prior,
-        prior_sha256=prior_record["prior_sha256"],
         preparation_manifest=prepared / "preparation.json",
     )
 
-    return MPCRunConfig(
+    return RunConfig(
         model=model,
         training=training,
         data=data,
@@ -59,15 +53,14 @@ def main() -> None:
     parser.add_argument(
         "--corpus",
         type=Path,
-        default=Path("data/corpus/MCFCorpusV3.1.gg2.h5ad"),
+        default=Path("data/corpus/MCFCorpusV3.2.gg2.h5ad"),
         help="Path to the corpus used for sample preparation (default: %(default)s).",
     )
     parser.add_argument(
         "--prepared",
         type=Path,
         default=Path("data/prepared"),
-        help="Directory containing train_rows.npy, val_rows.npy, preparation.json, "
-        "prior_assets.npz, and prior_assets.json (default: %(default)s).",
+        help="Directory containing train_rows.npy, val_rows.npy, and preparation.json (default: %(default)s).",
     )
     parser.add_argument(
         "--output-root",
