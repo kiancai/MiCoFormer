@@ -1,71 +1,46 @@
-"""Prepare fixed model features from a versioned prior archive.
-从带版本号的原始先验文件生成模型固定特征。
+"""Read phylogenetic and protein features from the unified corpus.
+从统一语料读取系统发育与蛋白特征，在内存中构建模型先验。
 """
-
+from dataclasses import dataclass
 from pathlib import Path
-import json
-
+import h5py
 import numpy as np
+import torch
 
-from micoformer.utils.io import sha256_file
+
+@dataclass(frozen=True)
+class PriorAssets:
+    table: torch.Tensor
+    vocabulary: tuple[str, ...]
+    observed_genus_ids: np.ndarray
 
 
-def build_prior(
-    *,
-    prior: Path,
-    output: Path,
-    expected_version: str,
-    expected_sha256: str,
-) -> Path:
-    """Check the source, normalize features, and save the model prior.
-    核对原始文件，归一化特征并保存模型先验。
+def load_prior(corpus: str | Path) -> PriorAssets:
+    """Build model features from V3.2; no separate prior file is needed.
+    从 V3.2 构建模型特征，不再读取独立先验文件。
     """
-    prior, output = Path(prior).resolve(), Path(output).resolve()
-    metadata_path = output.with_suffix(".json")
-    if output.exists() or metadata_path.exists():
-        raise FileExistsError(f"prior output already exists: {output}")
+    # Read only genus-level metadata, not the abundance matrix.
+    # 只读取菌属层面的特征，不把整个丰度矩阵装入内存。
+    with h5py.File(corpus, "r") as source:
+        version = source["uns/corpus_version"].asstr()[()]
+        if version != "MCFCorpusV3.2":
+            raise ValueError(f"expected MCFCorpusV3.2, found {version}")
+        phy = source["varm/position_encoding"][:].astype(np.float32)
+        feat = source["varm/protein_features"][:].astype(np.float32)
+        valid = source["var/protein_valid"][:]
+        names = tuple(source["var/_index"].asstr()[:])
+        observed = np.flatnonzero(source["var/n_samples_observed"][:] > 0).astype(np.int64) + 2
 
-    with np.load(prior, allow_pickle=False) as source:
-        declared = str(source["version"].item())
-        if declared != expected_version:
-            raise ValueError(f"expected {expected_version}, found {declared}")
-        digest = sha256_file(prior)
-        if digest != expected_sha256:
-            raise ValueError("prior SHA256 mismatch")
-        phy = source["phylogenetic_coords"].astype(np.float32)
-        feat = source["protein_features"].astype(np.float32)
-        valid = source["protein_valid"]
-        names = source["var_names_utf8"]
-        observed = source["observed_genus_ids"]
-
-    # Center and scale PHY globally to preserve relative distances.
-    # 系统发育坐标整体中心化和缩放，保留相对距离。
+    # Keep the existing scaling; data packaging does not change the model.
+    # 沿用原有缩放方式，统一数据文件不改变模型输入数值。
     centered = phy - phy.mean(axis=0, keepdims=True)
     norms = np.linalg.norm(centered, axis=1)
     scale = float(np.median(norms[norms > 0]))
     phy_unit = centered / scale
-
-    # Normalize valid protein rows; missing features stay zero.
-    # 有效蛋白向量逐行归一化；缺失特征保持为零。
     prot_unit = np.zeros_like(feat)
     norms = np.linalg.norm(feat[valid], axis=1)
     prot_unit[valid] = feat[valid] / norms[:, None]
-
-    # Keep the existing block scales and two reserved token rows.
-    # 沿用原有两部分尺度，前两行留给特殊编号。
     table = np.zeros((8116, 512), dtype=np.float32)
     table[2:, :32] = phy_unit * np.sqrt(512 / 2)
     table[2:, 32:] = prot_unit * np.sqrt(512 / 2)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output, pp_table=table, var_names_utf8=names, observed_genus_ids=observed
-    )
-    record = {
-        "source": {"path": str(prior), "version": declared, "sha256": digest},
-        "prior_sha256": sha256_file(output),
-        "phy_scale": scale,
-        "protein_valid_count": int(valid.sum()),
-        "observed_genus_count": int(observed.size),
-    }
-    metadata_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    return output
+    return PriorAssets(torch.from_numpy(table), names, observed)
