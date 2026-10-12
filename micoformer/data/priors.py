@@ -10,7 +10,7 @@ import torch
 
 @dataclass(frozen=True)
 class PriorAssets:
-    table: torch.Tensor
+    prior_table: torch.Tensor
     vocabulary: tuple[str, ...]
     observed_genus_ids: np.ndarray
 
@@ -40,9 +40,9 @@ def load_prior(corpus: str | Path) -> PriorAssets:
     prot_unit = np.zeros_like(feat)
     norms = np.linalg.norm(feat[valid], axis=1)
     prot_unit[valid] = feat[valid] / norms[:, None]
-    table = np.zeros((8116, 512), dtype=np.float32)
+    prior_table = np.zeros((8116, 512), dtype=np.float32)
     # Scale by sqrt(512 / 2)=16 to approximately match the abundance LayerNorm's initial magnitude.
     # 乘 sqrt(512 / 2)=16，使合并先验与丰度分支 LayerNorm 的初始数值尺度接近。
-    table[2:, :32] = phy_unit * np.sqrt(512 / 2)
-    table[2:, 32:] = prot_unit * np.sqrt(512 / 2)
-    return PriorAssets(torch.from_numpy(table), names, observed)
+    prior_table[2:, :32] = phy_unit * np.sqrt(512 / 2)
+    prior_table[2:, 32:] = prot_unit * np.sqrt(512 / 2)
+    return PriorAssets(torch.from_numpy(prior_table), names, observed)

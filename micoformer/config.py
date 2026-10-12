@@ -25,7 +25,7 @@ class ModelConfig:
     identity_type: Literal["fixed", "learned"] = "fixed"
     vocab_size: int = field(default=8116, init=False)
     d_model: int = field(default=512, init=False)
-    rclr_hidden_dim: int = 64
+    abundance_hidden_dim: int = 64
     num_layers: int = 12
     encoder_heads: int = 16
     encoder_ffn_dim: int = 2048
