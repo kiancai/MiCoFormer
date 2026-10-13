@@ -66,21 +66,11 @@ class LearnedTokenStem(nn.Module):
         return token_embedding.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
 
-# Fixed genus priors with independently created abundance encoding and mask vector.
-# 固定菌属先验，独立创建丰度编码与遮盖向量。
+# Model-supplied genus priors with independent abundance encoding and mask parameters.
+# 使用模型传入的菌属先验，独立创建丰度编码与遮盖参数。
 class FixedPriorTokenStem(nn.Module):
-    def __init__(
-        self,
-        config: ModelConfig,
-        *,
-        prior_table: Tensor,
-    ) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        # Fixed PHY32 + PROT480 priors [vocab_size, D]; move and save with the model.
-        # 固定先验表 [8116, 512]，由 PHY32 + PROT480 组成；随模型移动并保存。
-        self.register_buffer(
-            "prior_table", prior_table.detach().float().clone(), persistent=True
-        )
         self.abundance_mlp = nn.Sequential(
             nn.Linear(1, config.abundance_hidden_dim),
             nn.GELU(),
@@ -96,6 +86,8 @@ class FixedPriorTokenStem(nn.Module):
         abundance: Tensor,
         padding_mask: Tensor,
         abundance_mask: Tensor | None = None,
+        *,
+        prior_table: Tensor,
     ) -> Tensor:
         if abundance_mask is None:
             abundance_mask = torch.zeros_like(padding_mask)
@@ -106,10 +98,10 @@ class FixedPriorTokenStem(nn.Module):
             self.abundance_mask_embedding,
             abundance_embedding,
         )
-        # Look up genus vectors: [B, L] -> [B, L, D].
-        # 按菌属编号查先验向量：[B, L] -> [B, L, D]。
+        # Read the model-owned prior table: IDs [B, L] -> vectors [B, L, D].
+        # 从模型持有的先验表查向量：编号 [B, L] -> 向量 [B, L, D]。
         genus_embedding = F.embedding(
-            genus_ids, self.prior_table, padding_idx=PAD_TOKEN_ID
+            genus_ids, prior_table, padding_idx=PAD_TOKEN_ID
         )
         output = genus_embedding + abundance_embedding
         return output.masked_fill(padding_mask.unsqueeze(-1), 0.0)
