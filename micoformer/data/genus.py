@@ -1,5 +1,5 @@
-"""Read phylogenetic and protein features from the unified corpus.
-从统一语料读取系统发育与蛋白特征，在内存中构建模型先验。
+"""Load genus data and build phylogenetic/protein priors from the unified corpus.
+从统一语料读取菌属名称、已观测编号，并构建进化与蛋白先验表。
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,15 +9,15 @@ import torch
 
 
 @dataclass(frozen=True)
-class PriorAssets:
+class GenusData:
     prior_table: torch.Tensor
     vocabulary: tuple[str, ...]
     observed_genus_ids: np.ndarray
 
 
-def load_prior(corpus: str | Path) -> PriorAssets:
-    """Build model features from V3.2; no separate prior file is needed.
-    从 V3.2 构建模型特征，不再读取独立先验文件。
+def load_genus_data(corpus: str | Path) -> GenusData:
+    """Load genus names and observed IDs, and build the prior table from V3.2.
+    从 V3.2 读取菌属名称与已观测编号，并构建先验表。
     """
     # Read only genus-level metadata, not the abundance matrix.
     # 只读取菌属层面的特征，不把整个丰度矩阵装入内存。
@@ -45,4 +45,4 @@ def load_prior(corpus: str | Path) -> PriorAssets:
     # 乘 sqrt(512 / 2)=16，使合并先验与丰度分支 LayerNorm 的初始数值尺度接近。
     prior_table[2:, :32] = phy_unit * np.sqrt(512 / 2)
     prior_table[2:, 32:] = prot_unit * np.sqrt(512 / 2)
-    return PriorAssets(torch.from_numpy(prior_table), names, observed)
+    return GenusData(torch.from_numpy(prior_table), names, observed)
