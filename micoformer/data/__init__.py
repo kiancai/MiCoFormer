@@ -1,1 +1,1 @@
-"""MPC sample IO, transforms and corruption."""
+"""MiCoFormer sample IO, transforms and corruption."""

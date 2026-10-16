@@ -56,6 +56,10 @@ class TrainConfig:
     # 0 表示由训练进程自己加载数据；这个数不代表 CPU 核数。
     workers_per_rank: int = 2
     seed: int = 42
+    # Per-token selection probabilities for the MLM and Query tasks.
+    # MLM 丰度遮盖与 Query 菌属选择的逐 token 抽样概率。
+    mlm_mask_probability: float = 0.15
+    query_mask_probability: float = 0.10
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     gradient_clip: float = 1.0
