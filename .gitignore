@@ -1,39 +1,22 @@
+# Local editor files.
 .DS_Store
 .vscode/
-.vscode/sftp.json
 
-/tmp/
-/data
-/memory/
-
+# Python caches and package build output.
 __pycache__/
+*.py[cod]
 *.egg-info/
+.pytest_cache/
+/build/
+/dist/
 
-
-tests/
-!tests/
-tests/*
-!tests/test_pma_multiquery.py
-!tests/relation_pretraining/
-tests/relation_pretraining/*
-!tests/relation_pretraining/test_*.py
-!tests/relation_structure_pretraining/
-tests/relation_structure_pretraining/*
-!tests/relation_structure_pretraining/test_*.py
-design/
-
-*.ipynb
-.ipynb_checkpoints/
-/protocols/hparam_search_v2/runs/
-/protocols/hparam_search_v2/analysis/figures/
-/protocols/hparam_search_v2/analysis/generate_figures.R
-/protocols/hparam_search_v2_old/*
-/protocols/aligned_benchmark/
-.Rhistory
-
-checkpoints/
+# Local inputs and generated results; keep micoformer/data/ tracked.
+/data/
+/runs/
+/tmp/
+/checkpoints/
+*.pt
 *.ckpt
-events.out.tfevents.*
-lightning_logs/
-wandb/
-protocols/hparam_search_v2_old/run_stage.py
+*.h5ad
+*.npy
+*.npz

@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "micoformer"
-version = "0.3.0"
+version = "0.4.0"
+description = "Microbiome pretraining and sample representation extraction with MiCoFormer."
 requires-python = ">=3.11"
 dynamic = ["dependencies"]
 
