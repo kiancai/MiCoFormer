@@ -4,10 +4,27 @@ All notable changes to MiCoFormer will be documented in this file.
 
 The format is based on Keep a Changelog, adapted for the current research workflow.
 
-## [Unreleased]
+## [0.4.0] - 2026-10-16
+
+### Added
+- Added fixed phylogenetic and protein genus embeddings as the default model input, with learned genus embeddings available through configuration.
+- Added joint masked-abundance reconstruction, Query presence prediction, and Query continuous-abundance prediction objectives.
+- Added MCFCorpusV3.3 input support, with phylogenetic coordinates and protein features read from the same AnnData corpus.
+- Added reproducible analysis_primary sample selection and train/validation split generation with corpus version and SHA256 checks.
+- Added native PyTorch distributed pretraining with BF16 mixed precision, checkpoint resumption, and validation-based model selection and early stopping.
+- Added self-contained checkpoints containing model parameters, the fixed prior table, and the genus vocabulary.
+- Added streaming extraction of unmasked mean-pooled sample embeddings, row indices, and provenance records.
 
 ### Changed
-- Reserved for post-`v0.3` development on the `dev` branch.
+- Consolidated the implementation into data, models, workflows, and shared IO utilities, with model and training settings defined in Python configuration classes.
+- Replaced numbered scripts with prepare_data.py, train.py, and extract.py, including English command-line help.
+- Removed legacy model implementations, fine-tuning and experiment-specific pipelines, PyTorch Lightning, and unused dependencies.
+- Replaced legacy model, checkpoint, and command-line interfaces; older checkpoints are not automatically migrated to the new format.
+
+### Fixed
+- Replaced the additive masked-abundance input with a dedicated trainable vector, so masked positions use no abundance-MLP output.
+- Fixed RNG state restoration when resuming from checkpoints loaded onto a GPU.
+- Prevented overwriting existing embedding outputs or restarting a saved training run without an explicit resume request.
 
 ## [0.3.0] - 2026-04-10
 

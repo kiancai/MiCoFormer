@@ -1,397 +1,83 @@
+"""Transformer backbone and mean pooling over valid tokens.
+Transformer 编码主干与有效 token 的均值汇总。
+"""
 from __future__ import annotations
 
-from typing import Dict, Optional
+from torch import Tensor, nn
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from micoformer.models.attn_bias import (
-    BiasedTransformerEncoder,
-    BiasedTransformerEncoderLayer,
-    make_dist_bias,
-)
-from micoformer.models.phylo_pe import PhyloPE
+from micoformer.config import ModelConfig
 
 
-_VALID_BIAS_TYPES = {"none", "taxo", "phylo"}
-_VALID_ABUNDANCE_ENCODING = {"mlp", "bin"}
+def masked_token_mean(h: Tensor, padding_mask: Tensor) -> Tensor:
+    """Mean over valid tokens: [B, L, D] -> [B, D]; no L2 normalization.
+    对有效 token 取均值：[B, L, D] -> [B, D]；不做 L2 归一化。
+    """
+    # Exclude PAD and Query-removed positions; weights have shape [B, L, 1].
+    # 排除 PAD 和 Query 移除位置，生成 [B, L, 1] 的有效位置权重。
+    valid = (~padding_mask).to(dtype=h.dtype).unsqueeze(-1)
+    denominator = valid.sum(dim=1)
+    return (h * valid).sum(dim=1) / denominator
 
 
-class MiCoFormerEncoder(nn.Module):
-    """V5 三段相加 encoder。
-
-    input_token[i] = genus_embed[i] + abundance_embed[i] + phylo_pe[i]
-                     └── 身份 ──┘     └── 数值 ──┘     └── 位置/几何 ──┘
-
-    可选 flag:
-      - abundance_encoding='bin' 时用 self.abund_embed(nn.Embedding) 代替 self.abund_mlp
-      - use_phylo_pe=False 时不加 phylo_pe
+class EncoderBackbone(nn.Module):
+    """Encode input embeddings with a Transformer and final token normalization.
+    通过 Transformer 和最终 token 归一化处理输入 embedding。
     """
 
-    def __init__(
-        self,
-        *,
-        genus_vocab_size: int,
-        total_abundance_bins: int,
-        d_model: int = 256,
-        nhead: int = 8,
-        num_layers: int = 6,
-        dim_feedforward: int = 1024,
-        dropout: float = 0.1,
-        pad_taxon_id: int = 0,
-        pad_bin_id: int = 0,
-        # hierarchical 删除后此参数不再使用,保留以免签名/ckpt-hparam 改动(调用方仍传它)
-        rank_vocab_sizes: Dict[str, int],
-        # V4 R2:距离驱动的 attention bias
-        # - "none"  :baseline,不注入任何距离 bias
-        # - "taxo"  :离散 7-bucket bias_table,查 varp['taxo_dist']
-        # - "phylo" :3 层 MLP bias,查 varp['phylo_dist'](V5 默认)
-        bias_type: str = "none",
-        # phylo MLP 隐藏层维度(仅 bias_type="phylo" 时生效);V5 默认 64(3 层 MLP)
-        phylo_mlp_hidden: int = 64,
-        # phylo MLP 末层是否保留 bias 项(仅 bias_type="phylo" 时生效)。False=关掉末层 bias,
-        # 见 attn_bias.PhyloDistBias 注释。默认 True 保持现有 ckpt 兼容。
-        phylo_bias_last_layer_bias: bool = True,
-        # 词表大小(用于在不持有 dist_matrix 时占位创建 buffer,避免 ckpt 加载时无 buffer)
-        n_vars: Optional[int] = None,
-        # 2026-05-30:protein_w (蛋白 Tree-W) loss 需要蛋白距离矩阵 buffer。
-        # 镜像 dist_matrix:为 True 且 n_vars>0 时创建 [n_vars, n_vars] float32 buffer。
-        need_protein_dist: bool = False,
-        # ---------------- V5 新增 ----------------
-        abundance_encoding: str = "mlp",      # "mlp"(默认) | "bin"
-        use_phylo_pe: bool = True,             # 启用 PhyloPE(V5 默认 True)
-        phylo_pe_hidden: int = 128,
-        pe_dim: Optional[int] = None,          # PE 坐标维度;use_phylo_pe=True 时必须
-        # X2 多任务(2026-05-28 夜):蛋白功能 prior,镜像 phylo_pe 同构
-        use_protein_pe: bool = False,          # 启用 ProteinPE(等 bacformer_prior 出 varm['protein_pe'])
-        protein_pe_hidden: int = 128,
-        protein_pe_dim: Optional[int] = None,  # protein PE 坐标维度;use_protein_pe=True 时必须
-        grad_checkpointing: bool = False,       # 激活重算开关(以时间换显存),默认关
-        # JEPA v2 防塌(2026-06-06,T-JEPA register token):n_reg_tokens>0 时,序列**前缀**追加
-        # 这么多可学习 register token,参与 self-attention 但其输出在 forward 末尾被丢弃 —— 不对应
-        # 任何 genus、不被 mask/预测、不进 PMA/loss。默认 0=关(微调/纯 MLM 链路完全不受影响)。
-        # 因 target_encoder = deepcopy(encoder),register param 自然进 EMA 同步,两边共享同一实现。
-        n_reg_tokens: int = 0,
-    ) -> None:
+    def __init__(self, config: ModelConfig, input_stem: nn.Module) -> None:
         super().__init__()
-        self.pad_taxon_id = pad_taxon_id
-        self.nhead = nhead
-        self.n_reg_tokens = int(n_reg_tokens)
 
-        if bias_type not in _VALID_BIAS_TYPES:
-            raise ValueError(
-                f"Unknown bias_type: {bias_type!r}. Expected one of {sorted(_VALID_BIAS_TYPES)}."
-            )
-        self.bias_type = bias_type
+        self.config = config
+        self.input_stem = input_stem
 
-        if abundance_encoding not in _VALID_ABUNDANCE_ENCODING:
-            raise ValueError(
-                f"Unknown abundance_encoding: {abundance_encoding!r}. "
-                f"Expected one of {sorted(_VALID_ABUNDANCE_ENCODING)}."
-            )
-        self.abundance_encoding = abundance_encoding
-        self.use_phylo_pe = use_phylo_pe
-        self.use_protein_pe = use_protein_pe
-
-        # ============ Token identity embedding ============
-        # genus_embed:V5 单 genus embedding。保留 self.taxon_embed 作为同一对象的别名,ckpt 兼容
-        self.taxon_embed = nn.Embedding(genus_vocab_size, d_model, padding_idx=pad_taxon_id)
-        # 别名(V5 语义),与 taxon_embed 共享对象
-        self.genus_embed = self.taxon_embed
-
-        # ============ Abundance embedding ============
-        # bin 路径:nn.Embedding(num_bins+2, d_model)
-        # mlp 路径(V5 默认):MLP(1 → d/4 → d) + LayerNorm + abund_mask_token
-        # 仅创建当前 abundance_encoding 对应的权重(避免无关参数不参与 forward → DDP find_unused)
-        if self.abundance_encoding == "mlp":
-            self.abund_embed = None
-            self.abund_mlp = nn.Sequential(
-                nn.Linear(1, max(1, d_model // 4)),
-                nn.GELU(),
-                nn.Linear(max(1, d_model // 4), d_model),
-                nn.LayerNorm(d_model),
-            )
-            self.abund_mask_token = nn.Parameter(torch.zeros(d_model))
-        else:
-            self.abund_embed = nn.Embedding(total_abundance_bins, d_model, padding_idx=pad_bin_id)
-            self.abund_mlp = None
-            self.abund_mask_token = None
-
-        # ============ Phylo PE(V5) ============
-        # vocab_size 含 PAD/UNK,而 anndata.n_vars(=V_real)不含 → PhyloPE 内部 = genus_vocab_size
-        # genus_vocab_size 已经是 V_real + 2(0=PAD, 1=UNK, 2~=真实 genus)
-        # set_coords([V_real, pe_dim]) 会前置 2 行 0
-        self.phylo_pe: Optional[PhyloPE] = None
-        if self.use_phylo_pe:
-            if pe_dim is None:
-                raise ValueError(
-                    "use_phylo_pe=True requires pe_dim (PE 坐标维度,通常从 datamodule.pe_dim 透传)."
-                )
-            self.phylo_pe = PhyloPE(
-                d_model=d_model,
-                pe_dim=pe_dim,
-                vocab_size=genus_vocab_size,
-                hidden=phylo_pe_hidden,
-            )
-
-        # ============ Protein PE(X2 多任务,2026-05-28 夜) ============
-        # 蛋白功能 prior,镜像 phylo_pe:复用同一 PhyloPE 类(语义对偶)
-        # 等 bacformer_prior 出 varm['protein_pe'] 才启用;phase 1 默认 None
-        self.protein_pe: Optional[PhyloPE] = None
-        if self.use_protein_pe:
-            if protein_pe_dim is None:
-                raise ValueError(
-                    "use_protein_pe=True requires protein_pe_dim (蛋白 PE 坐标维度)."
-                )
-            self.protein_pe = PhyloPE(
-                d_model=d_model,
-                pe_dim=protein_pe_dim,
-                vocab_size=genus_vocab_size,
-                hidden=protein_pe_hidden,
-            )
-
-        # ============ Genus mask token(X2 范式,2026-05-28 夜) ============
-        # 镜像 abund_mask_token:mask 位置的 token embed 被替换为此可学习 token
-        # 防止模型从 token_id 直接 lookup phylo coord 答案(X2 任务的硬约束)
-        # 默认零初始化,跟 abund_mask_token 一致
-        self.genus_mask_token = nn.Parameter(torch.zeros(d_model))
-
-        # ============ JEPA v2 Register token(T-JEPA 防塌,2026-06-06) ============
-        # 序列前缀追加 n_reg_tokens 个可学习 token,只参与 attention、输出丢弃(详 forward)。
-        # normal std=0.02(类 ViT register / [CLS]);n_reg_tokens=0 时不创建(微调链路无此参数)。
-        self.reg_tokens: Optional[nn.Parameter] = None
-        if self.n_reg_tokens > 0:
-            self.reg_tokens = nn.Parameter(torch.empty(self.n_reg_tokens, d_model))
-            nn.init.normal_(self.reg_tokens, std=0.02)
-
-        # ============ Transformer ============
-        biased_layer = BiasedTransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-        )
-        self.encoder = BiasedTransformerEncoder(
-            biased_layer, num_layers=num_layers, grad_checkpointing=grad_checkpointing
+        # Pre-LN Transformer layer with GELU and [B, L, D] input layout.
+        # 使用 GELU、先归一化结构和 [B, L, D] 输入布局的标准编码层。
+        layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.encoder_heads,
+            dim_feedforward=config.encoder_ffn_dim,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
 
-        # V4 R2:距离 bias 模块(None / TaxoDistBias / PhyloDistBias)
-        self.dist_bias = make_dist_bias(
-            bias_type=bias_type,
-            nhead=nhead,
-            phylo_mlp_hidden=phylo_mlp_hidden,
-            phylo_last_layer_bias=phylo_bias_last_layer_bias,
+        # Stack independent layers while retaining dense padded batches.
+        # 堆叠参数独立的编码层，保持补齐后的稠密 batch 布局。
+        self.encoder = nn.TransformerEncoder(
+            layer,
+            num_layers=config.num_layers,
+            enable_nested_tensor=False,
         )
 
-        # 距离矩阵 buffer:persistent=False(不进 ckpt,需 workflow 重新注入)
-        # 2026-05-29 起:phylo_ce loss 也需要 dist_matrix,即使 bias_type='none' 也可能要创建
-        # → 改为 n_vars 是否传入决定是否创建,跟 bias_type 解耦
-        if n_vars is not None and n_vars > 0:
-            placeholder_dtype = torch.float32 if bias_type != "taxo" else torch.int8
-            self.register_buffer(
-                "dist_matrix",
-                torch.zeros((n_vars, n_vars), dtype=placeholder_dtype),
-                persistent=False,
-            )
-            # 2026-05-30:phylo_w (Tree-W) loss = E[d] 量级 ≈ 距离矩阵尺度(分支长度,上百),
-            # 不归一化会淹没 mlm loss(~0.2)数百倍。dist_scale = 非零距离均值,
-            # 在 set_dist_matrix 注入真实矩阵时更新;loss 除以它后落到 ~1 量级,weight 才是真比例。
-            self.register_buffer(
-                "dist_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False
-            )
-            self._dist_matrix_loaded = False
-        else:
-            if bias_type != "none":
-                raise ValueError(
-                    f"bias_type={bias_type!r} requires n_vars (var 表行数) to allocate "
-                    f"the dist_matrix buffer. Pass n_vars=adata.n_vars when building encoder."
-                )
-            self.dist_matrix = None
-            self._dist_matrix_loaded = True
+        # Normalize each output token independently; shape remains [B, L, D].
+        # 分别归一化每个输出 token，形状保持 [B, L, D]。
+        self.final_token_norm = nn.LayerNorm(config.d_model)
 
-        # 蛋白距离矩阵 buffer(2026-05-30,镜像 dist_matrix):persistent=False(不进 ckpt)。
-        # protein_w loss = E[protein_dist] 量级与 phylo 同理,需 protein_dist_scale 归一化。
-        # 与 dist_matrix 解耦:仅 need_protein_dist=True 且 n_vars>0 时创建。
-        if need_protein_dist and n_vars is not None and n_vars > 0:
-            self.register_buffer(
-                "protein_dist_matrix",
-                torch.zeros((n_vars, n_vars), dtype=torch.float32),
-                persistent=False,
-            )
-            self.register_buffer(
-                "protein_dist_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False
-            )
-            self._protein_dist_loaded = False
-        else:
-            self.protein_dist_matrix = None
-            self._protein_dist_loaded = True
-
-        self.layer_norm = nn.LayerNorm(d_model)
-
-    def set_dist_matrix(self, matrix: torch.Tensor) -> None:
-        """注入真实的距离矩阵。
-
-        2026-05-29 起:bias_type='none' 时也允许注入(phylo_ce loss 需要 dist_matrix);
-        前提是 encoder 构造时 n_vars > 0 已经创建了 dist_matrix buffer。
-        """
-        if self.dist_matrix is None:
-            raise RuntimeError(
-                "encoder.dist_matrix is None — pass n_vars > 0 at encoder __init__ "
-                "(needed for bias_type != 'none' OR phylo_ce_weight > 0)."
-            )
-        if matrix.shape != self.dist_matrix.shape:
-            raise ValueError(
-                f"dist_matrix shape mismatch: expected {tuple(self.dist_matrix.shape)}, "
-                f"got {tuple(matrix.shape)}."
-            )
-        # dtype:taxo bucket 用 int8,其余(phylo bias / bias='none' 时的 phylo_ce)用 float32
-        expected_dtype = torch.int8 if self.bias_type == "taxo" else torch.float32
-        if matrix.dtype != expected_dtype:
-            matrix = matrix.to(expected_dtype)
-        self.register_buffer("dist_matrix", matrix.to(self.dist_matrix.device), persistent=False)
-        # 2026-05-30:用真实矩阵的非零距离均值刷新 dist_scale(phylo_w loss 归一化尺度)。
-        # taxo bucket(int8)不走 phylo_w,这里算出的尺度无意义但无害。
-        matrix_f = matrix.float()
-        nz = matrix_f[matrix_f > 0]
-        scale = nz.mean() if nz.numel() > 0 else matrix_f.new_tensor(1.0)
-        self.register_buffer(
-            "dist_scale", scale.detach().to(self.dist_matrix.device), persistent=False
-        )
-        self._dist_matrix_loaded = True
-
-    def set_protein_dist_matrix(self, matrix: torch.Tensor) -> None:
-        """注入真实的蛋白距离矩阵(2026-05-30,精确镜像 set_dist_matrix)。
-
-        前提是 encoder 构造时 need_protein_dist=True + n_vars>0 已经创建了 buffer。
-        protein_dist 是 [V_real, V_real] float32(对角=0、对称,无 PAD/UNK 前置)。
-        """
-        if self.protein_dist_matrix is None:
-            raise RuntimeError(
-                "encoder.protein_dist_matrix is None — pass need_protein_dist=True and "
-                "n_vars > 0 at encoder __init__ (needed for protein_w_weight > 0)."
-            )
-        if matrix.shape != self.protein_dist_matrix.shape:
-            raise ValueError(
-                f"protein_dist_matrix shape mismatch: expected {tuple(self.protein_dist_matrix.shape)}, "
-                f"got {tuple(matrix.shape)}."
-            )
-        if matrix.dtype != torch.float32:
-            matrix = matrix.to(torch.float32)
-        self.register_buffer(
-            "protein_dist_matrix", matrix.to(self.protein_dist_matrix.device), persistent=False
-        )
-        # 用真实矩阵的非零距离均值刷新 protein_dist_scale(protein_w loss 归一化尺度)。
-        matrix_f = matrix.float()
-        nz = matrix_f[matrix_f > 0]
-        scale = nz.mean() if nz.numel() > 0 else matrix_f.new_tensor(1.0)
-        self.register_buffer(
-            "protein_dist_scale", scale.detach().to(self.protein_dist_matrix.device), persistent=False
-        )
-        self._protein_dist_loaded = True
-
-    def _build_token_embedding(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # V5: 单 genus embedding
-        return self.taxon_embed(token_ids)
-
-    def _build_abundance_embedding(
+    def _encode(
         self,
-        abund_bins: Optional[torch.Tensor],
-        abund_values: Optional[torch.Tensor],
-        mask_positions: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if self.abundance_encoding == "mlp":
-            if abund_values is None:
-                raise RuntimeError(
-                    "abundance_encoding='mlp' requires abund_values to be passed to forward()."
-                )
-            # [B, L] → [B, L, 1] → MLP → [B, L, d_model]
-            abund_x = self.abund_mlp(abund_values.unsqueeze(-1).float())
-            # mask 位置替换为 abund_mask_token(广播)
-            if mask_positions is not None and mask_positions.any():
-                mask_expanded = mask_positions.unsqueeze(-1)  # [B, L, 1]
-                abund_x = torch.where(mask_expanded, self.abund_mask_token, abund_x)
-            return abund_x
-        else:
-            # bin 路径
-            if abund_bins is None:
-                raise RuntimeError(
-                    "abundance_encoding='bin' requires abund_bins to be passed to forward()."
-                )
-            return self.abund_embed(abund_bins)
-
-    def forward(
-        self,
-        token_ids: torch.Tensor,                            # [B, L]
-        attention_mask: torch.Tensor,                       # [B, L]  True=Valid, False=PAD
+        genus_ids: Tensor,
+        abundance: Tensor,
+        padding_mask: Tensor,
+        abundance_mask: Tensor | None,
         *,
-        abund_bins: Optional[torch.Tensor] = None,          # [B, L]  bin 路径用
-        abund_values: Optional[torch.Tensor] = None,        # [B, L]  mlp 路径用
-        mask_positions: Optional[torch.Tensor] = None,      # [B, L]  bool,MLM 被 mask 的位置(mlp 路径用)
-        var_indices: Optional[torch.Tensor] = None,         # [B, L]  int64  bias_type!='none' 时必需
-        mask_token_id_replace: bool = False,                # X2 范式:mask 位置 token embed 替换为 genus_mask_token + PE 输出乘 0 防作弊
-    ) -> torch.Tensor:
+        prior_table: Tensor,
+    ) -> Tensor:
+        """Encode genus IDs and abundance [B, L] into contextual vectors [B, L, D].
+        将菌属编号与丰度 [B, L] 编码为上下文向量 [B, L, D]。
         """
-        Returns:
-            h: [B, L, d_model]  token-level 输出(sample-level PMA pooling 在 module 层做)
-        """
-        # ============ Token embedding 三/四段相加 ============
-        token_x = self._build_token_embedding(token_ids)
-        # X2 范式:mask 位置 token embed 替换为可学习 mask token(防 token_id 泄露答案)
-        if mask_token_id_replace and mask_positions is not None and mask_positions.any():
-            mask_expanded = mask_positions.unsqueeze(-1)  # [B, L, 1]
-            token_x = torch.where(mask_expanded, self.genus_mask_token, token_x)
-        abund_x = self._build_abundance_embedding(abund_bins, abund_values, mask_positions)
-        x = token_x + abund_x
-        # phylo PE:mask 位置在 X2 下要乘 0(防 phylo_pe.coords[token_id] 泄露答案)
-        if self.use_phylo_pe and self.phylo_pe is not None:
-            pe_x = self.phylo_pe(token_ids)
-            if mask_token_id_replace and mask_positions is not None and mask_positions.any():
-                pe_x = pe_x * (~mask_positions).unsqueeze(-1).to(pe_x.dtype)
-            x = x + pe_x
-        # protein PE:同 phylo PE 屏蔽逻辑
-        if self.use_protein_pe and self.protein_pe is not None:
-            ppe_x = self.protein_pe(token_ids)
-            if mask_token_id_replace and mask_positions is not None and mask_positions.any():
-                ppe_x = ppe_x * (~mask_positions).unsqueeze(-1).to(ppe_x.dtype)
-            x = x + ppe_x
-
-        # ============ attention mask ============
-        key_padding_mask = ~attention_mask  # [B, L]
-
-        # ============ Attention bias(R2) ============
-        attn_bias: Optional[torch.Tensor] = None
-        if self.bias_type != "none":
-            if var_indices is None:
-                raise RuntimeError(
-                    f"bias_type={self.bias_type!r} requires var_indices to be passed to forward()."
-                )
-            if not self._dist_matrix_loaded:
-                raise RuntimeError(
-                    "dist_matrix has not been loaded. Call encoder.set_dist_matrix(...) before forward()."
-                )
-            attn_bias = self.dist_bias(var_indices, self.dist_matrix)  # [B, nhead, L, L]
-
-        # ============ JEPA v2 Register token 前缀(2026-06-06) ============
-        # 把 n_reg_tokens 个可学习 register token 拼到序列**最前面**(prefix):
-        #   - x         : [B, n_reg+L, d]      register 行不带 abund/PE,纯可学习 token
-        #   - key_padding: register 列恒 valid(False=不屏蔽)→ genus token 能 attend register
-        #   - attn_bias : 若有(phylo bias),pad register 行/列为 0(register 与任何 token 无 phylo 偏置)
-        # forward 末尾切掉前 n_reg 行还原 [B, L, d] → 下游 target_mask/PMA/predictor 索引零偏移。
-        n_reg = self.n_reg_tokens
-        if n_reg > 0 and self.reg_tokens is not None:
-            B = x.shape[0]
-            reg = self.reg_tokens.view(1, n_reg, -1).expand(B, -1, -1).to(x.dtype)  # [B, n_reg, d]
-            x = torch.cat([reg, x], dim=1)                                          # [B, n_reg+L, d]
-            reg_kpm = torch.zeros(B, n_reg, dtype=key_padding_mask.dtype, device=key_padding_mask.device)
-            key_padding_mask = torch.cat([reg_kpm, key_padding_mask], dim=1)        # register 不屏蔽
-            if attn_bias is not None:
-                # attn_bias [B, nhead, L, L] → pad 成 [B, nhead, n_reg+L, n_reg+L],register 行列填 0
-                attn_bias = F.pad(attn_bias, (n_reg, 0, n_reg, 0), value=0.0)
-
-        h = self.encoder(x, key_padding_mask=key_padding_mask, attn_bias=attn_bias)
-        h = self.layer_norm(h)
-        # 丢弃 register 输出,还原原始 genus 序列布局(下游索引/池化对齐不被偏移破坏)
-        if n_reg > 0 and self.reg_tokens is not None:
-            h = h[:, n_reg:, :]
-        return h
+        # abundance_mask hides abundance only; None preserves all supplied abundance.
+        # abundance_mask 仅遮盖丰度、保留身份；None 表示不额外遮盖丰度。
+        # Only fixed input identities use the prior table supplied by MiCoFormer.
+        # 仅 fixed 输入身份使用 MiCoFormer 传入的先验表，不在此保存副本。
+        if self.config.identity_type == "fixed":
+            h = self.input_stem(genus_ids, abundance, padding_mask, abundance_mask, prior_table=prior_table)
+        else:
+            h = self.input_stem(genus_ids, abundance, padding_mask, abundance_mask)
+        # True entries exclude PAD or Query-removed positions from attention keys/values.
+        # True 标记 PAD 或 Query 移除位置，使其不作为注意力的键和值。
+        h = self.encoder(h, src_key_padding_mask=padding_mask)
+        h = self.final_token_norm(h)
+        # Attention masking does not zero output positions; clear all D features explicitly.
+        # 注意力屏蔽不保证对应输出为零，因此明确将忽略位置的全部 D 个特征归零。
+        return h.masked_fill(padding_mask.unsqueeze(-1), 0.0)
