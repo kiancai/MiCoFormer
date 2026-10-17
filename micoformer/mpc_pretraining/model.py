@@ -58,6 +58,7 @@ class QueryOutput:
     positive_continuous: Tensor
     positive_target: Tensor
     positive_count: int
+    sample_h: Tensor
 
 
 class MPCForwardOutput(NamedTuple):
@@ -240,6 +241,7 @@ class MPCPretrainingModel(nn.Module):
             positive_continuous=positive_continuous,
             positive_target=rclr[query_mask].float(),
             positive_count=int(positive_ids.numel()),
+            sample_h=sample_h,
         )
 
     @staticmethod
