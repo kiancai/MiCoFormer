@@ -20,7 +20,7 @@ def weighted_unifrac(mass,length):
         if not torch.isfinite(result).all():raise ValueError('nonfinite UniFrac')
         return result
 
-def neighborhood_loss(h,distances):
+def neighborhood_details(h,distances):
     if len(h)<2:raise ValueError('neighborhood needs at least two anchors')
     with torch.autocast(device_type=h.device.type,enabled=False):
         diagonal=torch.eye(len(h),device=h.device,dtype=torch.bool)
@@ -31,4 +31,12 @@ def neighborhood_loss(h,distances):
         logp=torch.log_softmax(logits,1).masked_fill(diagonal,0.)
         loss=-(prob*logp).sum(1).mean()
         if not torch.isfinite(loss):raise ValueError('nonfinite neighborhood loss')
-        return loss
+        with torch.no_grad():
+            teacher_logp=torch.log_softmax(teacher_logits,1).masked_fill(diagonal,0.)
+            entropy=-(prob*teacher_logp).sum(1).mean()
+            kl=(prob*(teacher_logp-logp.detach())).sum(1).mean()
+        return loss,entropy,kl
+
+
+def neighborhood_loss(h,distances):
+    return neighborhood_details(h,distances)[0]

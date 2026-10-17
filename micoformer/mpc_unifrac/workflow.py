@@ -27,8 +27,8 @@ from .data import (
     batch_to_device,
 )
 from micoformer.mpc_fixed_pretraining.model import MPCFixedModelConfig as MPCModelConfig
-from .model import WeakUniFracModel as MPCPretrainingModel
-from .teacher import ASSETS,TEACHER_T,STUDENT_T
+from .model import UniFracModel as MPCPretrainingModel
+from .teacher import ASSETS,TEACHER_T,STUDENT_T,weighted_unifrac,neighborhood_details
 
 
 SCHEMA_VERSION = 1
@@ -42,12 +42,14 @@ EXPECTED_VAL_SHA256 = "beebe861783d1cf715265819d67a7af062c0c7593209104ccf64bb947
 
 
 @dataclass(frozen=True)
-class MPCRunConfig:
+class UniFracRunConfig:
     corpus: Path
     train_rows: Path
     val_rows: Path
     prior_assets: Path
     output_root: Path
+    initialization_checkpoint: Path
+    unifrac_weight: float
     seed: int = 42
     batch_size_per_rank: int = 128
     workers_per_rank: int = 2
@@ -82,18 +84,27 @@ class MPCRunConfig:
         if fixed != expected:
             raise ValueError("the user-approved first full-data training contract drifted")
 
-    def normalized(self) -> "MPCRunConfig":
-        return MPCRunConfig(
+    @property
+    def loss_weights(self) -> dict[str, float]:
+        # Preserve the reference MPC recipe; choose UniFrac strength explicitly.
+        # 保留原 MPC 配方，UniFrac 强度由调用方显式指定。
+        return {"mlm": 1.0, "continuous": 0.534399128791011,
+                "presence": 0.24296011504612833, "unifrac": self.unifrac_weight}
+
+    def normalized(self) -> "UniFracRunConfig":
+        return UniFracRunConfig(
             corpus=self.corpus.resolve(),
             train_rows=self.train_rows.resolve(),
             val_rows=self.val_rows.resolve(),
             prior_assets=self.prior_assets.resolve(),
             output_root=self.output_root.resolve(),
+            initialization_checkpoint=self.initialization_checkpoint.resolve(),
+            unifrac_weight=self.unifrac_weight,
         )
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        for name in ("corpus", "train_rows", "val_rows", "prior_assets", "output_root"):
+        for name in ("corpus", "train_rows", "val_rows", "prior_assets", "output_root", "initialization_checkpoint"):
             payload[name] = str(payload[name])
         return payload
 
@@ -140,11 +151,10 @@ def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
 
 def _source_files() -> list[Path]:
     repo = Path(__file__).resolve().parents[2]
-    exp = repo.parent / "tmp/20260923_mpc_fixedpp_v31_weak_unifrac"
-    return sorted(repo.glob("micoformer/**/*.py")) + sorted((exp / "scripts").glob("*.py"))
+    return sorted(repo.glob("micoformer/**/*.py")) + sorted((repo / "scripts").glob("*mpc_unifrac*.py"))
 
 
-def _manifest_payload(config: MPCRunConfig, *, hash_corpus: bool) -> dict[str, Any]:
+def _manifest_payload(config: UniFracRunConfig, *, hash_corpus: bool) -> dict[str, Any]:
     config = config.normalized()
     train = np.load(config.train_rows, mmap_mode="r", allow_pickle=False)
     val = np.load(config.val_rows, mmap_mode="r", allow_pickle=False)
@@ -207,7 +217,7 @@ def _manifest_payload(config: MPCRunConfig, *, hash_corpus: bool) -> dict[str, A
         "assets": assets,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
-        "fixed_weights": FIXED_WEIGHTS,
+        "fixed_weights": config.loss_weights,
         "teacher_assets": {str(p):sha256_file(p) for p in ASSETS.iterdir() if p.is_file()},
         "temperatures": {"teacher":TEACHER_T,"student":STUDENT_T},
         "probe_assets": {
@@ -215,8 +225,8 @@ def _manifest_payload(config: MPCRunConfig, *, hash_corpus: bool) -> dict[str, A
             for path in sorted((config.output_root / "audit/probe").glob("*"))
         },
         "initialization_asset": {
-            "path": str(config.output_root.parents[1] / "tmp/20260817_mpc_fixed_context_full_data_pretraining/run/epoch0.pt"),
-            "sha256": sha256_file(config.output_root.parents[1] / "tmp/20260817_mpc_fixed_context_full_data_pretraining/run/epoch0.pt"),
+            "path": str(config.initialization_checkpoint),
+            "sha256": sha256_file(config.initialization_checkpoint),
         },
         "training_reduction": "global target-count mean per component; no duplicated or dropped rows",
         "deterministic_algorithms": True,
@@ -228,7 +238,7 @@ def _manifest_payload(config: MPCRunConfig, *, hash_corpus: bool) -> dict[str, A
     return payload
 
 
-def prepare_run(config: MPCRunConfig) -> Path:
+def prepare_run(config: UniFracRunConfig) -> Path:
     config = config.normalized()
     manifest = _manifest_payload(config, hash_corpus=True)
     path = config.output_root / "audit/sealed_run_manifest.json"
@@ -241,7 +251,7 @@ def prepare_run(config: MPCRunConfig) -> Path:
     return path
 
 
-def validate_sealed_run(config: MPCRunConfig) -> dict[str, Any]:
+def validate_sealed_run(config: UniFracRunConfig) -> dict[str, Any]:
     config = config.normalized()
     path = config.output_root / "audit/sealed_run_manifest.json"
     if not path.is_file():
@@ -280,7 +290,7 @@ def _init_distributed() -> tuple[int, int, int, torch.device]:
     return rank, world, local_rank, device
 
 
-def _load_prior(config: MPCRunConfig) -> tuple[Tensor, np.ndarray]:
+def _load_prior(config: UniFracRunConfig) -> tuple[Tensor, np.ndarray]:
     with np.load(config.prior_assets, allow_pickle=False) as archive:
         table = torch.from_numpy(np.asarray(archive["pp_table"])).float()
         observed = np.asarray(archive["observed_genus_ids"], dtype=np.int64)
@@ -300,7 +310,7 @@ class _LoaderBundle:
 
 
 def _build_loaders(
-    config: MPCRunConfig,
+    config: UniFracRunConfig,
     *,
     rank: int,
     world: int,
@@ -509,7 +519,7 @@ def _assert_gradient_sync(
     return maximum
 
 
-def _load_calibration(config: MPCRunConfig, sealed: Mapping[str, Any]) -> dict[str, Any]:
+def _load_calibration(config: UniFracRunConfig, sealed: Mapping[str, Any]) -> dict[str, Any]:
     path = config.output_root / "audit/loss_weights.json"
     payload = json.loads(path.read_text())
     expected = payload.pop("calibration_sha256")
@@ -517,7 +527,7 @@ def _load_calibration(config: MPCRunConfig, sealed: Mapping[str, Any]) -> dict[s
     payload["calibration_sha256"] = expected
     if expected != actual or payload["manifest_sha256"] != sealed["manifest_sha256"]:
         raise RuntimeError("loss coefficient contract mismatch")
-    if payload["lambda"] != FIXED_WEIGHTS or payload["mode"] != "MLM_NORMALIZED_SELECTED_FIXED_RECIPE":
+    if payload["lambda"] != config.loss_weights or payload["mode"] != "EXPLICIT_UNIFRAC_WEIGHT":
         raise RuntimeError("fixed coefficients drifted; no recalibration permitted")
     if sha256_file(payload["epoch0"]["path"]) != payload["epoch0"]["sha256"]:
         raise RuntimeError("bound epoch0 changed")
@@ -525,7 +535,7 @@ def _load_calibration(config: MPCRunConfig, sealed: Mapping[str, Any]) -> dict[s
 
 
 def _load_epoch0_model(
-    config: MPCRunConfig,
+    config: UniFracRunConfig,
     sealed: Mapping[str, Any],
     calibration: Mapping[str, Any],
     device: torch.device,
@@ -581,6 +591,7 @@ def _loss_statistics_tensor(
     values=[]
     for n in NAMES:
         values.extend([float(getattr(output,n+'_loss').detach())*getattr(output,n+'_count'),float(getattr(output,n+'_count'))])
+    values.extend([float(output.unifrac_teacher_entropy)*output.unifrac_count, float(output.unifrac_kl)*output.unifrac_count])
     values.extend([sum(float(lambdas[n])*float(getattr(output,n+'_loss').detach()) for n in NAMES),1.])
     return torch.tensor(values,device=device,dtype=torch.float64)
 
@@ -589,7 +600,7 @@ def _unpack_loss_statistics(values,lambdas):
     a=values.detach().cpu().numpy()
     raw={n:float(a[2*i]/a[2*i+1]) for i,n in enumerate(NAMES)}
     weighted={n:float(lambdas[n])*raw[n] for n in NAMES}
-    return dict(**raw,weighted_total=sum(weighted.values()),mean_batch_weighted_total=float(a[-2]/a[-1]),raw_components=raw,weighted_components=weighted,target_counts={n:int(a[2*i+1]) for i,n in enumerate(NAMES)})
+    return dict(**raw,weighted_total=sum(weighted.values()),mean_batch_weighted_total=float(a[-2]/a[-1]),raw_components=raw,weighted_components=weighted,target_counts={n:int(a[2*i+1]) for i,n in enumerate(NAMES)},unifrac_diagnostics=dict(teacher_entropy=float(a[8]/a[7]),kl=float(a[9]/a[7]),ce_minus_entropy_minus_kl=float(raw["unifrac"]-(a[8]+a[9])/a[7])))
 
 
 def _spectral_summary(count: int, sum_h: Tensor, sum_outer: Tensor) -> dict[str, Any]:
@@ -641,7 +652,8 @@ def _validate_epoch(
     device: torch.device,
 ) -> dict[str, Any]:
     ddp.eval()
-    statistics = torch.zeros(10, device=device, dtype=torch.float64)
+    statistics = torch.zeros(12, device=device, dtype=torch.float64)
+    clean_statistics = torch.zeros(4, device=device, dtype=torch.float64)
     representation_count = torch.zeros((), device=device, dtype=torch.float64)
     sum_h = torch.zeros(512, device=device, dtype=torch.float64)
     sum_outer = torch.zeros((512, 512), device=device, dtype=torch.float64)
@@ -654,12 +666,15 @@ def _validate_epoch(
             _, mean = ddp.module.unmasked_representations(
                 arguments["genus_ids"], arguments["rclr"], arguments["padding_mask"]
             )
+        clean_ce, clean_h, clean_kl = neighborhood_details(mean,weighted_unifrac(arguments['edge_mass'],ddp.module.unifrac_lengths))
+        anchors = mean.shape[0]
+        clean_statistics += torch.stack([clean_ce.double()*anchors,clean_h.double()*anchors,clean_kl.double()*anchors,torch.as_tensor(anchors,device=device,dtype=torch.float64)])
         statistics += _loss_statistics_tensor(output, lambdas, device=device)
         mean64 = mean.float().double()
         representation_count += mean64.shape[0]
         sum_h += mean64.sum(0)
         sum_outer += mean64.T @ mean64
-    for tensor in (statistics, representation_count, sum_h, sum_outer):
+    for tensor in (statistics, clean_statistics, representation_count, sum_h, sum_outer):
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     rows_array = np.concatenate(local_rows)
     gathered_rows: list[np.ndarray] | None = [None] * world if rank == 0 else None  # type: ignore[list-item]
@@ -673,6 +688,7 @@ def _validate_epoch(
             raise RuntimeError("distributed validation rows contain padding, duplication, or omission")
         payload = {
             "loss": _unpack_loss_statistics(statistics, lambdas),
+            "clean_unifrac_diagnostics": dict(zip(["ce","teacher_entropy","kl"],(clean_statistics[:3]/clean_statistics[3]).cpu().tolist())),
             "representation": _spectral_summary(
                 int(representation_count.item()), sum_h.cpu(), sum_outer.cpu()
             ),
@@ -717,7 +733,7 @@ def _checkpoint_payload(
     sealed: Mapping[str, Any],
     rng_by_rank: list[dict[str, Any]],
     validation: Mapping[str, Any],
-    config: MPCRunConfig,
+    config: UniFracRunConfig,
 ) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -741,7 +757,7 @@ def _checkpoint_payload(
 
 def _save_training_checkpoint(
     *,
-    config: MPCRunConfig,
+    config: UniFracRunConfig,
     ddp: DDP,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LambdaLR,
@@ -809,12 +825,12 @@ def _save_training_checkpoint(
     return result
 
 
-def run_ddp_smoke(config: MPCRunConfig) -> Path:
+def run_ddp_smoke(config: UniFracRunConfig) -> Path:
     from .support import integrated_smoke
     return integrated_smoke(config)
 
 
-def _validate_smoke(config: MPCRunConfig, sealed: Mapping[str, Any], calibration: Mapping[str, Any]) -> None:
+def _validate_smoke(config: UniFracRunConfig, sealed: Mapping[str, Any], calibration: Mapping[str, Any]) -> None:
     path = config.output_root / "audit/ddp_smoke.json"
     if not path.is_file():
         raise RuntimeError("run the three-rank DDP smoke before formal training")
@@ -843,7 +859,7 @@ def _validate_smoke(config: MPCRunConfig, sealed: Mapping[str, Any], calibration
 def _load_resume(
     path: Path,
     *,
-    config: MPCRunConfig,
+    config: UniFracRunConfig,
     sealed: Mapping[str, Any],
     lambdas: Mapping[str, float],
     ddp: DDP,
@@ -875,7 +891,7 @@ def _load_resume(
     )
 
 
-def run_full_pretraining(config: MPCRunConfig, *, resume: Path | None = None) -> Path:
+def run_full_pretraining(config: UniFracRunConfig, *, resume: Path | None = None) -> Path:
     config = config.normalized()
     sealed = validate_sealed_run(config)
     calibration = _load_calibration(config, sealed)
@@ -959,7 +975,7 @@ def run_full_pretraining(config: MPCRunConfig, *, resume: Path | None = None) ->
             loaders.train_epoch.set(epoch)
             epoch_started = perf_counter()
             torch.cuda.reset_peak_memory_stats(device)
-            train_statistics = torch.zeros(10, device=device, dtype=torch.float64)
+            train_statistics = torch.zeros(12, device=device, dtype=torch.float64)
             local_samples = 0
             local_row_ids = []
             first_step_gradient_sync_max_abs = math.nan
@@ -1120,4 +1136,4 @@ def run_full_pretraining(config: MPCRunConfig, *, resume: Path | None = None) ->
         if dist.is_initialized():
             dist.destroy_process_group()
 
-from .support import (NAMES, FIXED_WEIGHTS, ExactDistributedSampler, distributed_training_loss, verify_epoch_rows, run_fixed_gradient_probe)
+from .support import (NAMES, ExactDistributedSampler, distributed_training_loss, verify_epoch_rows, run_fixed_gradient_probe)

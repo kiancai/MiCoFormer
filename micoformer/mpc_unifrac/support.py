@@ -17,8 +17,7 @@ from .data import (
     FullSupportRowDataset, DualCorruptionCollator, SharedEpoch, batch_to_device,
 )
 
-FIXED_WEIGHTS = {"mlm": 1.0, "continuous": 0.534399128791011, "presence": 0.24296011504612833, "unifrac": 0.00005}
-NAMES = tuple(FIXED_WEIGHTS)
+NAMES = ("mlm", "continuous", "presence", "unifrac")
 
 
 class ExactDistributedSampler(DistributedSampler):
@@ -153,6 +152,26 @@ def run_fixed_gradient_probe(config, model, observed, weights, *, epoch, step, r
                 local_batch_sha256=w.sha256_file(path), optimizer_update=False)
             if not all(math.isfinite(x) for x in [*norms.values(), *losses.values(), *cosines.values(), record['weighted_vector_sum_norm']]):
                 raise RuntimeError('nonfinite fixed gradient probe')
+            # Observational paired views only: no gradients, no optimizer update;
+            # outer RNG save/restore and parameter hash checks cover both forwards.
+            from .teacher import weighted_unifrac,neighborhood_details
+            with torch.no_grad():
+                distances=weighted_unifrac(arguments['edge_mass'],model.unifrac_lengths)
+                diagnostics={}
+                for view in ['query_masked','clean']:
+                    with torch.autocast('cuda',dtype=torch.bfloat16):
+                        if view=='clean':
+                            _,h=model.unmasked_representations(arguments['genus_ids'],arguments['rclr'],arguments['padding_mask'])
+                        else:
+                            h=model._query_output(arguments['genus_ids'],arguments['rclr'],arguments['padding_mask'],arguments['query_mask'],arguments['negative_genus_ids']).sample_h
+                    ce,entropy,kl=neighborhood_details(h,distances)
+                    sums=torch.stack([ce.double(),entropy.double(),kl.double()])*len(h)
+                    dist.all_reduce(sums)
+                    diagnostics[view]=dict(zip(['ce','teacher_entropy','kl'],(sums/counts[3]).cpu().tolist()))
+                    del h
+                if abs(diagnostics['query_masked']['ce']-losses['unifrac'])>1e-5:
+                    raise RuntimeError('fixed masked diagnostic drifted from gradient probe')
+                record['unifrac_view_diagnostics']=diagnostics
             records.append(record)
             del gradients, arguments, combined
         if before_state != w._model_state_sha256(model) or any(p.grad is not None for p in model.parameters()):
@@ -189,7 +208,7 @@ def integrated_smoke(config):
                   gradient_as_bucket_view=True, static_graph=True)
         opt = torch.optim.AdamW(ddp.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
         sched = w._make_scheduler(opt, total_steps=50*5270, warmup_ratio=.02, base_lr=3e-4, minimum_lr=1e-6)
-        weights = FIXED_WEIGHTS
+        weights = config.loss_weights
         torch.cuda.reset_peak_memory_stats(device)
         losses = []
         initial_probe=run_fixed_gradient_probe(config,model,observed,weights,epoch=0,step=0,rank=rank,world=world,device=device)

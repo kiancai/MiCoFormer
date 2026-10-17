@@ -1,9 +1,12 @@
+"""Add UniFrac supervision to the Query sample representation.
+在 Query 样本表示上增加 UniFrac 邻域监督。
+"""
 from typing import NamedTuple
 import numpy as np
 import torch
 from torch import Tensor
 from micoformer.mpc_fixed_pretraining.model import MPCFixedPretrainingModel,MPCFixedModelConfig
-from .teacher import ASSETS,weighted_unifrac,neighborhood_loss
+from .teacher import ASSETS,weighted_unifrac,neighborhood_loss,neighborhood_details
 class Output(NamedTuple):
     mlm_loss:Tensor
     continuous_loss:Tensor
@@ -13,7 +16,9 @@ class Output(NamedTuple):
     continuous_count:int
     presence_count:int
     unifrac_count:int
-class WeakUniFracModel(MPCFixedPretrainingModel):
+    unifrac_teacher_entropy:Tensor
+    unifrac_kl:Tensor
+class UniFracModel(MPCFixedPretrainingModel):
     def __init__(self,candidate_table,config=None):
         super().__init__(candidate_table,config or MPCFixedModelConfig())
         self.register_buffer('unifrac_lengths',torch.from_numpy(np.load(ASSETS/'branch_lengths.npy')).float(),persistent=False)
@@ -23,8 +28,8 @@ class WeakUniFracModel(MPCFixedPretrainingModel):
         m,mc=self._mlm_loss(genus_ids,rclr,padding,mlm_mask)
         q=self._query_output(genus_ids,rclr,padding,query_mask,negative_genus_ids)
         c,p,cc,pc=self._query_losses(q)
-        u=neighborhood_loss(q.sample_h,weighted_unifrac(edge_mass,self.unifrac_lengths))
-        return Output(m,c,p,u,mc,cc,pc,len(genus_ids))
+        u,entropy,kl=neighborhood_details(q.sample_h,weighted_unifrac(edge_mass,self.unifrac_lengths))
+        return Output(m,c,p,u,mc,cc,pc,len(genus_ids),entropy,kl)
     def component_loss(self,component,**arguments):
         mass=arguments.pop('edge_mass')
         if component!='unifrac':return super().component_loss(component,**arguments)
