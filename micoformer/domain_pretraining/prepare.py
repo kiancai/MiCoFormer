@@ -1,4 +1,4 @@
-"""Freeze V3.3 domain rows, train-only vocabulary, initialization and provenance."""
+"""Freeze V3.4 domain rows, train-only vocabulary, initialization and provenance."""
 from __future__ import annotations
 
 import hashlib
@@ -21,7 +21,7 @@ from micoformer.mpc_unifrac.model import UniFracModel
 from micoformer.mpc_unifrac.teacher import ASSETS, TEACHER_T, STUDENT_T
 
 BASE_COMMIT = "28de0ee4f2b363cb4130f86064a542c3e3666fea"
-CORPUS_SHA256 = "4373cace4204621e4438ee2e05531c3677a0eaa437289bbdbf0805f581a8d887"
+CORPUS_SHA256 = "1bacb2ee3fc88006ad472c500df585997380a98bf88b37e52da04df4cedc0b41"
 PRIOR_SHA256 = "6a2c08d216efb90499720eec5aa872df5275a62d5e8052760a5105765262262c"
 INITIAL_12_SHA256 = "011f34e4e98652ae60cfb8c7e4a821061e2e8a39fc2132312921035fce1157a5"
 WEIGHTS = dict(mlm=1., continuous=.534399128791011,
@@ -107,7 +107,7 @@ def prepare_experiment(output: Path) -> Path:
     if manifest_path.exists():
         raise FileExistsError("existing preparation is immutable; validate or choose a new directory")
     source = source_identity()
-    corpus = PROJECT / "data/MCFCorpusV3.3/MCFCorpusV3.3.gg2.h5ad"
+    corpus = PROJECT / "data/MCFCorpusV3.4/MCFCorpusV3.4.gg2.h5ad"
     prepared = corpus.parent / "prepared"
     prior = PROJECT / "tmp/20260813_fixed_prior_query_architecture_gate/cache/prior_assets.npz"
     initial = PROJECT / "tmp/20260817_mpc_fixed_context_full_data_pretraining/run/epoch0.pt"
@@ -118,6 +118,17 @@ def prepare_experiment(output: Path) -> Path:
         if assets[key]["sha256"] != expected:
             raise ValueError(f"unexpected {key} identity")
     prep = json.loads((prepared / "preparation.json").read_text())
+    release = json.loads((corpus.parent / "release_manifest.json").read_text())
+    verification = json.loads((corpus.parent / "verification.json").read_text())
+    if (release["status"] != "RELEASED" or release["version"] != "MCFCorpusV3.4"
+            or release["files"][corpus.name]["sha256"] != CORPUS_SHA256
+            or verification["status"] != "PASS"
+            or verification["output_sha256"] != CORPUS_SHA256
+            or prep["corpus"]["version"] != "MCFCorpusV3.4"
+            or prep["corpus"]["sha256"] != CORPUS_SHA256):
+        raise ValueError("V3.4 release/preparation identity is not verified")
+    assets["corpus_release"] = file_record(corpus.parent / "release_manifest.json")
+    assets["corpus_verification"] = file_record(corpus.parent / "verification.json")
     assets["canonical_preparation"] = file_record(prepared / "preparation.json")
     canonical = {}
     for split in ("all", "train", "val"):
@@ -125,7 +136,7 @@ def prepare_experiment(output: Path) -> Path:
         path = prepared / record["file"]
         assets["canonical_" + split] = file_record(path)
         if assets["canonical_" + split]["sha256"] != record["sha256"]:
-            raise ValueError("canonical V3.3 split changed")
+            raise ValueError("canonical V3.4 split changed")
         canonical[split] = np.load(path, allow_pickle=False)
         if len(canonical[split]) != record["count"] or len(np.unique(canonical[split])) != len(canonical[split]):
             raise ValueError("invalid canonical split")
@@ -257,10 +268,10 @@ def prepare_experiment(output: Path) -> Path:
                 steps_per_epoch=math.ceil(batches / 3), total_steps=50 * math.ceil(batches / 3))
     manifest = dict(schema_version=1, status="SEALED", machine="CmlLab", node=socket.gethostname(),
         prepared_at=datetime.now().astimezone().isoformat(), source=source, assets=assets,
-        corpus_version="MCFCorpusV3.3", domains=domains, arms=arms,
+        corpus_version="MCFCorpusV3.4", domains=domains, arms=arms,
         domain_policy=dict(human_gold_l2="Mammals: Human", primary_only=True,
             gut_gold_l3="Digestive system", gut_gold_l4=list(GUT_SITES),
-            respiratory_gold_l3="Respiratory system", split="intersection_with_V3.3_published_splits",
+            respiratory_gold_l3="Respiratory system", split="intersection_with_V3.4_published_splits",
             split_limit="row-random; not Study/subject held out; retain source duplicate policy"),
         torch=torch.__version__, cuda=torch.version.cuda)
     common._atomic_json(manifest_path, manifest)

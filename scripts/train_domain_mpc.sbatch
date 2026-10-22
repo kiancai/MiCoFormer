@@ -11,7 +11,7 @@
 set -euo pipefail
 # Slurm copies the batch script to its spool; use the worktree bound to the
 # manifest/commit instead of treating that temporary script path as a repo.
-worktree=/home/cml_lab/caiqy/project/MCFProjet/exp-20261022_domain_corpus_pretraining
+worktree=${5:?Submitter must bind the exact source worktree}
 cd -- "$worktree"
 manifest=$1
 manifest_sha=$2
@@ -44,4 +44,4 @@ scontrol show job -dd "$SLURM_JOB_ID"
 nvidia-smi
 exec /home/cml_lab/anaconda3/envs/MiCoFormerV2/bin/python \
     scripts/2.train_domain_mpc.py job --manifest "$manifest" \
-    --manifest-sha256 "$manifest_sha" --arm "$arm" "${@:5}"
+    --manifest-sha256 "$manifest_sha" --arm "$arm" "${@:6}"

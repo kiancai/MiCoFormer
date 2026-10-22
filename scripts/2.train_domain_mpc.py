@@ -37,7 +37,7 @@ def submit(manifest_path: Path, expected_sha: str, arms=None):
         command = ["sbatch", "--parsable", "--job-name=" + label,
             "--output=" + str(logs / "%x-%j.out"), "--error=" + str(logs / "%x-%j.err"),
             str(REPO / "scripts/train_domain_mpc.sbatch"), str(manifest_path), expected_sha,
-            name, manifest["source"]["commit"]]
+            name, manifest["source"]["commit"], str(REPO)]
         result = subprocess.run(command, text=True, capture_output=True)
         if result.returncode:
             raise RuntimeError(f"sbatch failed for {name}: {result.stderr.strip()}")
