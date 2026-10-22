@@ -18,8 +18,9 @@ from torch.utils.data import DataLoader
 
 from .data import DomainModelConfig, ExactBatchSampler, accumulation_groups, accumulation_loss, target_counts
 from .prepare import validate_manifest
+from .input import InMemoryFullSupportRowDataset as FullSupportRowDataset
 from micoformer.mpc_unifrac import workflow as common
-from micoformer.mpc_unifrac.data import FullSupportRowDataset, DualCorruptionCollator, SharedEpoch, batch_to_device
+from micoformer.mpc_unifrac.data import DualCorruptionCollator, SharedEpoch, batch_to_device
 from micoformer.mpc_unifrac.model import UniFracModel
 from micoformer.mpc_unifrac.teacher import weighted_unifrac, neighborhood_details
 from micoformer.mpc_unifrac.support import _state_close
@@ -96,6 +97,7 @@ def make_loader(arm, corpus, split: str, *, epoch: int, start_batch: int = 0, wo
     # the model dropout RNG, which makes cursor-based resume reproducible.
     loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collator,
         num_workers=worker_count, pin_memory=True,
+        multiprocessing_context="fork" if worker_count else None,
         prefetch_factor=2 if worker_count else None,
         generator=torch.Generator().manual_seed(arm["seed"] + epoch + (0 if split == "train" else 10000)))
     return loader, sampler, rows
