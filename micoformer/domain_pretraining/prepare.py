@@ -75,6 +75,11 @@ def select_domains(primary, l2, l3, l4) -> dict[str, np.ndarray]:
     }
 
 
+def normalize_run_ids(values) -> np.ndarray:
+    """Preserve missing Run identities without adding a categorical value."""
+    return pd.Series(values).astype("string").fillna("").to_numpy(dtype=str)
+
+
 def prepare_experiment(output: Path) -> Path:
     output = output.resolve()
     manifest_path = output / "audit/domain_run_manifest.json"
@@ -141,7 +146,7 @@ def prepare_experiment(output: Path) -> Path:
         observed = {}
         indptr = h["X/indptr"][:]
         richness = np.diff(indptr)
-        runs = np.asarray(pd.Series(meta["Run"]).fillna("").astype(str))
+        runs = normalize_run_ids(meta["Run"])
         for name, rows in masks.items():
             train = np.intersect1d(rows, canonical["train"])
             val = np.intersect1d(rows, canonical["val"])

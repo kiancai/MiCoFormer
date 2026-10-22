@@ -2,13 +2,14 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import unittest
 import torch
 
 from micoformer.domain_pretraining.data import (
     DomainModelConfig, ExactBatchSampler, accumulation_loss, accumulation_groups,
 )
-from micoformer.domain_pretraining.prepare import select_domains
+from micoformer.domain_pretraining.prepare import select_domains, normalize_run_ids
 from micoformer.mpc_unifrac.support import NAMES
 
 
@@ -66,6 +67,10 @@ def test_domain_selection_excludes_oral_ambiguous_nonhuman_and_nonprimary():
 
 
 class SingleGpuContractTests(unittest.TestCase):
+    def test_missing_categorical_Run_is_not_an_accession(self):
+        values = pd.Categorical(["SRR1", None, "SRR2", None])
+        assert normalize_run_ids(values).tolist() == ["SRR1", "", "SRR2", ""]
+
     def test_exact_coverage(self):
         for size in (2, 127, 128, 129, 255, 256, 257, 383, 384, 385, 111439):
             with self.subTest(size=size):
