@@ -27,6 +27,7 @@ INITIAL_12_SHA256 = "011f34e4e98652ae60cfb8c7e4a821061e2e8a39fc2132312921035fce1
 WEIGHTS = dict(mlm=1., continuous=.534399128791011,
                presence=.24296011504612833, unifrac=.00005)
 GUT_SITES = ("Large intestine", "Small intestine", "Lower gastrointestinal tract")
+SUBMISSION_ORDER = ("respiratory_12l", "respiratory_6l", "gut_12l", "gut_6l")
 REPO = Path(__file__).resolve().parents[2]
 PROJECT = REPO.parent
 GIT_BINARY = "/home/cml_lab/anaconda3/bin/git"  # Verified 2.42; system Git lacks worktree support.
@@ -69,21 +70,25 @@ def validate_manifest(path: Path, expected_sha256: str) -> dict:
     return manifest
 
 
-def rebind_source(path: Path, expected_sha256: str, destination: Path) -> Path:
-    """Preserve all scientific inputs when repairing a failed job launcher.
+def rebind_source(path: Path, expected_sha256: str, destination: Path, *,
+                  reason: str = "source-only maintenance; unchanged scientific inputs and method") -> Path:
+    """Preserve scientific inputs when sealing a reviewed source-only change.
 
     The old manifest remains immutable. This explicit command only binds the
     clean new source and retains the previous manifest/hash as provenance.
     """
     if common.sha256_file(path) != expected_sha256 or destination.exists():
         raise RuntimeError("old manifest changed or new manifest already exists")
+    if not reason.strip():
+        raise ValueError("source rebind requires a non-empty reason")
     manifest = json.loads(path.read_text())
     for record in manifest["assets"].values():
         verify_file(record)
     manifest["source"] = source_identity()
     manifest["previous_manifest"] = file_record(path)
     manifest["source_rebound_at"] = datetime.now().astimezone().isoformat()
-    manifest["source_rebind_reason"] = "repair GPU batch driver environment; unchanged scientific inputs and method"
+    manifest["source_rebind_reason"] = reason
+    manifest["submission_order"] = list(SUBMISSION_ORDER)
     common._atomic_json(destination, manifest)
     return destination
 
@@ -269,6 +274,7 @@ def prepare_experiment(output: Path) -> Path:
     manifest = dict(schema_version=1, status="SEALED", machine="CmlLab", node=socket.gethostname(),
         prepared_at=datetime.now().astimezone().isoformat(), source=source, assets=assets,
         corpus_version="MCFCorpusV3.4", domains=domains, arms=arms,
+        submission_order=list(SUBMISSION_ORDER),
         domain_policy=dict(human_gold_l2="Mammals: Human", primary_only=True,
             gut_gold_l3="Digestive system", gut_gold_l4=list(GUT_SITES),
             respiratory_gold_l3="Respiratory system", split="intersection_with_V3.4_published_splits",

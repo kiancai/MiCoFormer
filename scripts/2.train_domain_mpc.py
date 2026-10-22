@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def submit(manifest_path: Path, expected_sha: str, arms=None):
-    from micoformer.domain_pretraining.prepare import validate_manifest, REPO
+    from micoformer.domain_pretraining.prepare import validate_manifest, REPO, SUBMISSION_ORDER
     from micoformer.mpc_unifrac import workflow as common
     manifest_path = manifest_path.resolve()
     manifest = validate_manifest(manifest_path, expected_sha)
@@ -27,7 +27,10 @@ def submit(manifest_path: Path, expected_sha: str, arms=None):
         raise RuntimeError("submission receipt belongs to a different manifest")
     logs = output / "logs/slurm"
     logs.mkdir(parents=True, exist_ok=True)
-    for name, arm in manifest["arms"].items():
+    if set(manifest["arms"]) != set(SUBMISSION_ORDER):
+        raise RuntimeError("manifest must contain the four approved domain arms")
+    for name in SUBMISSION_ORDER:
+        arm = manifest["arms"][name]
         if arms and name not in arms:
             continue
         if name in receipt["jobs"]:
@@ -66,6 +69,7 @@ def main():
             p.add_argument("--arms", nargs="+", choices=("gut_12l", "gut_6l", "respiratory_12l", "respiratory_6l"))
         if name == "rebind":
             p.add_argument("--output-manifest", type=Path, required=True)
+            p.add_argument("--reason", default="source-only maintenance; unchanged scientific inputs and method")
         if name == "job":
             p.add_argument("--arm", required=True,
                 choices=("gut_12l", "gut_6l", "respiratory_12l", "respiratory_6l"))
@@ -86,7 +90,7 @@ def main():
         print(submit(args.manifest, args.manifest_sha256, args.arms))
     elif args.command == "rebind":
         from micoformer.domain_pretraining.prepare import rebind_source
-        print(rebind_source(args.manifest, args.manifest_sha256, args.output_manifest))
+        print(rebind_source(args.manifest, args.manifest_sha256, args.output_manifest, reason=args.reason))
     else:
         from micoformer.domain_pretraining.workflow import run_job
         run_job(args.manifest, args.manifest_sha256, args.arm, resume=args.resume)
