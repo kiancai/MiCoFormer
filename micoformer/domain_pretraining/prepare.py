@@ -60,11 +60,32 @@ def validate_manifest(path: Path, expected_sha256: str) -> dict:
     if common.sha256_file(path) != expected_sha256:
         raise RuntimeError("submitted manifest SHA256 changed")
     manifest = json.loads(path.read_text())
+    if manifest["torch"] != torch.__version__ or manifest["cuda"] != torch.version.cuda:
+        raise RuntimeError("prepared PyTorch/CUDA environment changed")
     if manifest["source"] != source_identity():
         raise RuntimeError("run source/commit changed after preparation")
     for record in manifest["assets"].values():
         verify_file(record)
     return manifest
+
+
+def rebind_source(path: Path, expected_sha256: str, destination: Path) -> Path:
+    """Preserve all scientific inputs when repairing a failed job launcher.
+
+    The old manifest remains immutable. This explicit command only binds the
+    clean new source and retains the previous manifest/hash as provenance.
+    """
+    if common.sha256_file(path) != expected_sha256 or destination.exists():
+        raise RuntimeError("old manifest changed or new manifest already exists")
+    manifest = json.loads(path.read_text())
+    for record in manifest["assets"].values():
+        verify_file(record)
+    manifest["source"] = source_identity()
+    manifest["previous_manifest"] = file_record(path)
+    manifest["source_rebound_at"] = datetime.now().astimezone().isoformat()
+    manifest["source_rebind_reason"] = "repair GPU batch driver environment; unchanged scientific inputs and method"
+    common._atomic_json(destination, manifest)
+    return destination
 
 
 def select_domains(primary, l2, l3, l4) -> dict[str, np.ndarray]:

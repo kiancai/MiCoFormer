@@ -13,13 +13,13 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def submit(manifest_path: Path, expected_sha: str):
+def submit(manifest_path: Path, expected_sha: str, arms=None):
     from micoformer.domain_pretraining.prepare import validate_manifest, REPO
     from micoformer.mpc_unifrac import workflow as common
     manifest_path = manifest_path.resolve()
     manifest = validate_manifest(manifest_path, expected_sha)
     output = manifest_path.parents[1]
-    receipt_path = output / "audit/submitted_jobs.json"
+    receipt_path = output / "audit" / f"submitted_jobs_{manifest_path.stem}.json"
     receipt = json.loads(receipt_path.read_text()) if receipt_path.exists() else dict(
         manifest=str(manifest_path), manifest_sha256=expected_sha,
         commit=manifest["source"]["commit"], machine="CmlLab", jobs={})
@@ -28,6 +28,8 @@ def submit(manifest_path: Path, expected_sha: str):
     logs = output / "logs/slurm"
     logs.mkdir(parents=True, exist_ok=True)
     for name, arm in manifest["arms"].items():
+        if arms and name not in arms:
+            continue
         if name in receipt["jobs"]:
             print(f"already submitted {name}: {receipt['jobs'][name]['job_id']}", flush=True)
             continue
@@ -56,10 +58,14 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     prep = sub.add_parser("prepare")
     prep.add_argument("--output-root", type=Path, required=True)
-    for name in ("submit", "job"):
+    for name in ("submit", "job", "rebind"):
         p = sub.add_parser(name)
         p.add_argument("--manifest", type=Path, required=True)
         p.add_argument("--manifest-sha256", required=True)
+        if name == "submit":
+            p.add_argument("--arms", nargs="+", choices=("gut_12l", "gut_6l", "respiratory_12l", "respiratory_6l"))
+        if name == "rebind":
+            p.add_argument("--output-manifest", type=Path, required=True)
         if name == "job":
             p.add_argument("--arm", required=True,
                 choices=("gut_12l", "gut_6l", "respiratory_12l", "respiratory_6l"))
@@ -77,7 +83,10 @@ def main():
         from micoformer.domain_pretraining.prepare import prepare_experiment
         print(prepare_experiment(args.output_root))
     elif args.command == "submit":
-        print(submit(args.manifest, args.manifest_sha256))
+        print(submit(args.manifest, args.manifest_sha256, args.arms))
+    elif args.command == "rebind":
+        from micoformer.domain_pretraining.prepare import rebind_source
+        print(rebind_source(args.manifest, args.manifest_sha256, args.output_manifest))
     else:
         from micoformer.domain_pretraining.workflow import run_job
         run_job(args.manifest, args.manifest_sha256, args.arm, resume=args.resume)
