@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from micoformer.domain_adaptation.distributed import rank_batches, numeric_close, ForkserverEpoch
+from micoformer.domain_adaptation.distributed import rank_batches, numeric_close, ForkserverEpoch, rank_ordered_mean
 from micoformer.mpc_unifrac.model import Output
 from micoformer.mpc_unifrac.support import distributed_training_loss
 
@@ -18,6 +18,7 @@ def gradient_worker(rank, rendezvous, output):
     torch.set_num_threads(1)
     dist.init_process_group('gloo', init_method='file://' + rendezvous, rank=rank, world_size=3)
     model = DDP(torch.nn.Linear(1, 1, bias=False).double())
+    model.register_comm_hook(None, rank_ordered_mean)
     with torch.no_grad():
         model.module.weight.fill_(.7)
     counts = np.array([[7, 2, 4, 128], [3, 11, 22, 127], [1, 5, 10, 2]])
@@ -33,6 +34,38 @@ def gradient_worker(rank, rendezvous, output):
     if not np.isclose(actual, expected, atol=2e-6, rtol=2e-7):
         raise AssertionError((rank, actual, expected))
     Path(output, f'rank{rank}').write_text(str(actual))
+    dist.destroy_process_group()
+
+
+def resume_worker(rank, rendezvous, output):
+    import copy
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method='file://' + rendezvous, rank=rank, world_size=3)
+    def make():
+        model = DDP(torch.nn.Sequential(torch.nn.Linear(5, 9), torch.nn.Dropout(.1),
+                                       torch.nn.GELU(), torch.nn.Linear(9, 1)))
+        model.register_comm_hook(None, rank_ordered_mean)
+        return model, torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model, optimizer = make()
+    def step():
+        optimizer.zero_grad(set_to_none=True)
+        x = torch.randn(4+rank, 5)
+        model(x).square().mean().backward()
+        optimizer.step()
+    torch.manual_seed(42+rank)
+    step()
+    saved = copy.deepcopy((model.module.state_dict(), optimizer.state_dict(), torch.get_rng_state()))
+    step()
+    expected = copy.deepcopy(model.module.state_dict())
+    del model, optimizer
+    model, optimizer = make()
+    model.module.load_state_dict(saved[0])
+    optimizer.load_state_dict(saved[1])
+    torch.set_rng_state(saved[2])
+    step()
+    if not all(torch.equal(expected[k], v) for k,v in model.module.state_dict().items()):
+        raise AssertionError('DDP rebuild changed next update')
+    Path(output, f'rank{rank}').write_text('PASS')
     dist.destroy_process_group()
 
 
@@ -81,6 +114,11 @@ class DistributedTests(unittest.TestCase):
             mp.spawn(gradient_worker, args=(os.path.join(root, 'rendezvous'), root), nprocs=3, join=True)
             values = [float(Path(root, f'rank{i}').read_text()) for i in range(3)]
             self.assertEqual(values, [values[0]]*3)
+
+    def test_three_process_exact_resume_after_bucket_rebuild(self):
+        with tempfile.TemporaryDirectory(prefix='lora-ddp-resume-') as root:
+            mp.spawn(resume_worker, args=(os.path.join(root, 'rendezvous'), root), nprocs=3, join=True)
+            self.assertEqual([Path(root, f'rank{i}').read_text() for i in range(3)], ['PASS']*3)
 
 
 if __name__ == '__main__':

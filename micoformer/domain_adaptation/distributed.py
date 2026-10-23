@@ -163,9 +163,30 @@ def restore(path, model, optimizer, scheduler, arm, sha, device, rank):
     return state
 
 
+def rank_ordered_mean(state, bucket):
+    """Keep floating summation order independent of DDP bucket rebuilding.
+
+    Only ~8.5MB of trainable gradients are communicated. Gathering them in rank
+    order avoids position-dependent NCCL summation order when a restored DDP
+    reducer reconstructs its buckets; the mathematical gradient mean is intact.
+    """
+    buffer = bucket.buffer()
+    values = [torch.empty_like(buffer) for _ in range(dist.get_world_size())]
+    dist.all_gather(values, buffer)
+    buffer.copy_(values[0])
+    for value in values[1:]:
+        buffer.add_(value)
+    buffer.div_(dist.get_world_size())
+    future = torch.futures.Future()
+    future.set_result(buffer)
+    return future
+
+
 def wrap(model, device):
-    return DDP(model, device_ids=[device.index], output_device=device.index,
-               broadcast_buffers=False, gradient_as_bucket_view=True)
+    ddp = DDP(model, device_ids=[device.index], output_device=device.index,
+              broadcast_buffers=False, gradient_as_bucket_view=True)
+    ddp.register_comm_hook(None, rank_ordered_mean)
+    return ddp
 
 
 def cpu_clone(value):
@@ -217,7 +238,16 @@ def smoke(arm, manifest, sha, device, rank):
     assert state['next_batch'] == 3 and state['global_step'] == 1
     del state
     _, replay = update(ddp, optimizer, scheduler, tail, arm, device)
-    if not single.state_equal(expected, (model.state_dict(), optimizer.state_dict(), scheduler.state_dict())) or replay != expected_record:
+    replay_states = (model.state_dict(), optimizer.state_dict(), scheduler.state_dict())
+    checks = dict(model_exact=single.state_equal(expected[0], replay_states[0]),
+        optimizer_exact=single.state_equal(expected[1], replay_states[1]),
+        scheduler_exact=single.state_equal(expected[2], replay_states[2]),
+        update_diagnostics_exact=replay == expected_record)
+    common._atomic_json(Path(arm['output']) / f'audit/strict_replay_rank{rank}.json', dict(
+        status='PASS' if all(checks.values()) else 'FAILED', checks=checks,
+        expected_update=expected_record, replay_update=replay,
+        gradient_reduction='rank_ordered_mean'))
+    if not all(checks.values()):
         raise RuntimeError('DDP strict next-update replay failed')
     frozen = frozen_sha256(model)
     if frozen != manifest['initialization']['frozen_parameter_sha256']:

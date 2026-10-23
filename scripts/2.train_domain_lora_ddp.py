@@ -35,7 +35,9 @@ def prepare(root, job, uuids, label):
     manifest['source'] = source_identity()
     manifest['prepared_at'] = datetime.now().astimezone().isoformat()
     manifest['node'] = socket.gethostname()
-    cpu_ddp = root / 'audit' / ('ddp_recompute_cpu_acceptance.json' if label == 'ddp3_recompute' else 'ddp_cpu_acceptance.json')
+    cpu_names = dict(ddp3='ddp_cpu_acceptance.json', ddp3_recompute='ddp_recompute_cpu_acceptance.json',
+                     ddp3_exact='ddp_exact_cpu_acceptance.json')
+    cpu_ddp = root / 'audit' / cpu_names[label]
     manifest['assets'].update(contract=file_record(root / 'PLAN.md'),
         previous_contract=file_record(archived_plan), previous_manifest=file_record(previous),
         previous_cpu_acceptance=file_record(cpu), ddp_cpu_acceptance=file_record(cpu_ddp))
@@ -51,10 +53,14 @@ def prepare(root, job, uuids, label):
         placeholder_job_id=str(job), node='gpu1', gpu_uuids=uuids,
         preserve_placeholder=True, allocation_actions='none',
         sequence=['respiratory_lora', 'gut_lora'], dataloader_context='forkserver',
-        label=label, activation_recomputation=label == 'ddp3_recompute')
-    if label == 'ddp3_recompute':
+        label=label, activation_recomputation=label != 'ddp3',
+        gradient_reduction='rank_ordered_mean')
+    if label != 'ddp3':
         manifest['assets'].update(previous_ddp_manifest=file_record(root / 'audit/lora_run_manifest_ddp3.json'),
             previous_ddp_contract=file_record(root / 'archive/PLAN_ddp3_without_recompute_20261023.md'))
+    if label == 'ddp3_exact':
+        manifest['assets'].update(previous_recompute_manifest=file_record(root / 'audit/lora_run_manifest_ddp3_recompute.json'),
+            previous_recompute_contract=file_record(root / 'archive/PLAN_ddp3_recompute_20261023.md'))
     if len(uuids) != 3 or len(set(uuids)) != 3 or any(not u.startswith('GPU-') for u in uuids):
         raise RuntimeError('bind three distinct allocated GPU UUIDs')
     for name, arm in manifest['arms'].items():
@@ -146,7 +152,7 @@ def main():
     p.add_argument('--root', type=Path, required=True)
     p.add_argument('--placeholder-job', required=True)
     p.add_argument('--gpu-uuids', nargs=3, required=True)
-    p.add_argument('--execution-label', choices=('ddp3', 'ddp3_recompute'), default='ddp3')
+    p.add_argument('--execution-label', choices=('ddp3', 'ddp3_recompute', 'ddp3_exact'), default='ddp3')
     for name in ('sequence', 'worker'):
         p = sub.add_parser(name)
         p.add_argument('--manifest', type=Path, required=True)
