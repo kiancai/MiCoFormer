@@ -40,3 +40,5 @@ GPU smoke与CPU审计明确分开，CPU PASS不证明BF16、显存或实际学�
 ## 三卡占位内执行（2026-10-23）
 
 用户批准每组同机三卡，先呼吸道再肠道。`scripts/2.train_domain_lora_ddp.py`准备新版manifest并编排两个独立起点的DDP训练；`scripts/run_domain_lora_placeholder.sh`只启动工作层，不申请或结束allocation。每rank B128、全局384，原局部关系池和更新数保持；按目标数校正DDP均值。三rank RNG/optimizer/cursor严格恢复，每卡原门控及三卡恢复/验证汇总通过才训练。DataLoader使用forkserver；仅同拓扑恢复。旧单卡manifest和准备结果保留为历史，不将旧源码seal用于新执行。
+
+B128 LoRA真实门控在40GB GPU达到显存上限后，新执行版本启用encoder现有non-reentrant激活重计算，保留dropout RNG、模型配置与所有科学参数；CPU核对前向/梯度/RNG，GPU重新通过门控再正式训练。旧失败路径和seal保留，新版本使用ddp3_recompute目录与独立manifest。

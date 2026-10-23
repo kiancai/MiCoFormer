@@ -105,6 +105,10 @@ def load_model(arm: dict, manifest: dict, device: torch.device) -> UniFracModel:
         raise RuntimeError("LoRA initialization changed")
     model._dapt_prior_record = manifest["assets"]["prior"]
     model._dapt_origin_record = manifest["assets"]["origin"]
+    # Runtime-only non-reentrant activation recomputation preserves dropout RNG
+    # and changes neither the saved architecture nor any trainable parameter.
+    if manifest.get("execution", {}).get("activation_recomputation", False):
+        model.backbone.encoder.grad_checkpointing = True
     return model.to(device)
 
 

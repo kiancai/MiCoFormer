@@ -88,6 +88,35 @@ class LoRATest(unittest.TestCase):
         self.assertTrue(torch.equal(a, torch.rand(20)))
         self.assertFalse(state_equal(torch.tensor([1.]), torch.tensor([1.0000001])))
 
+    def test_recomputation_preserves_dropout_outputs_gradients_and_rng(self):
+        model = TinyModel()
+        inject_lora(model, LoRAConfig(4, 8, .05))
+        for module in model.modules():
+            if isinstance(module, nn.Dropout):
+                module.p = .1
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if name.endswith('lora_B'):
+                    parameter.normal_(std=.01)
+        reference = copy.deepcopy(model).train()
+        recompute = copy.deepcopy(model).train()
+        recompute.backbone.encoder.grad_checkpointing = True
+        x = torch.randn(3, 7, 16)
+        expected = None
+        for candidate in (reference, recompute):
+            torch.manual_seed(71)
+            h, score = candidate(x)
+            score.square().backward()
+            result = (h.detach(), {n: p.grad.clone() for n,p in candidate.named_parameters()
+                                  if p.requires_grad}, torch.get_rng_state())
+            if expected is None:
+                expected = result
+            else:
+                self.assertTrue(torch.equal(expected[0], result[0]))
+                self.assertTrue(torch.equal(expected[2], result[2]))
+                for name in expected[1]:
+                    torch.testing.assert_close(expected[1][name], result[1][name], rtol=1e-6, atol=1e-7)
+
 
 if __name__ == "__main__":
     unittest.main()

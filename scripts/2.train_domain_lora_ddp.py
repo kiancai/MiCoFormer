@@ -14,7 +14,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def prepare(root, job, uuids):
+def prepare(root, job, uuids, label):
     import torch
     from micoformer.domain_adaptation.prepare import (file_record, verify_file,
         validate_contract, source_identity)
@@ -35,29 +35,37 @@ def prepare(root, job, uuids):
     manifest['source'] = source_identity()
     manifest['prepared_at'] = datetime.now().astimezone().isoformat()
     manifest['node'] = socket.gethostname()
+    cpu_ddp = root / 'audit' / ('ddp_recompute_cpu_acceptance.json' if label == 'ddp3_recompute' else 'ddp_cpu_acceptance.json')
     manifest['assets'].update(contract=file_record(root / 'PLAN.md'),
         previous_contract=file_record(archived_plan), previous_manifest=file_record(previous),
-        previous_cpu_acceptance=file_record(cpu), ddp_cpu_acceptance=file_record(root / 'audit/ddp_cpu_acceptance.json'))
-    gate = json.loads((root / 'audit/ddp_cpu_acceptance.json').read_text())
+        previous_cpu_acceptance=file_record(cpu), ddp_cpu_acceptance=file_record(cpu_ddp))
+    gate = json.loads(cpu_ddp.read_text())
     if gate['status'] != 'PASS':
         raise RuntimeError('three-process CPU acceptance is required')
+    for name, digest in gate['source_hashes'].items():
+        if common.sha256_file(Path(__file__).resolve().parents[1] / name) != digest:
+            raise RuntimeError(f'CPU-tested execution source changed: {name}')
     manifest['execution'] = dict(world_size=3, per_rank_accumulation=1,
         logical_microbatches_per_update=3, per_rank_microbatch=128,
         dropout_seed_policy='42+rank; unchanged common seed42 adapter initialization',
         placeholder_job_id=str(job), node='gpu1', gpu_uuids=uuids,
         preserve_placeholder=True, allocation_actions='none',
-        sequence=['respiratory_lora', 'gut_lora'], dataloader_context='forkserver')
+        sequence=['respiratory_lora', 'gut_lora'], dataloader_context='forkserver',
+        label=label, activation_recomputation=label == 'ddp3_recompute')
+    if label == 'ddp3_recompute':
+        manifest['assets'].update(previous_ddp_manifest=file_record(root / 'audit/lora_run_manifest_ddp3.json'),
+            previous_ddp_contract=file_record(root / 'archive/PLAN_ddp3_without_recompute_20261023.md'))
     if len(uuids) != 3 or len(set(uuids)) != 3 or any(not u.startswith('GPU-') for u in uuids):
         raise RuntimeError('bind three distinct allocated GPU UUIDs')
     for name, arm in manifest['arms'].items():
-        arm['output'] = str(root / 'ddp3/runs' / name)
+        arm['output'] = str(root / label / 'runs' / name)
     validate_contract(manifest)
     if manifest['torch'] != torch.__version__ or manifest['cuda'] != torch.version.cuda:
         raise RuntimeError('environment changed')
-    destination = root / 'audit/lora_run_manifest_ddp3.json'
+    destination = root / 'audit' / f'lora_run_manifest_{label}.json'
     if destination.exists():
         raise FileExistsError('three-card manifest is immutable')
-    (root / 'ddp3').mkdir(exist_ok=True)
+    (root / label).mkdir(exist_ok=True)
     common._atomic_json(destination, manifest)
     print(json.dumps(file_record(destination), indent=2))
 
@@ -91,14 +99,15 @@ def sequence(path, sha):
     manifest = validate_manifest(path, sha)
     root = path.resolve().parents[1]
     execution = manifest['execution']
+    run_root = root / execution['label']
     job = str(execution['placeholder_job_id'])
     if os.environ.get('SLURM_JOB_ID') != job or f'job_{job}' not in Path('/proc/self/cgroup').read_text():
         raise RuntimeError('controller must be inside the preserved allocation')
     os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(execution['gpu_uuids'])
-    with (root / 'ddp3/controller.lock').open('a') as lock:
+    with (run_root / 'controller.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         def record(status, **extra):
-            common._atomic_json(root / 'ddp3/controller_status.json', dict(
+            common._atomic_json(run_root / 'controller_status.json', dict(
                 status=status, time=datetime.now().astimezone().isoformat(), pid=os.getpid(),
                 sid=os.getsid(0), machine='CmlLab', node=socket.gethostname(),
                 placeholder_job_id=job, preserve_placeholder=True, manifest_sha256=sha, **extra))
@@ -116,7 +125,7 @@ def sequence(path, sha):
                 command = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
                     '--nnodes=1', '--nproc-per-node=3', str(Path(__file__).resolve()), 'worker',
                     '--manifest', str(path.resolve()), '--manifest-sha256', sha, '--arm', name]
-                log = root / 'ddp3/logs' / f'{name}.log'
+                log = run_root / 'logs' / f'{name}.log'
                 log.parent.mkdir(parents=True, exist_ok=True)
                 record('RUNNING', active_arm=name, command=command, log=str(log))
                 print(f'Starting {name} on all three GPUs; placeholder {job} remains untouched', flush=True)
@@ -137,6 +146,7 @@ def main():
     p.add_argument('--root', type=Path, required=True)
     p.add_argument('--placeholder-job', required=True)
     p.add_argument('--gpu-uuids', nargs=3, required=True)
+    p.add_argument('--execution-label', choices=('ddp3', 'ddp3_recompute'), default='ddp3')
     for name in ('sequence', 'worker'):
         p = sub.add_parser(name)
         p.add_argument('--manifest', type=Path, required=True)
@@ -153,7 +163,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     if args.command == 'prepare':
-        prepare(args.root, args.placeholder_job, args.gpu_uuids)
+        prepare(args.root, args.placeholder_job, args.gpu_uuids, args.execution_label)
     elif args.command == 'sequence':
         sequence(args.manifest, args.manifest_sha256)
     else:

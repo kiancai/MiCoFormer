@@ -149,6 +149,7 @@ def save(path, model, optimizer, scheduler, arm, sha, device, rank, *, epoch, cu
         state = single.checkpoint(model, optimizer, scheduler, arm, sha, device,
             epoch=epoch, cursor=cursor, global_step=global_step, best_score=best_score, statistics=statistics)
         state.update(world_size=3, rng_states=rng, per_rank_accumulation=1,
+                     activation_recomputation=model.backbone.encoder.grad_checkpointing,
                      dropout_seed_policy='seed42+rank; adapter initialization remains seed42')
         common._atomic_torch(path, state)
     dist.barrier()
@@ -303,6 +304,7 @@ def train(arm, manifest, sha, device, rank, *, resume=False):
             status='RUNNING', launched_at=single.stamp(), arm=arm['name'], manifest_sha256=sha,
             source_commit=manifest['source']['commit'], placeholder_job_id=os.environ['SLURM_JOB_ID'],
             node=socket.gethostname(), world_size=3, per_rank_microbatch=128,
+            activation_recomputation=model.backbone.encoder.grad_checkpointing,
             per_rank_accumulation=1, usual_samples_per_update=384, resume=resume))
     if not resume:
         persist(output / 'run/epoch00.pt')
