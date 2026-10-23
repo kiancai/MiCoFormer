@@ -36,3 +36,7 @@ python scripts/2.train_domain_lora.py verify --manifest /absolute/path/lora_run_
 
 epoch10是主终点；epoch0/1/3/5及best为诊断。不据下游测试成绩改rank、LR、数据或epoch。
 GPU smoke与CPU审计明确分开，CPU PASS不证明BF16、显存或实际学习率适用性。
+
+## 三卡占位内执行（2026-10-23）
+
+用户批准每组同机三卡，先呼吸道再肠道。`scripts/2.train_domain_lora_ddp.py`准备新版manifest并编排两个独立起点的DDP训练；`scripts/run_domain_lora_placeholder.sh`只启动工作层，不申请或结束allocation。每rank B128、全局384，原局部关系池和更新数保持；按目标数校正DDP均值。三rank RNG/optimizer/cursor严格恢复，每卡原门控及三卡恢复/验证汇总通过才训练。DataLoader使用forkserver；仅同拓扑恢复。旧单卡manifest和准备结果保留为历史，不将旧源码seal用于新执行。
