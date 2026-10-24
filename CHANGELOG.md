@@ -6,9 +6,19 @@ The format is based on Keep a Changelog, adapted for the current research workfl
 
 ## [Unreleased]
 
+### Added
+- Ported optional normalized weighted UniFrac supervision from dev into the current pretraining workflow, using full-composition tree masses and the existing Query sample representation.
+- Added CE/entropy/KL diagnostics for the neighborhood objective; training with only the original three objectives remains available.
+
 ### Changed
+- Unified objective outputs as loss/count/diagnostics and shared their training/validation statistics and logs; unmasked diagnostics remain separate from training losses, with no objective-specific loop branches or fixed statistics layouts.
+- Integrated neighborhood weight and temperatures into TrainConfig, enabling weak UniFrac by default (weight 0.00005); setting the weight to 0 skips tree loading, full-composition targets, auxiliary losses, and diagnostics.
+- Switched to MCFCorpusV4.1 with embedded UniFrac tree assets; removed the separate tree-directory setting, keeping all UniFrac configuration out of the training CLI.
 - Switched data preparation and the default training input to MCFCorpusV4, with the released corpus version and SHA256 pinned.
 - Required complete protein features for every genus and normalized all rows directly, removing legacy protein-feature validity masking and older corpus-version branches.
+
+### Removed
+- Removed redundant fixed-asset and internal-interface runtime checks and the temporary test suite; retained corpus identity checks and training failure handling.
 
 ## [0.4.0] - 2026-10-16
 

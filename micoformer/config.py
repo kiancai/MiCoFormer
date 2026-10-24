@@ -60,6 +60,11 @@ class TrainConfig:
     # MLM 丰度遮盖与 Query 菌属选择的逐 token 抽样概率。
     mlm_mask_probability: float = 0.15
     query_mask_probability: float = 0.10
+    # Weak neighborhood supervision by default; 0 skips tree targets and computation.
+    # 默认弱邻域监督；设为 0 时跳过树目标准备和相关计算。
+    unifrac_weight: float = 0.00005
+    unifrac_teacher_temperature: float = 0.03
+    unifrac_student_temperature: float = 0.05
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     gradient_clip: float = 1.0

@@ -14,6 +14,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from micoformer.config import RunConfig, REFERENCE_LAMBDAS
 from micoformer.data.genus import load_genus_data
+from micoformer.data.unifrac import load_unifrac_assets
 from micoformer.models import MiCoFormer
 from micoformer.data.collate import batch_to_device
 from micoformer.data.loaders import TrainingData
@@ -31,8 +32,8 @@ from .distributed import _init_distributed, _seed_all
 
 from .validation import (
     _validate_epoch,
-    _loss_statistics_tensor,
-    _unpack_loss_statistics,
+    LossStatistics,
+    _weighted_loss,
 )
 
 
@@ -117,6 +118,25 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
     # Use the fixed loss coefficients for the selected identity type.
     # 使用所选身份输入模式对应的固定损失系数。
     lambdas = dict(REFERENCE_LAMBDAS[config.model.identity_type])
+    unifrac_assets = None
+    model_options = {}
+    objective_notes = {}
+    if config.training.unifrac_weight != 0:
+        unifrac_assets = load_unifrac_assets(config.data.corpus)
+        # Bind the tree to this run and to strict checkpoint resumption.
+        # 树资产指纹写入本次运行，并参与严格的断点恢复核对。
+        preparation["unifrac"] = unifrac_assets.identity
+        lambdas["unifrac"] = config.training.unifrac_weight
+        model_options = {
+            "unifrac_lengths": unifrac_assets.branch_lengths,
+            "teacher_temperature": config.training.unifrac_teacher_temperature,
+            "student_temperature": config.training.unifrac_student_temperature,
+        }
+        objective_notes["unifrac"] = {
+            "neighborhood": "rank-local batch; no cross-rank candidate gathering",
+            "pool_size_per_rank": config.training.batch_size_per_rank,
+            "singleton_policy": "zero effective targets; excluded from objective means",
+        }
 
     # Select this process's GPU and initialize distributed communication.
     # 选择当前进程的 GPU，并初始化分布式通信。
@@ -127,7 +147,7 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
         # 各进程使用相同种子建立模型初始权重。
         _seed_all(config.training.seed)
 
-        model = MiCoFormer(genus_data.prior_table, config.model).to(device)
+        model = MiCoFormer(genus_data.prior_table, config.model, **model_options).to(device)
 
         # Keep genus names with the model for checkpoint export.
         # 将菌属名称保存在模型中，供 checkpoint 导出。
@@ -140,7 +160,8 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
         # Build per-rank loaders, samplers, and shared epoch state.
         # 创建各进程的数据读取器、采样器与共享 epoch 状态。
         training_data = TrainingData.from_config(
-            config, rank=rank, world=world, observed=genus_data.observed_genus_ids
+            config, rank=rank, world=world, observed=genus_data.observed_genus_ids,
+            unifrac_assets=unifrac_assets,
         )
 
         # DDP synchronizes gradients during backward propagation.
@@ -233,6 +254,7 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
                     "steps_per_epoch": len(training_data.train_loader),
                     "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                     "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+                    "objective_notes": objective_notes,
                 },
             )
 
@@ -256,9 +278,7 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
             epoch_started = perf_counter()
             torch.cuda.reset_peak_memory_stats(device)
 
-            # Accumulate three loss sums/counts and the batch-total sum/count.
-            # 累计三项损失总和与目标数，以及批次总损失之和与批次数。
-            train_statistics = torch.zeros(8, device=device, dtype=torch.float64)
+            train_statistics = LossStatistics(device)
 
             for batch_index, batch in enumerate(training_data.train_loader):
                 # Move model inputs to this GPU; each batch performs one optimizer update.
@@ -272,13 +292,7 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = ddp(**arguments)
 
-                    # Combine MLM, continuous Query, and presence Query losses.
-                    # 合并 MLM、Query 连续丰度和 Query 存在性损失。
-                    total = (
-                        output.mlm_loss
-                        + lambdas["continuous"] * output.continuous_loss
-                        + lambdas["presence"] * output.presence_loss
-                    )
+                    total = _weighted_loss(output, lambdas)
 
                 # Stop on invalid loss before updating parameters.
                 # 损失出现 NaN 或无穷大时，在更新参数前终止。
@@ -306,9 +320,7 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
 
                 # Detach loss statistics from the computation graph before accumulating.
                 # 将损失统计与计算图分离后累计。
-                train_statistics += _loss_statistics_tensor(
-                    output, lambdas, device=device
-                )
+                train_statistics.update(output, total)
 
                 global_step += 1
 
@@ -323,13 +335,16 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
                             "batches_per_epoch": len(training_data.train_loader),
                             "global_step": global_step,
                             "weighted_total_local": float(total.detach().cpu()),
-                            "mlm_local": float(output.mlm_loss.detach().cpu()),
-                            "continuous_local": float(
-                                output.continuous_loss.detach().cpu()
-                            ),
-                            "presence_local": float(
-                                output.presence_loss.detach().cpu()
-                            ),
+                            "objectives_local": {
+                                name: {
+                                    "loss": float(result.loss.detach().cpu()),
+                                    "count": result.count,
+                                    "diagnostics": {
+                                        key: float(value.detach().cpu())
+                                        for key, value in result.diagnostics.items()
+                                    },
+                                } for name, result in output.items()
+                            },
                             "gradient_norm_preclip_local": float(
                                 gradient_norm.detach().cpu()
                             ),
@@ -340,8 +355,8 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
 
             # Aggregate all ranks; average each loss over its prediction targets.
             # 汇总各进程统计，按各项预测目标数计算损失均值。
-            dist.all_reduce(train_statistics, op=dist.ReduceOp.SUM)
-            training_loss = _unpack_loss_statistics(train_statistics, lambdas)
+            train_statistics.synchronize()
+            training_loss = train_statistics.summary(lambdas)
 
             # Validate with fixed corruption and no updates; also monitor unmasked representations.
             # 使用固定扰动验证，不更新参数；同时监测无遮盖表征。

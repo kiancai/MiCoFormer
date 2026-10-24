@@ -1,3 +1,3 @@
-from .model import MiCoFormer, PretrainingOutput
+from .model import MiCoFormer, LossResult
 
-__all__ = ["MiCoFormer", "PretrainingOutput"]
+__all__ = ["MiCoFormer", "LossResult"]

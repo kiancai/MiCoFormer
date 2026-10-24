@@ -6,8 +6,10 @@ from __future__ import annotations
 from multiprocessing.sharedctypes import Synchronized
 from typing import Any, Sequence
 import numpy as np
+from scipy import sparse
 import torch
 from torch import Tensor
+from .unifrac import full_composition_edge_mass
 from .corruption import (
     deterministic_mlm_mask,
     deterministic_query_mask,
@@ -29,6 +31,7 @@ class PretrainingCollator:
         shared_epoch: Synchronized,
         mlm_mask_probability: float,
         query_mask_probability: float,
+        unifrac_incidence: sparse.csr_matrix | None = None,
     ) -> None:
         # Observed genera use model IDs, with real genera starting at 2.
         # 已观测菌属使用模型编号，真实菌属从 2 开始。
@@ -40,6 +43,7 @@ class PretrainingCollator:
         self.shared_epoch = shared_epoch
         self.mlm_mask_probability = mlm_mask_probability
         self.query_mask_probability = query_mask_probability
+        self.unifrac_incidence = unifrac_incidence
 
     def __call__(self, samples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
         # DataLoader supplies a list of variable-length CorpusDataset samples.
@@ -93,7 +97,7 @@ class PretrainingCollator:
         )
         # Return inputs and targets; the model applies masking and genus removal.
         # 返回输入与任务标记，实际丰度遮盖和菌属移除由模型执行。
-        return {
+        batch = {
             "genus_ids": genus,
             "abundance": abundance,
             "padding_mask": padding,
@@ -104,6 +108,9 @@ class PretrainingCollator:
             "richness": richness,
             "corruption_epoch": np.int64(epoch),
         }
+        if self.unifrac_incidence is not None:
+            batch["edge_mass"] = full_composition_edge_mass(samples, self.unifrac_incidence)
+        return batch
 
 
 def batch_to_device(
@@ -114,7 +121,7 @@ def batch_to_device(
 """
     # Keep [B, L] shapes: integer IDs, float32 abundance, and bool masks.
     # 保持 [B, L] 形状：编号为整数，丰度为 float32，标记为 bool。
-    return {
+    arguments = {
         "genus_ids": torch.as_tensor(batch["genus_ids"], device=device, dtype=torch.long),
         "abundance": torch.as_tensor(batch["abundance"], device=device, dtype=torch.float32),
         "padding_mask": torch.as_tensor(batch["padding_mask"], device=device, dtype=torch.bool),
@@ -124,6 +131,11 @@ def batch_to_device(
             batch["negative_genus_ids"], device=device, dtype=torch.long
         ),
     }
+    if "edge_mass" in batch:
+        arguments["edge_mass"] = torch.as_tensor(
+            batch["edge_mass"], device=device, dtype=torch.float32
+        )
+    return arguments
 
 
 def collate_unmasked(samples: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:

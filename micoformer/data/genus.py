@@ -16,15 +16,15 @@ class GenusData:
 
 
 def load_genus_data(corpus: str | Path) -> GenusData:
-    """Load genus names and observed IDs, and build the prior table from V4.
-    从 V4 读取菌属名称与已观测编号，并构建先验表。
+    """Load genus names and observed IDs, and build the prior table from V4.1.
+    从 V4.1 读取菌属名称与已观测编号，并构建先验表。
     """
     # Read only genus-level metadata, not the abundance matrix.
     # 只读取菌属层面的特征，不把整个丰度矩阵装入内存。
     with h5py.File(corpus, "r") as source:
         version = source["uns/corpus_version"].asstr()[()]
-        if version != "MCFCorpusV4":
-            raise ValueError(f"expected MCFCorpusV4, found {version}")
+        if version != "MCFCorpusV4.1":
+            raise ValueError(f"expected MCFCorpusV4.1, found {version}")
         phy = source["varm/position_encoding"][:].astype(np.float32)
         feat = source["varm/protein_features"][:].astype(np.float32)
         names = tuple(source["var/_index"].asstr()[:])

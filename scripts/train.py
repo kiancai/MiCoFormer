@@ -53,7 +53,7 @@ def main() -> None:
     parser.add_argument(
         "--corpus",
         type=Path,
-        default=Path("data/corpus/MCFCorpusV4.gg2.h5ad"),
+        default=Path("data/corpus/MCFCorpusV4.1.gg2.h5ad"),
         help="Path to the corpus used for sample preparation (default: %(default)s).",
     )
     parser.add_argument(

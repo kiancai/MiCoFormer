@@ -12,6 +12,7 @@ import numpy as np
 from torch.utils.data import DataLoader, DistributedSampler
 from micoformer.config import RunConfig
 from micoformer.data.datasets import CorpusDataset
+from micoformer.data.unifrac import UniFracAssets
 from micoformer.data.collate import (
     PretrainingCollator,
     collate_unmasked,
@@ -43,6 +44,7 @@ class TrainingData:
         rank: int,
         world: int,
         observed: np.ndarray,
+        unifrac_assets: UniFracAssets | None = None,
     ) -> TrainingData:
         """Build training/validation readers from prepared splits.
         根据已准备的划分创建训练和验证读取器。
@@ -57,8 +59,12 @@ class TrainingData:
         )
         # Use the configured sequence limit and retain full support for negative sampling.
         # 按模型配置截取序列，保留完整菌属集合用于负例排除。
-        train_dataset = CorpusDataset(config.data.corpus, train_rows, max_seq_len=config.model.max_seq_len)
-        val_dataset = CorpusDataset(config.data.corpus, val_rows, max_seq_len=config.model.max_seq_len)
+        dataset_options = {
+            "max_seq_len": config.model.max_seq_len,
+            "include_full_abundance": unifrac_assets is not None,
+        }
+        train_dataset = CorpusDataset(config.data.corpus, train_rows, **dataset_options)
+        val_dataset = CorpusDataset(config.data.corpus, val_rows, **dataset_options)
         # Partition dataset positions across ranks; shuffle training each epoch.
         # 按 rank 分配数据集内的位置，训练顺序逐轮打乱。
         train_sampler: DistributedSampler[int] = DistributedSampler(
@@ -111,6 +117,7 @@ class TrainingData:
                 shared_epoch=train_epoch,
                 mlm_mask_probability=config.training.mlm_mask_probability,
                 query_mask_probability=config.training.query_mask_probability,
+                unifrac_incidence=unifrac_assets.incidence if unifrac_assets is not None else None,
             ),
             **common,
         )
@@ -126,6 +133,7 @@ class TrainingData:
                 shared_epoch=val_epoch,
                 mlm_mask_probability=config.training.mlm_mask_probability,
                 query_mask_probability=config.training.query_mask_probability,
+                unifrac_incidence=unifrac_assets.incidence if unifrac_assets is not None else None,
             ),
             **common,
         )

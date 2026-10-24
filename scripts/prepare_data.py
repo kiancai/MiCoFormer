@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare MiCoFormer pretraining splits from MCFCorpusV4.
+"""Prepare MiCoFormer pretraining splits from MCFCorpusV4.1.
 
 Select analysis_primary rows, then save train/validation indices and provenance.
 """
@@ -13,8 +13,8 @@ import numpy as np
 from micoformer.data.preparation import prepare_splits
 
 # Pin the corpus file before selection. / 选样前核对指定语料文件。
-CORPUS_VERSION = "MCFCorpusV4"
-CORPUS_SHA256 = "7ec7b2ddbdebaa7fd3a47d906561409ca9dd9f1875c1a4e610c0a6e1d80421a0"
+CORPUS_VERSION = "MCFCorpusV4.1"
+CORPUS_SHA256 = "fba76888ec4739cff59b3b8b1e315e9889899e215de97a4b3f9b24befb2879cb"
 
 # Random row split, not grouped by Study. / 按样本行随机划分，不按 Study 分组。
 SEED = 42
@@ -24,7 +24,7 @@ VALIDATION_FRACTION = 0.005
 def select_rows(adata: ad.AnnData) -> np.ndarray:
     """Return selected original row indices. / 返回入选样本的原始行号。"""
     obs = adata.obs
-    # V4 retains the QC-passing representatives. / V4沿用已确定的QC代表行。
+    # V4.1 retains the QC-passing representatives. / V4.1沿用已确定的QC代表行。
     selected = obs["analysis_primary"].to_numpy(dtype=bool, copy=True)
 
     return np.flatnonzero(selected).astype(np.int64)
@@ -32,7 +32,7 @@ def select_rows(adata: ad.AnnData) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Select MCFCorpusV4 analysis_primary samples and create "
+        description="Select MCFCorpusV4.1 analysis_primary samples and create "
         f"random training/validation splits ({VALIDATION_FRACTION:.1%} validation, "
         f"seed {SEED}).",
         epilog="Run from the repository root: python -m scripts.prepare_data",
@@ -40,8 +40,8 @@ def main() -> None:
     parser.add_argument(
         "--corpus",
         type=Path,
-        default=Path("data/corpus/MCFCorpusV4.gg2.h5ad"),
-        help="Path to the MCFCorpusV4 H5AD file (default: %(default)s). "
+        default=Path("data/corpus/MCFCorpusV4.1.gg2.h5ad"),
+        help="Path to the MCFCorpusV4.1 H5AD file (default: %(default)s). "
         "Its version and SHA256 are checked. "
         "Relative paths start from the current working directory.",
     )

@@ -14,11 +14,15 @@ class CorpusDataset(Dataset[dict[str, Any]]):
     读取单个样本，保留截取前的完整菌属集合供负例采样排除。
     """
 
-    def __init__(self, corpus: str | Path, corpus_rows: np.ndarray, *, max_seq_len: int) -> None:
+    def __init__(
+        self, corpus: str | Path, corpus_rows: np.ndarray, *, max_seq_len: int,
+        include_full_abundance: bool = False,
+    ) -> None:
         # Selected corpus rows and sequence limit from the model configuration.
         # 选中的语料行号，以及模型配置提供的最大序列长度。
         self.corpus_rows = np.asarray(corpus_rows, dtype=np.int64)
         self.max_seq_len = max_seq_len
+        self.include_full_abundance = include_full_abundance
         # Open lazily and reuse the file connection within each process.
         # 首次读取时打开文件，各进程独立保存并复用连接。
         self._handle: h5py.File | None = None
@@ -71,7 +75,7 @@ class CorpusDataset(Dataset[dict[str, Any]]):
         # 所选列号加 2，为特殊 token 编号 0、1 留出位置。
         genus_ids = (genus_columns[order] + 2).astype(np.int64, copy=False)
 
-        return {
+        sample = {
             # Corpus row ID for tracking and deterministic masking.
             # 语料行号，用于追踪样本和生成确定性遮盖。
             "row_id": np.int64(corpus_row_id),
@@ -84,6 +88,11 @@ class CorpusDataset(Dataset[dict[str, Any]]):
             "full_indices": genus_columns,
             "richness": np.int64(genus_columns.size),
         }
+        # UniFrac uses all observed abundance, independently of the encoder's Top-K.
+        # UniFrac 使用全部观测丰度，与 encoder 的 Top-K 截取独立。
+        if self.include_full_abundance:
+            sample["full_relative"] = corpus_abundance / corpus_abundance.sum(dtype=np.float64)
+        return sample
 
     def close(self) -> None:
         """Close the file and clear cached state. / 关闭文件并清空读取状态。"""
