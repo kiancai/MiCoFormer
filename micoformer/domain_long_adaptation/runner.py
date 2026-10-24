@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import traceback
-from .prepare import RUN,NAMES,verify,now
+from .prepare import RUN,NAMES,verify,now,configure_tree
 from micoformer.mpc_unifrac import workflow as common
 
 QUEUES={0:['loraplus_r64','lora_r128'],1:['dora_r64','adapter_b256']}
@@ -57,6 +57,7 @@ def main():
     args=parser.parse_args()
     if args.action=='pipeline':return pipeline(args.slot)
     manifest,sha=verify()
+    configure_tree()
     if args.action=='verify':print(json.dumps(dict(status='PASS',manifest_sha256=sha)),flush=True);return
     if not args.arm:parser.error('--arm required')
     if args.action=='extract':

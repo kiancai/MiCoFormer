@@ -6,13 +6,21 @@ from torch import nn
 from micoformer.models.attn_bias import BiasedTransformerEncoderLayer
 from micoformer.domain_adaptation.lora import inject_lora,LoRAConfig
 from micoformer.domain_method_adaptation.modules import inject,parameter_groups
-from micoformer.domain_long_adaptation.prepare import bind_manifest
+from micoformer.domain_long_adaptation.prepare import bind_manifest,configure_tree,RUN
 from micoformer.domain_long_adaptation.extraction import validate_prefix
 from micoformer.mpc_unifrac.workflow import _make_scheduler
 
 
 class LongRunTests(unittest.TestCase):
     def setUp(self):torch.set_num_threads(1)
+
+    def test_tree_readers_bind_before_collator_construction(self):
+        from micoformer.mpc_unifrac import data,model,teacher
+        saved=[data.ASSETS,model.ASSETS,teacher.ASSETS]
+        try:
+            configure_tree()
+            self.assertEqual(data.ASSETS,RUN/'assets/tree');self.assertEqual(model.ASSETS,data.ASSETS);self.assertEqual(teacher.ASSETS,data.ASSETS)
+        finally:data.ASSETS,model.ASSETS,teacher.ASSETS=saved
 
     def test_portable_rebinding_does_not_change_sealed_data(self):
         raw=dict(assets={'corpus':dict(path='assets/corpus.h5ad')},contract=dict(path='PLAN.md'),arms={'a':dict(output='runs/a',data=dict(paths=dict(train='assets/train.npy',val='assets/val.npy'),observed_genus_ids='assets/observed.npy',smoke_rows='assets/smoke.npy'))})
