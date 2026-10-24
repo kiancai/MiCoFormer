@@ -16,18 +16,17 @@ class GenusData:
 
 
 def load_genus_data(corpus: str | Path) -> GenusData:
-    """Load genus names and observed IDs, and build the prior table from V3.3.
-    从 V3.3 读取菌属名称与已观测编号，并构建先验表。
+    """Load genus names and observed IDs, and build the prior table from V4.
+    从 V4 读取菌属名称与已观测编号，并构建先验表。
     """
     # Read only genus-level metadata, not the abundance matrix.
     # 只读取菌属层面的特征，不把整个丰度矩阵装入内存。
     with h5py.File(corpus, "r") as source:
         version = source["uns/corpus_version"].asstr()[()]
-        if version != "MCFCorpusV3.3":
-            raise ValueError(f"expected MCFCorpusV3.3, found {version}")
+        if version != "MCFCorpusV4":
+            raise ValueError(f"expected MCFCorpusV4, found {version}")
         phy = source["varm/position_encoding"][:].astype(np.float32)
         feat = source["varm/protein_features"][:].astype(np.float32)
-        valid = source["var/protein_valid"][:]
         names = tuple(source["var/_index"].asstr()[:])
         observed = np.flatnonzero(source["var/n_samples_observed"][:] > 0).astype(np.int64) + 2
 
@@ -37,9 +36,10 @@ def load_genus_data(corpus: str | Path) -> GenusData:
     norms = np.linalg.norm(centered, axis=1)
     scale = float(np.median(norms[norms > 0]))
     phy_unit = centered / scale
-    prot_unit = np.zeros_like(feat)
-    norms = np.linalg.norm(feat[valid], axis=1)
-    prot_unit[valid] = feat[valid] / norms[:, None]
+    # Normalize every genus protein vector to unit length.
+    # 对全部菌属的蛋白向量逐行做 L2 归一化。
+    norms = np.linalg.norm(feat, axis=1)
+    prot_unit = feat / norms[:, None]
     prior_table = np.zeros((8116, 512), dtype=np.float32)
     # Scale by sqrt(512 / 2)=16 to approximately match the abundance LayerNorm's initial magnitude.
     # 乘 sqrt(512 / 2)=16，使合并先验与丰度分支 LayerNorm 的初始数值尺度接近。

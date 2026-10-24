@@ -4,6 +4,12 @@ All notable changes to MiCoFormer will be documented in this file.
 
 The format is based on Keep a Changelog, adapted for the current research workflow.
 
+## [Unreleased]
+
+### Changed
+- Switched data preparation and the default training input to MCFCorpusV4, with the released corpus version and SHA256 pinned.
+- Required complete protein features for every genus and normalized all rows directly, removing legacy protein-feature validity masking and older corpus-version branches.
+
 ## [0.4.0] - 2026-10-16
 
 ### Added
