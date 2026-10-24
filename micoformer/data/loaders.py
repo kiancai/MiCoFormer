@@ -12,6 +12,7 @@ import numpy as np
 from torch.utils.data import DataLoader, DistributedSampler
 from micoformer.config import RunConfig
 from micoformer.data.datasets import CorpusDataset
+from micoformer.data.samplers import LengthBucketSampler
 from micoformer.data.unifrac import UniFracAssets
 from micoformer.data.collate import (
     PretrainingCollator,
@@ -65,16 +66,25 @@ class TrainingData:
         }
         train_dataset = CorpusDataset(config.data.corpus, train_rows, **dataset_options)
         val_dataset = CorpusDataset(config.data.corpus, val_rows, **dataset_options)
-        # Partition dataset positions across ranks; shuffle training each epoch.
-        # 按 rank 分配数据集内的位置，训练顺序逐轮打乱。
-        train_sampler: DistributedSampler[int] = DistributedSampler(
-            train_dataset,
-            num_replicas=world,
-            rank=rank,
-            shuffle=True,
-            seed=config.training.seed,
-            drop_last=False,
-        )
+        # Bucket training lengths after rank sharding, or keep random batches.
+        # 各卡分片后按训练长度分桶，也可配置为原来的随机组批。
+        sampler_options = {
+            "num_replicas": world,
+            "rank": rank,
+            "seed": config.training.seed,
+        }
+        train_sampler: DistributedSampler[int]
+        if config.training.length_bucketing:
+            train_sampler = LengthBucketSampler(
+                train_dataset,
+                train_dataset.sequence_lengths(),
+                batch_size=config.training.batch_size_per_rank,
+                **sampler_options,
+            )
+        else:
+            train_sampler = DistributedSampler(
+                train_dataset, shuffle=True, drop_last=False, **sampler_options,
+            )
         # Validation uses a fixed order, partitioned across the same ranks.
         # 验证按相同进程数分片，保持固定顺序。
         val_sampler: DistributedSampler[int] = DistributedSampler(

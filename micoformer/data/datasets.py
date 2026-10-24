@@ -34,6 +34,14 @@ class CorpusDataset(Dataset[dict[str, Any]]):
         """Number of selected samples. / 当前数据集的样本数。"""
         return int(self.corpus_rows.size)
 
+    def sequence_lengths(self) -> np.ndarray:
+        """Read Top-K input lengths without loading abundance values.
+        仅读取 CSR 行指针，得到 Top-K 输入长度，不加载丰度数值。
+        """
+        with h5py.File(self.corpus, "r") as source:
+            richness = np.diff(source["X/indptr"][:])
+        return np.minimum(richness[self.corpus_rows], self.max_seq_len)
+
     def _data(self):
         """Open disk X on first access or after a process change.
         首次读取或进程变化时，打开磁盘中的丰度矩阵 X。

@@ -56,6 +56,9 @@ class TrainConfig:
     # 0 表示由训练进程自己加载数据；这个数不代表 CPU 核数。
     workers_per_rank: int = 2
     seed: int = 42
+    # Group similar input lengths to reduce padding; False keeps random batches.
+    # 按相近输入长度组批以减少 padding；设为 False 保留随机组批。
+    length_bucketing: bool = True
     # Per-token selection probabilities for the MLM and Query tasks.
     # MLM 丰度遮盖与 Query 菌属选择的逐 token 抽样概率。
     mlm_mask_probability: float = 0.15

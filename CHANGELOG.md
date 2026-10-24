@@ -7,10 +7,12 @@ The format is based on Keep a Changelog, adapted for the current research workfl
 ## [Unreleased]
 
 ### Added
+- Added configurable length-bucketed training batches, enabled by default, with epoch-wise shuffling and the existing distributed sample-coverage policy; validation and extraction order remain unchanged.
 - Ported optional normalized weighted UniFrac supervision from dev into the current pretraining workflow, using full-composition tree masses and the existing Query sample representation.
 - Added CE/entropy/KL diagnostics for the neighborhood objective; training with only the original three objectives remains available.
 
 ### Changed
+- Length-bucketed training changes batch-local Query-negative and UniFrac candidate pools, without changing their sampling rules, loss formulas, or weights.
 - Unified objective outputs as loss/count/diagnostics and shared their training/validation statistics and logs; unmasked diagnostics remain separate from training losses, with no objective-specific loop branches or fixed statistics layouts.
 - Integrated neighborhood weight and temperatures into TrainConfig, enabling weak UniFrac by default (weight 0.00005); setting the weight to 0 skips tree loading, full-composition targets, auxiliary losses, and diagnostics.
 - Switched to MCFCorpusV4.1 with embedded UniFrac tree assets; removed the separate tree-directory setting, keeping all UniFrac configuration out of the training CLI.
