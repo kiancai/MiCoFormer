@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 REFERENCE_LAMBDAS = {
-    # fixed：Encoder 的菌属身份输入取自固定 PHY32 + PROT480 表。
+    # fixed：Encoder 的菌属身份输入取自固定 PHY288 + PROT480 表。
     "fixed": {
         "mlm": 1.0,
         "continuous": 0.534399128791011,
@@ -24,7 +24,7 @@ REFERENCE_LAMBDAS = {
 class ModelConfig:
     identity_type: Literal["fixed", "learned"] = "fixed"
     vocab_size: int = field(default=8116, init=False)
-    d_model: int = field(default=512, init=False)
+    d_model: int = field(default=768, init=False)
     abundance_hidden_dim: int = 64
     num_layers: int = 12
     encoder_heads: int = 16

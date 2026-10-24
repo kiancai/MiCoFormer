@@ -111,8 +111,8 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
         config.data.val_rows,
     )
 
-    # GenusData: prior table [8116, 512], vocabulary, and observed genus IDs.
-    # 菌属数据：先验表 [8116, 512]、名称表和已观测菌属编号。
+    # GenusData: prior table [8116, D], vocabulary, and observed genus IDs.
+    # 菌属数据：先验表 [8116, D]、名称表和已观测菌属编号。
     genus_data = load_genus_data(config.data.corpus)
 
     # Use the fixed loss coefficients for the selected identity type.
