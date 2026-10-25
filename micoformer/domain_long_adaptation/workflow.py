@@ -47,7 +47,8 @@ def preflight(destination):
     """Direct H100 use, one explicitly inspected UUID, never a Slurm allocation."""
     if socket.gethostname() != "NVH1003":
         raise RuntimeError("expected the approved H100 host NVH1003")
-    allowed={"GPU-3d8a1781-fc8e-1855-bff0-6bda65635a07", "GPU-a576c223-bd1d-ae30-dc26-ab90d9053d61"}
+    allowed={"GPU-3d8a1781-fc8e-1855-bff0-6bda65635a07", "GPU-a576c223-bd1d-ae30-dc26-ab90d9053d61",
+             "GPU-f412ca27-bee5-f140-4344-ebbe13b2438a"}
     if EXPECTED_UUID not in allowed or os.environ.get("CUDA_VISIBLE_DEVICES") != EXPECTED_UUID:
         raise RuntimeError("one explicitly approved H100 UUID required")
     query=subprocess.check_output(["nvidia-smi","-i",EXPECTED_UUID,"--query-gpu=uuid,name,memory.total","--format=csv,noheader"],text=True)
@@ -300,7 +301,7 @@ def train(arm, manifest, sha, device, *, resume=False):
             common._append_jsonl(destination/"results/epochs.jsonl",result)
             print(f"{now()} {arm['name']} completed epoch={epoch}/{arm['epochs']} train={train_seconds:.2f}s wall={result['epoch_wall_seconds']:.2f}s val={score:.6f}",flush=True)
             del loader
-            if epoch in [10,20,30,50]:
+            if arm.get("extract_on_milestone", True) and epoch in [10,20,30,50]:
                 import sys
                 command=[sys.executable,"-m","micoformer.domain_long_adaptation.runner","extract",
                          "--arm",arm["name"],"--epoch",str(epoch)]
