@@ -16,7 +16,7 @@ def recipe():
             window=4096,sampler='window4096',steps_per_epoch=2304,total_steps=115200,
             learning_rate=5e-5,lr_ratio=16.,head_learning_rate=0.,minimum_lr=1e-6,
             warmup_ratio=.02,weight_decay=.01,gradient_clip=1.,workers=4,
-            student_temperature=.05,teacher_temperature=.03,extract_on_milestone=False,
+            extract_on_milestone=False,
             milestones=[0,10,20,30,50],weights=copy.deepcopy(WEIGHTS),
             adaptation=dict(method='loraplus',rank=64,alpha=128.,dropout=.05),
             trainable_inventory=dict(counts=dict(adaptation=6291456,heads=559747,frozen=37864576)),

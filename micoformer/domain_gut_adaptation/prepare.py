@@ -32,10 +32,13 @@ def check_contract(raw):
                     window=4096, sampler='window4096', steps_per_epoch=2304, total_steps=115200,
                     learning_rate=5e-5, lr_ratio=16., head_learning_rate=0., minimum_lr=1e-6,
                     warmup_ratio=.02, weight_decay=.01, gradient_clip=1., workers=4,
-                    student_temperature=.05, teacher_temperature=.03,
                     extract_on_milestone=False, milestones=[0,10,20,30,50])
-    if any(a.get(k) != v for k,v in expected.items()):
-        raise RuntimeError('frozen gut recipe changed')
+    differences={k:a.get(k) for k,v in expected.items() if a.get(k)!=v}
+    if differences:
+        raise RuntimeError('frozen gut recipe changed: '+repr(differences))
+    from micoformer.mpc_unifrac.teacher import STUDENT_T, TEACHER_T
+    if (STUDENT_T,TEACHER_T)!=(.05,.03):
+        raise RuntimeError('actual neighborhood temperatures changed')
     if a['adaptation'] != dict(method='loraplus',rank=64,alpha=128.,dropout=.05) or a['weights'] != WEIGHTS:
         raise RuntimeError('method or objective changed')
     if a['trainable_inventory']['counts'] != dict(adaptation=6291456,heads=559747,frozen=37864576):
@@ -92,7 +95,12 @@ def prepare():
         else:
             relative = 'assets/data/'+Path(record['path']).name
         dest = RUN/relative;dest.parent.mkdir(parents=True,exist_ok=True)
-        dest.symlink_to(record['path'])
+        if dest.is_symlink():
+            if dest.resolve()!=Path(record['path']).resolve():
+                raise RuntimeError('existing asset link has another source')
+        else:
+            if dest.exists():raise FileExistsError(dest)
+            dest.symlink_to(record['path'])
         assets[name] = dict(path=relative,bytes=record['bytes'],sha256=record['sha256'])
     arrays = {k:np.load(RUN/assets['gut_'+k]['path'],allow_pickle=False) for k in ['all','train','val']}
     for k,n in [('all',296445),('train',294906),('val',1539)]:
