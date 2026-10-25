@@ -1,7 +1,7 @@
 """One protected GPU, four finite runs, frozen endpoints and direct delivery."""
 import argparse,fcntl,json,os,subprocess,sys,threading,time,traceback
 from pathlib import Path
-from .prepare import RUN,NAMES,UUID,verify,now
+from .prepare import RUN,NAMES,UUID,verify,now,configure_tree
 from micoformer.mpc_unifrac import workflow as common
 
 LOCAL='/home/cml_lab/caiqy/project/MCFProjet/tmp/20261025_digestive_l3_adaptation'
@@ -42,10 +42,10 @@ def pipeline():
     if time.monotonic()-started>36*3600:raise RuntimeError('finite queue deadline exceeded')
     for action in ['gate','train']:
      common._atomic_json(RUN/'audit/pipeline_status.json',dict(status='RUNNING',time=now(),current=name,phase=action,completed=complete,pid=os.getpid(),manifest_sha256=sha))
-     subprocess.run([sys.executable,'-m',__package__+'.runner',action,'--arm',name],check=True)
+     subprocess.run([sys.executable,'-m',__package__+'.runner',action,'--arm',name],check=True,timeout=max(1,36*3600-(time.monotonic()-started)))
     deliver(name)
     for epoch in manifest['execution']['evaluation_epochs'][name]:
-     subprocess.run([sys.executable,str(RUN/'evaluation/scripts/extract.py'),'--arm',name,'--epoch',str(epoch)],check=True)
+     subprocess.run([sys.executable,str(RUN/'evaluation/scripts/extract.py'),'--arm',name,'--epoch',str(epoch)],check=True,timeout=max(1,36*3600-(time.monotonic()-started)))
     complete.append(name);snapshot()
    common._atomic_json(RUN/'audit/pipeline_status.json',dict(status='COMPLETED',time=now(),completed=complete,manifest_sha256=sha))
   except BaseException as error:
@@ -58,7 +58,7 @@ def pipeline():
 def main():
  parser=argparse.ArgumentParser();parser.add_argument('action',choices=['pipeline','verify','gate','train']);parser.add_argument('--arm',choices=NAMES);parser.add_argument('--resume',action='store_true');args=parser.parse_args()
  if args.action=='pipeline':return pipeline()
- m,sha=verify()
+ m,sha=verify();configure_tree()
  if args.action=='verify':print(json.dumps(dict(status='PASS',manifest_sha256=sha)));return
  if not args.arm:parser.error('--arm required')
  from micoformer.domain_long_adaptation.workflow import preflight,train
