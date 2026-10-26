@@ -8,8 +8,8 @@ REFERENCE_LAMBDAS = {
     # fixed：Encoder 的菌属身份输入取自固定 PHY288 + PROT480 表。
     "fixed": {
         "mlm": 1.0,
-        "continuous": 0.534399128791011,
-        "presence": 0.24296011504612833,
+        "continuous": 0.11311750792081131,
+        "presence": 0.05985332446133382,
     },
     # learned：Encoder 的菌属身份输入使用可训练的 embedding。
     # 当前实现的 Query 候选端仍使用固定先验，不代表完全取消先验。
@@ -48,8 +48,8 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrainConfig:
-    # Per-GPU batch size supplied by train.py. / 由 train.py 提供的每卡批大小。
-    batch_size_per_rank: int
+    # Per-GPU training batch size. / 每卡训练批大小。
+    batch_size_per_rank: int = 96
     # CPU data-loading subprocesses per training process (one process per GPU).
     # 每个训练进程的 CPU 数据加载子进程数；每张 GPU 对应一个训练进程。
     # Zero loads data in the training process; this is not a CPU core count.
@@ -71,7 +71,7 @@ class TrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     gradient_clip: float = 1.0
-    max_epochs: int = 50
+    max_epochs: int = 100
     min_epochs: int = 10
     warmup_ratio: float = 0.02
     minimum_lr: float = 1e-6
