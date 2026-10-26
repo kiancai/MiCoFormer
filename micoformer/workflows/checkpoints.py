@@ -159,12 +159,18 @@ def _load_resume(
 ) -> tuple[int, int, float, float, int]:
     """Restore training and return progress counters. / 恢复训练状态并返回进度。"""
     payload = torch.load(path, map_location=device, weights_only=False)
-    # Resume the same run: data record, full config, loss weights, and rank count.
-    # 续接同一训练：数据记录、完整配置、损失权重和进程数必须一致。
+    # Output location and CPU worker count may change without changing training.
+    # 允许迁移输出目录、调整 CPU worker 数；其余训练配置仍须完全一致。
+    saved_config = dict(payload["config"])
+    current_config = config.to_dict()
+    for settings in (saved_config, current_config):
+        settings.pop("output_root")
+        settings["training"] = dict(settings["training"])
+        settings["training"].pop("workers_per_rank")
     if (
         payload["checkpoint_kind"] != "training_checkpoint"
         or payload["data_preparation"] != preparation
-        or payload["config"] != config.to_dict()
+        or saved_config != current_config
         or payload["lambda"] != dict(lambdas)
         or len(payload["rng_by_rank"]) != world
     ):

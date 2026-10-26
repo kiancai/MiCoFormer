@@ -15,14 +15,14 @@ class LearnedTokenStem(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         # Genus table [vocab_size, D]: IDs [B, L] -> vectors [B, L, D].
-        # 菌属向量表 [8116, 512]：编号 [B, L] 查表得到向量 [B, L, 512]。
+        # 菌属向量表 [8116, D]：编号 [B, L] 查表得到向量 [B, L, D]。
         self.genus_embedding = nn.Embedding(
             config.vocab_size,
             config.d_model,
             padding_idx=PAD_TOKEN_ID,
         )
-        # Abundance MLP: 1 -> H -> D (default 1 -> 64 -> 512), with GELU and LayerNorm.
-        # 丰度编码：[B, L, 1] -> [B, L, 64] -> [B, L, 512]，经非线性与归一化处理。
+        # Abundance MLP: 1 -> H -> D (default 1 -> 64 -> 768), with GELU and LayerNorm.
+        # 丰度编码：[B, L, 1] -> [B, L, 64] -> [B, L, D]，经非线性与归一化处理。
         self.abundance_mlp = nn.Sequential(
             nn.Linear(1, config.abundance_hidden_dim),
             nn.GELU(),
@@ -30,7 +30,7 @@ class LearnedTokenStem(nn.Module):
             nn.LayerNorm(config.d_model),
         )
         # Shared trainable abundance-mask vector [D]; normal initialization (mean=0, std=0.02).
-        # 共享的可训练丰度遮盖向量 [512]；用均值 0、标准差 0.02 的正态分布初始化。
+        # 共享的可训练丰度遮盖向量 [D]；用均值 0、标准差 0.02 的正态分布初始化。
         self.abundance_mask_embedding = nn.Parameter(torch.empty(config.d_model))
         nn.init.normal_(self.abundance_mask_embedding, mean=0.0, std=0.02)
 

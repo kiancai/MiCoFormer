@@ -22,10 +22,8 @@ def make_config(
     汇总数据路径、模型参数和训练设置。
     """
     model = ModelConfig()
-    # Set per-GPU batch size here. / 在这里设置每卡批大小。
-    training = TrainConfig(
-        batch_size_per_rank=128,
-    )
+    # Training defaults are defined in config.py. / 训练默认参数统一在 config.py 设置。
+    training = TrainConfig()
 
     data = DataConfig(
         corpus=corpus,
@@ -53,7 +51,7 @@ def main() -> None:
     parser.add_argument(
         "--corpus",
         type=Path,
-        default=Path("data/corpus/MCFCorpusV3.3.gg2.h5ad"),
+        default=Path("data/corpus/MCFCorpusV4.3.gg2.h5ad"),
         help="Path to the corpus used for sample preparation (default: %(default)s).",
     )
     parser.add_argument(

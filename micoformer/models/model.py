@@ -10,15 +10,16 @@ from micoformer.config import ModelConfig
 from .encoder import EncoderBackbone, masked_token_mean
 from .embeddings import FixedPriorTokenStem, LearnedTokenStem
 from .heads import AbundanceRegressionHead, ConcatQueryHead
+from .unifrac import neighborhood_loss, weighted_unifrac
 
 
-class PretrainingOutput(NamedTuple):
-    mlm_loss: Tensor
-    continuous_loss: Tensor
-    presence_loss: Tensor
-    mlm_count: int
-    continuous_count: int
-    presence_count: int
+class LossResult(NamedTuple):
+    """A mean loss, effective target count, and detached diagnostics.
+    每项目标的平均损失、有效目标数，以及不参与反传的诊断。
+    """
+    loss: Tensor
+    count: int
+    diagnostics: dict[str, Tensor]
 
 
 class MiCoFormer(nn.Module):
@@ -26,9 +27,23 @@ class MiCoFormer(nn.Module):
     共享编码器，执行 MLM 丰度重建与 Query 丰度、存在性预测。
     """
 
-    def __init__(self, prior_table: Tensor, config: ModelConfig) -> None:
+    def __init__(
+        self, prior_table: Tensor, config: ModelConfig, *,
+        unifrac_lengths: Tensor | None = None,
+        teacher_temperature: float = 0.03,
+        student_temperature: float = 0.05,
+    ) -> None:
         super().__init__()
         self.config = config
+        # Tree lengths are training-only targets, not parameters or inference assets.
+        # 树枝长度仅用于训练监督，不是参数，也不是推理所需资产。
+        self.register_buffer(
+            "unifrac_lengths",
+            unifrac_lengths.detach().float().clone() if unifrac_lengths is not None else None,
+            persistent=False,
+        )
+        self.teacher_temperature = teacher_temperature
+        self.student_temperature = student_temperature
 
         # Share one non-trainable prior table [vocab_size, D], saved with the model.
         # 共用一份不可训练的先验表 [vocab_size, D]，随模型保存与迁移设备。
@@ -56,23 +71,53 @@ class MiCoFormer(nn.Module):
         query_mask: Tensor,
         mlm_mask: Tensor,
         negative_genus_ids: Tensor,
-    ) -> PretrainingOutput:
-        """Compute three mean losses and target counts from batch tensors [B, L].
-        根据 batch 张量 [B, L] 计算三项平均损失及对应目标数量。
+        edge_mass: Tensor | None = None,
+    ) -> dict[str, LossResult]:
+        """Compute MiCoFormer losses, including Query-view UniFrac when enabled.
+        计算 MiCoFormer 损失；开启时包含 Query 视图的 UniFrac 监督。
         """
 
         # Encode the MLM and Query views separately with shared parameters.
         # MLM 与 Query 采用不同遮盖视图，分别编码并共用参数。
         mlm_loss, mlm_count = self._mlm_loss(genus_ids, abundance, padding_mask, mlm_mask)
 
-        continuous_loss, presence_loss, continuous_count, presence_count = self._query_losses(
+        (
+            continuous_loss, presence_loss, continuous_count, presence_count, sample_h,
+        ) = self._query_losses(
             genus_ids, abundance, padding_mask, query_mask, negative_genus_ids
         )
 
-        return PretrainingOutput(
-            mlm_loss, continuous_loss, presence_loss,
-            mlm_count, continuous_count, presence_count,
-        )
+        objectives = {
+            "mlm": LossResult(mlm_loss, mlm_count, {}),
+            "continuous": LossResult(continuous_loss, continuous_count, {}),
+            "presence": LossResult(presence_loss, presence_count, {}),
+        }
+        objectives.update(self.sample_objectives(sample_h, edge_mass))
+        return objectives
+
+    def sample_objectives(
+        self, sample_h: Tensor, edge_mass: Tensor | None,
+    ) -> dict[str, LossResult]:
+        """Compute sample targets for Query or unmasked representations.
+        样本目标共用同一入口，训练与无遮盖诊断分别传入各自的表征。
+        """
+        if self.unifrac_lengths is None:
+            return {}
+        count = len(sample_h)
+        if count >= 2:
+            distances = weighted_unifrac(edge_mass, self.unifrac_lengths)
+            loss, entropy, kl = neighborhood_loss(
+                sample_h, distances,
+                teacher_temperature=self.teacher_temperature,
+                student_temperature=self.student_temperature,
+            )
+        else:
+            # A singleton has no neighbors and contributes no effective targets.
+            # 单样本没有邻域：保留零损失计算图，但不计入有效目标数。
+            loss = sample_h.sum() * 0.0
+            entropy = kl = loss.detach()
+            count = 0
+        return {"unifrac": LossResult(loss, count, {"teacher_entropy": entropy, "kl": kl})}
 
     def unmasked_representations(
         self,
@@ -161,7 +206,7 @@ class MiCoFormer(nn.Module):
         padding_mask: Tensor,
         query_mask: Tensor,
         negative_genus_ids: Tensor,
-    ) -> tuple[Tensor, Tensor, int, int]:
+    ) -> tuple[Tensor, Tensor, int, int, Tensor]:
         """Remove Query targets, predict candidates, and compute abundance/presence losses.
         移除 Query 目标，预测正负候选菌属，并计算丰度与存在性损失。
         """
@@ -227,6 +272,6 @@ class MiCoFormer(nn.Module):
         # BCEWithLogits computes the mean presence loss directly from logits.
         # BCEWithLogits 直接根据 logit 计算平均存在性损失。
         presence_loss = F.binary_cross_entropy_with_logits(logits, labels)
-        # Return abundance/presence losses followed by their target counts.
-        # 依次返回丰度损失、存在性损失及对应的目标数量。
-        return continuous_loss, presence_loss, positive_count, int(labels.numel())
+        # Reuse this same Query view for UniFrac; do not add another encoder pass.
+        # UniFrac 复用本次 Query 视图，不新增 encoder 前向。
+        return continuous_loss, presence_loss, positive_count, int(labels.numel()), sample_h

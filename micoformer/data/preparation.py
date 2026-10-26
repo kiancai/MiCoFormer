@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Callable
 
-import anndata as ad
+import h5py
 import numpy as np
 
 from micoformer.utils.io import sha256_file
@@ -28,15 +28,17 @@ def prepare_splits(
     选取样本行，划分训练/验证集，并将行号保存到新目录。
 
     Returns the preparation.json path. / 返回 preparation.json 路径。
+    The selector receives the open HDF5 corpus. / 选样函数接收打开的 HDF5 语料。
     """
     corpus, output = Path(corpus).resolve(), Path(output).resolve()
     if output.exists():
         raise FileExistsError(f"choose a new preparation directory: {output}")
 
-    adata = ad.read_h5ad(corpus, backed="r")
-    try:
+    # Selection reads only its required metadata, keeping full-corpus memory bounded.
+    # 选样函数只读取所需元数据，避免整库 obs 同时进入内存。
+    with h5py.File(corpus, "r") as source:
         # Check the corpus before selection. / 选样前核对语料身份。
-        declared = adata.uns["corpus_version"]
+        declared = source["uns/corpus_version"].asstr()[()]
         if declared != expected_version:
             raise ValueError(f"expected {expected_version}, found {declared}")
         digest = sha256_file(corpus)
@@ -46,12 +48,10 @@ def prepare_splits(
             "path": str(corpus),
             "sha256": digest,
             "version": declared,
-            "shape": list(adata.shape),
+            "shape": [int(value) for value in source["X"].attrs["shape"]],
         }
-        rows = np.sort(select_rows(adata))
-        vocabulary = np.asarray(adata.var_names, dtype=str)
-    finally:
-        adata.file.close()
+        rows = np.sort(select_rows(source))
+        vocabulary = source["var"][source["var"].attrs["_index"]].asstr()[:].astype(str)
 
     # Keep the existing random row split; no Study grouping. / 沿用按行随机划分，不按 Study 分组。
     permutation = np.random.default_rng(seed).permutation(rows.size)

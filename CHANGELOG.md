@@ -4,6 +4,30 @@ All notable changes to MiCoFormer will be documented in this file.
 
 The format is based on Keep a Changelog, adapted for the current research workflow.
 
+## [0.5.0] - 2026-10-26
+
+### Added
+- Added configurable length-bucketed training batches, enabled by default, with epoch-wise shuffling and the existing distributed sample-coverage policy; validation and extraction order remain unchanged.
+- Added optional normalized weighted UniFrac supervision to MiCoFormer pretraining, using full-composition tree masses and the existing Query sample representation.
+- Added CE/entropy/KL diagnostics for the neighborhood objective; training with only the original three objectives remains available.
+
+### Changed
+- Switched to MCFCorpusV4.3 and its frozen 768-dimensional PHY288 + raw-PROT480 prior, with fixed centering and one RMS scale per block to equalize reference-pair squared-distance totals; input and Query use the same stored table without row normalization.
+- Increased model width to 768 while retaining 12 layers, 16 attention heads, and FFN width 2048. Previous 512-wide checkpoints require their original code; they cannot resume this model.
+- Made preparation select required HDF5 metadata directly, preserving the sample-level split policy without loading every observation column at once.
+- Length-bucketed training changes batch-local Query-negative and UniFrac candidate pools, without changing their sampling rules, loss formulas, or weights.
+- Unified objective outputs as loss/count/diagnostics and shared their training/validation statistics and logs; unmasked diagnostics remain separate from training losses, with no objective-specific loop branches or fixed statistics layouts.
+- Integrated neighborhood weight and temperatures into TrainConfig, enabling weak UniFrac by default (weight 0.00005); setting the weight to 0 skips tree loading, full-composition targets, auxiliary losses, and diagnostics.
+- Kept UniFrac tree assets inside the unified corpus; removed the separate tree-directory setting, keeping all UniFrac configuration out of the training CLI.
+- Pinned the released corpus version and SHA256 for preparation and the default training input.
+- Required complete raw protein features for every genus, removing legacy protein-feature validity masking and older corpus-version branches.
+- Centralized training defaults in TrainConfig: batch size 96 per GPU, a 100-epoch limit, and fixed-prior loss weights calibrated for V4.3.
+- Loaded training and validation data from one read-only CSR matrix per rank, shared with forked CPU workers; standalone embedding extraction remains disk-backed.
+- Allowed training resumption after changing only the output directory or data-loading worker count, while preserving other configuration, data, loss-weight, and world-size checks.
+
+### Removed
+- Removed redundant fixed-asset and internal-interface runtime checks and the temporary test suite; retained corpus identity checks and training failure handling.
+
 ## [0.4.0] - 2026-10-16
 
 ### Added

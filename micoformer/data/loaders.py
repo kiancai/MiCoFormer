@@ -12,6 +12,8 @@ import numpy as np
 from torch.utils.data import DataLoader, DistributedSampler
 from micoformer.config import RunConfig
 from micoformer.data.datasets import CorpusDataset
+from micoformer.data.samplers import LengthBucketSampler
+from micoformer.data.unifrac import UniFracAssets
 from micoformer.data.collate import (
     PretrainingCollator,
     collate_unmasked,
@@ -43,12 +45,13 @@ class TrainingData:
         rank: int,
         world: int,
         observed: np.ndarray,
+        unifrac_assets: UniFracAssets | None = None,
     ) -> TrainingData:
         """Build training/validation readers from prepared splits.
         根据已准备的划分创建训练和验证读取器。
         """
-        # Read corpus row IDs [N_train]/[N_val]; the abundance matrix stays on disk.
-        # 读取语料行号 [N_train]/[N_val]，丰度矩阵仍按需从磁盘读取。
+        # Read split row IDs; share one resident CSR between both splits in this rank.
+        # 读取划分行号；当前 rank 的训练和验证共用一份内存 CSR。
         train_rows = np.asarray(
             np.load(config.data.train_rows, mmap_mode="r", allow_pickle=False)
         )
@@ -57,18 +60,32 @@ class TrainingData:
         )
         # Use the configured sequence limit and retain full support for negative sampling.
         # 按模型配置截取序列，保留完整菌属集合用于负例排除。
-        train_dataset = CorpusDataset(config.data.corpus, train_rows, max_seq_len=config.model.max_seq_len)
-        val_dataset = CorpusDataset(config.data.corpus, val_rows, max_seq_len=config.model.max_seq_len)
-        # Partition dataset positions across ranks; shuffle training each epoch.
-        # 按 rank 分配数据集内的位置，训练顺序逐轮打乱。
-        train_sampler: DistributedSampler[int] = DistributedSampler(
-            train_dataset,
-            num_replicas=world,
-            rank=rank,
-            shuffle=True,
-            seed=config.training.seed,
-            drop_last=False,
-        )
+        dataset_options = {
+            "max_seq_len": config.model.max_seq_len,
+            "include_full_abundance": unifrac_assets is not None,
+            "resident": True,
+        }
+        train_dataset = CorpusDataset(config.data.corpus, train_rows, **dataset_options)
+        val_dataset = CorpusDataset(config.data.corpus, val_rows, **dataset_options)
+        # Bucket training lengths after rank sharding, or keep random batches.
+        # 各卡分片后按训练长度分桶，也可配置为原来的随机组批。
+        sampler_options = {
+            "num_replicas": world,
+            "rank": rank,
+            "seed": config.training.seed,
+        }
+        train_sampler: DistributedSampler[int]
+        if config.training.length_bucketing:
+            train_sampler = LengthBucketSampler(
+                train_dataset,
+                train_dataset.sequence_lengths(),
+                batch_size=config.training.batch_size_per_rank,
+                **sampler_options,
+            )
+        else:
+            train_sampler = DistributedSampler(
+                train_dataset, shuffle=True, drop_last=False, **sampler_options,
+            )
         # Validation uses a fixed order, partitioned across the same ranks.
         # 验证按相同进程数分片，保持固定顺序。
         val_sampler: DistributedSampler[int] = DistributedSampler(
@@ -82,8 +99,9 @@ class TrainingData:
         # 无法均分时由采样器补少量重复位置，使各进程样本数相同。
         # Persistent workers read shared int64 epoch values; validation stays at 0.
         # 持久 worker 读取共享 int64 轮数；训练逐轮更新，验证保持为 0。
-        train_epoch = mp.Value("q", 0)
-        val_epoch = mp.Value("q", 0)
+        context = mp.get_context("fork")
+        train_epoch = context.Value("q", 0)
+        val_epoch = context.Value("q", 0)
         # Read CPU worker count and per-GPU batch size from the training config.
         # CPU 加载进程数和每卡批大小统一取自训练配置。
         worker_count = config.training.workers_per_rank
@@ -98,6 +116,9 @@ class TrainingData:
             "persistent_workers": worker_count > 0,
             "prefetch_factor": 2 if worker_count > 0 else None,
             "drop_last": False,
+            # Fork shares read-only CSR pages instead of serializing the corpus.
+            # fork 共享只读 CSR 内存页，避免向 worker 序列化整个语料。
+            "multiprocessing_context": context if worker_count > 0 else None,
         }
         # Connect sample reading, rank sampling, and task collation; stream 1 is training.
         # 连接样本读取、进程采样与任务组批；stream=1 用于训练。
@@ -111,6 +132,7 @@ class TrainingData:
                 shared_epoch=train_epoch,
                 mlm_mask_probability=config.training.mlm_mask_probability,
                 query_mask_probability=config.training.query_mask_probability,
+                unifrac_incidence=unifrac_assets.incidence if unifrac_assets is not None else None,
             ),
             **common,
         )
@@ -126,11 +148,12 @@ class TrainingData:
                 shared_epoch=val_epoch,
                 mlm_mask_probability=config.training.mlm_mask_probability,
                 query_mask_probability=config.training.query_mask_probability,
+                unifrac_incidence=unifrac_assets.incidence if unifrac_assets is not None else None,
             ),
             **common,
         )
-        # DataLoaders fetch samples lazily when the training loop iterates over them.
-        # 训练循环遍历读取器时才逐批取样，不在此处加载整个语料。
+        # Workers start on iteration, after the shared CSR has been loaded.
+        # 共用 CSR 加载后，worker 在开始遍历时启动。
         return cls(
             train_loader=train_loader,
             val_loader=val_loader,

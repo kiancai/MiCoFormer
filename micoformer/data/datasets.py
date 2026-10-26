@@ -2,11 +2,29 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from functools import lru_cache
 import os
 import h5py
 import numpy as np
 from anndata.io import sparse_dataset
 from torch.utils.data import Dataset
+from scipy.sparse import csr_matrix
+
+
+@lru_cache(maxsize=1)
+def _resident_csr(corpus: Path) -> csr_matrix:
+    """Share original CSR arrays between splits and forked CPU workers.
+    原始 CSR 数组由训练、验证和 fork CPU worker 共用，不保留 HDF5 连接。
+    """
+    with h5py.File(corpus, "r") as source:
+        matrix = source["X"]
+        result = csr_matrix(
+            (matrix["data"][:], matrix["indices"][:], matrix["indptr"][:]),
+            shape=tuple(matrix.attrs["shape"]), copy=False,
+        )
+    for array in (result.data, result.indices, result.indptr):
+        array.flags.writeable = False
+    return result
 
 
 class CorpusDataset(Dataset[dict[str, Any]]):
@@ -14,26 +32,45 @@ class CorpusDataset(Dataset[dict[str, Any]]):
     读取单个样本，保留截取前的完整菌属集合供负例采样排除。
     """
 
-    def __init__(self, corpus: str | Path, corpus_rows: np.ndarray, *, max_seq_len: int) -> None:
+    def __init__(
+        self, corpus: str | Path, corpus_rows: np.ndarray, *, max_seq_len: int,
+        include_full_abundance: bool = False,
+        resident: bool = False,
+    ) -> None:
         # Selected corpus rows and sequence limit from the model configuration.
         # 选中的语料行号，以及模型配置提供的最大序列长度。
         self.corpus_rows = np.asarray(corpus_rows, dtype=np.int64)
         self.max_seq_len = max_seq_len
+        self.include_full_abundance = include_full_abundance
         # Open lazily and reuse the file connection within each process.
         # 首次读取时打开文件，各进程独立保存并复用连接。
         self._handle: h5py.File | None = None
         self._matrix = None
         self._pid: int | None = None
         self.corpus = Path(corpus).resolve()
+        self._resident = _resident_csr(self.corpus) if resident else None
 
     def __len__(self) -> int:
         """Number of selected samples. / 当前数据集的样本数。"""
         return int(self.corpus_rows.size)
 
+    def sequence_lengths(self) -> np.ndarray:
+        """Read Top-K input lengths without loading abundance values.
+        仅读取 CSR 行指针，得到 Top-K 输入长度，不加载丰度数值。
+        """
+        if self._resident is not None:
+            richness = np.diff(self._resident.indptr)
+        else:
+            with h5py.File(self.corpus, "r") as source:
+                richness = np.diff(source["X/indptr"][:])
+        return np.minimum(richness[self.corpus_rows], self.max_seq_len)
+
     def _data(self):
         """Open disk X on first access or after a process change.
         首次读取或进程变化时，打开磁盘中的丰度矩阵 X。
         """
+        if self._resident is not None:
+            return self._resident
         if self._handle is None or self._pid != os.getpid():
             self.close()
             self._handle = h5py.File(self.corpus, "r")
@@ -71,7 +108,7 @@ class CorpusDataset(Dataset[dict[str, Any]]):
         # 所选列号加 2，为特殊 token 编号 0、1 留出位置。
         genus_ids = (genus_columns[order] + 2).astype(np.int64, copy=False)
 
-        return {
+        sample = {
             # Corpus row ID for tracking and deterministic masking.
             # 语料行号，用于追踪样本和生成确定性遮盖。
             "row_id": np.int64(corpus_row_id),
@@ -84,6 +121,11 @@ class CorpusDataset(Dataset[dict[str, Any]]):
             "full_indices": genus_columns,
             "richness": np.int64(genus_columns.size),
         }
+        # UniFrac uses all observed abundance, independently of the encoder's Top-K.
+        # UniFrac 使用全部观测丰度，与 encoder 的 Top-K 截取独立。
+        if self.include_full_abundance:
+            sample["full_relative"] = corpus_abundance / corpus_abundance.sum(dtype=np.float64)
+        return sample
 
     def close(self) -> None:
         """Close the file and clear cached state. / 关闭文件并清空读取状态。"""
