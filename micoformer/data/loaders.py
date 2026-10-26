@@ -50,8 +50,8 @@ class TrainingData:
         """Build training/validation readers from prepared splits.
         根据已准备的划分创建训练和验证读取器。
         """
-        # Read corpus row IDs [N_train]/[N_val]; the abundance matrix stays on disk.
-        # 读取语料行号 [N_train]/[N_val]，丰度矩阵仍按需从磁盘读取。
+        # Read split row IDs; share one resident CSR between both splits in this rank.
+        # 读取划分行号；当前 rank 的训练和验证共用一份内存 CSR。
         train_rows = np.asarray(
             np.load(config.data.train_rows, mmap_mode="r", allow_pickle=False)
         )
@@ -63,6 +63,7 @@ class TrainingData:
         dataset_options = {
             "max_seq_len": config.model.max_seq_len,
             "include_full_abundance": unifrac_assets is not None,
+            "resident": True,
         }
         train_dataset = CorpusDataset(config.data.corpus, train_rows, **dataset_options)
         val_dataset = CorpusDataset(config.data.corpus, val_rows, **dataset_options)
@@ -98,8 +99,9 @@ class TrainingData:
         # 无法均分时由采样器补少量重复位置，使各进程样本数相同。
         # Persistent workers read shared int64 epoch values; validation stays at 0.
         # 持久 worker 读取共享 int64 轮数；训练逐轮更新，验证保持为 0。
-        train_epoch = mp.Value("q", 0)
-        val_epoch = mp.Value("q", 0)
+        context = mp.get_context("fork")
+        train_epoch = context.Value("q", 0)
+        val_epoch = context.Value("q", 0)
         # Read CPU worker count and per-GPU batch size from the training config.
         # CPU 加载进程数和每卡批大小统一取自训练配置。
         worker_count = config.training.workers_per_rank
@@ -114,6 +116,9 @@ class TrainingData:
             "persistent_workers": worker_count > 0,
             "prefetch_factor": 2 if worker_count > 0 else None,
             "drop_last": False,
+            # Fork shares read-only CSR pages instead of serializing the corpus.
+            # fork 共享只读 CSR 内存页，避免向 worker 序列化整个语料。
+            "multiprocessing_context": context if worker_count > 0 else None,
         }
         # Connect sample reading, rank sampling, and task collation; stream 1 is training.
         # 连接样本读取、进程采样与任务组批；stream=1 用于训练。
@@ -147,8 +152,8 @@ class TrainingData:
             ),
             **common,
         )
-        # DataLoaders fetch samples lazily when the training loop iterates over them.
-        # 训练循环遍历读取器时才逐批取样，不在此处加载整个语料。
+        # Workers start on iteration, after the shared CSR has been loaded.
+        # 共用 CSR 加载后，worker 在开始遍历时启动。
         return cls(
             train_loader=train_loader,
             val_loader=val_loader,

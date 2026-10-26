@@ -2,11 +2,29 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from functools import lru_cache
 import os
 import h5py
 import numpy as np
 from anndata.io import sparse_dataset
 from torch.utils.data import Dataset
+from scipy.sparse import csr_matrix
+
+
+@lru_cache(maxsize=1)
+def _resident_csr(corpus: Path) -> csr_matrix:
+    """Share original CSR arrays between splits and forked CPU workers.
+    原始 CSR 数组由训练、验证和 fork CPU worker 共用，不保留 HDF5 连接。
+    """
+    with h5py.File(corpus, "r") as source:
+        matrix = source["X"]
+        result = csr_matrix(
+            (matrix["data"][:], matrix["indices"][:], matrix["indptr"][:]),
+            shape=tuple(matrix.attrs["shape"]), copy=False,
+        )
+    for array in (result.data, result.indices, result.indptr):
+        array.flags.writeable = False
+    return result
 
 
 class CorpusDataset(Dataset[dict[str, Any]]):
@@ -17,6 +35,7 @@ class CorpusDataset(Dataset[dict[str, Any]]):
     def __init__(
         self, corpus: str | Path, corpus_rows: np.ndarray, *, max_seq_len: int,
         include_full_abundance: bool = False,
+        resident: bool = False,
     ) -> None:
         # Selected corpus rows and sequence limit from the model configuration.
         # 选中的语料行号，以及模型配置提供的最大序列长度。
@@ -29,6 +48,7 @@ class CorpusDataset(Dataset[dict[str, Any]]):
         self._matrix = None
         self._pid: int | None = None
         self.corpus = Path(corpus).resolve()
+        self._resident = _resident_csr(self.corpus) if resident else None
 
     def __len__(self) -> int:
         """Number of selected samples. / 当前数据集的样本数。"""
@@ -38,14 +58,19 @@ class CorpusDataset(Dataset[dict[str, Any]]):
         """Read Top-K input lengths without loading abundance values.
         仅读取 CSR 行指针，得到 Top-K 输入长度，不加载丰度数值。
         """
-        with h5py.File(self.corpus, "r") as source:
-            richness = np.diff(source["X/indptr"][:])
+        if self._resident is not None:
+            richness = np.diff(self._resident.indptr)
+        else:
+            with h5py.File(self.corpus, "r") as source:
+                richness = np.diff(source["X/indptr"][:])
         return np.minimum(richness[self.corpus_rows], self.max_seq_len)
 
     def _data(self):
         """Open disk X on first access or after a process change.
         首次读取或进程变化时，打开磁盘中的丰度矩阵 X。
         """
+        if self._resident is not None:
+            return self._resident
         if self._handle is None or self._pid != os.getpid():
             self.close()
             self._handle = h5py.File(self.corpus, "r")
