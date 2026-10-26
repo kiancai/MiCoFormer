@@ -4,11 +4,11 @@ All notable changes to MiCoFormer will be documented in this file.
 
 The format is based on Keep a Changelog, adapted for the current research workflow.
 
-## [Unreleased]
+## [0.5.0] - 2026-10-26
 
 ### Added
 - Added configurable length-bucketed training batches, enabled by default, with epoch-wise shuffling and the existing distributed sample-coverage policy; validation and extraction order remain unchanged.
-- Ported optional normalized weighted UniFrac supervision from dev into the current pretraining workflow, using full-composition tree masses and the existing Query sample representation.
+- Added optional normalized weighted UniFrac supervision to MiCoFormer pretraining, using full-composition tree masses and the existing Query sample representation.
 - Added CE/entropy/KL diagnostics for the neighborhood objective; training with only the original three objectives remains available.
 
 ### Changed
@@ -21,6 +21,9 @@ The format is based on Keep a Changelog, adapted for the current research workfl
 - Kept UniFrac tree assets inside the unified corpus; removed the separate tree-directory setting, keeping all UniFrac configuration out of the training CLI.
 - Pinned the released corpus version and SHA256 for preparation and the default training input.
 - Required complete raw protein features for every genus, removing legacy protein-feature validity masking and older corpus-version branches.
+- Centralized training defaults in TrainConfig: batch size 96 per GPU, a 100-epoch limit, and fixed-prior loss weights calibrated for V4.3.
+- Loaded training and validation data from one read-only CSR matrix per rank, shared with forked CPU workers; standalone embedding extraction remains disk-backed.
+- Allowed training resumption after changing only the output directory or data-loading worker count, while preserving other configuration, data, loss-weight, and world-size checks.
 
 ### Removed
 - Removed redundant fixed-asset and internal-interface runtime checks and the temporary test suite; retained corpus identity checks and training failure handling.
