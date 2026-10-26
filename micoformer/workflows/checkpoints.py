@@ -7,6 +7,7 @@ Training checkpoints include optimizer, scheduler, and per-rank RNG state; load_
 from __future__ import annotations
 
 import random
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
 import numpy as np
@@ -16,6 +17,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from micoformer.config import (
     RunConfig,
     ModelConfig,
+    TrainConfig,
 )
 from micoformer.models import MiCoFormer
 from micoformer.utils.io import (
@@ -23,6 +25,26 @@ from micoformer.utils.io import (
     atomic_json,
     sha256_file,
 )
+
+
+def load_model_config(checkpoint: Path) -> ModelConfig:
+    """Read model settings from a training checkpoint or model snapshot.
+    从训练 checkpoint 或模型快照读取模型配置。
+    """
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    return ModelConfig.from_checkpoint_dict(payload["model_config"])
+
+
+def initialize_weights(model: MiCoFormer, checkpoint: Path) -> None:
+    """Load base weights for a new optimization stage, keeping corpus token identity.
+    为新优化阶段加载基座权重和先验，确保语料中的 token 编号一致。
+    """
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state = payload["model_state_dict"]
+    if tuple(payload["vocabulary"]) != tuple(model.vocabulary):
+        raise ValueError("initial checkpoint must match the corpus vocabulary order")
+    model.load_state_dict(state, strict=True)
+    model.initialization = {"checkpoint": str(checkpoint), "sha256": sha256_file(checkpoint)}
 
 
 def _capture_rng_state(device: torch.device) -> dict[str, Any]:
@@ -89,6 +111,7 @@ def _save_training_checkpoint(
         # Save the unwrapped model, including its persistent prior-table buffer.
         # 保存 DDP 内部模型，包含持久化的固定先验表。
         "model_state_dict": ddp.module.state_dict(),
+        "initialization": getattr(ddp.module, "initialization", None),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         # Epoch is zero-based and identifies a completed training/validation round.
@@ -126,6 +149,7 @@ def _save_training_checkpoint(
                 "model_config": ddp.module.config.to_dict(),
                 "vocabulary": ddp.module.vocabulary,
                 "model_state_dict": ddp.module.state_dict(),
+                "initialization": payload["initialization"],
                 "validation": dict(validation),
             },
         )
@@ -165,7 +189,11 @@ def _load_resume(
     current_config = config.to_dict()
     for settings in (saved_config, current_config):
         settings.pop("output_root")
-        settings["training"] = dict(settings["training"])
+        # Expand defaults so checkpoints saved before optional LoRA fields still resume.
+        # 补齐新增可选字段的默认值，兼容接入 LoRA 前的普通预训练 checkpoint。
+        settings.setdefault("initialize_from", None)
+        settings["model"] = ModelConfig.from_checkpoint_dict(settings["model"]).to_dict()
+        settings["training"] = asdict(TrainConfig(**settings["training"]))
         settings["training"].pop("workers_per_rank")
     if (
         payload["checkpoint_kind"] != "training_checkpoint"
@@ -178,6 +206,7 @@ def _load_resume(
     # Restore existing objects; fixed buffers are included in the model state.
     # 恢复已经创建的对象；模型状态包含固定 buffer。
     ddp.module.load_state_dict(payload["model_state_dict"], strict=True)
+    ddp.module.initialization = payload.get("initialization")
     optimizer.load_state_dict(payload["optimizer_state_dict"])
     scheduler.load_state_dict(payload["scheduler_state_dict"])
     _restore_rng_state(payload["rng_by_rank"][rank], device)
@@ -215,6 +244,7 @@ def load_model(
     model = MiCoFormer(state["prior_table"], config)
     model.load_state_dict(state, strict=True)
     model.vocabulary = tuple(payload["vocabulary"])
+    model.initialization = payload.get("initialization")
     # Inference needs no training corpus; eval disables training-time dropout.
     # 加载模型无需训练语料库；eval 关闭训练时的 Dropout。
     model.to(torch.device(device)).eval()

@@ -10,6 +10,7 @@ from micoformer.config import ModelConfig
 from .encoder import EncoderBackbone, masked_token_mean
 from .embeddings import FixedPriorTokenStem, LearnedTokenStem
 from .heads import AbundanceRegressionHead, ConcatQueryHead
+from .lora import add_lora
 from .unifrac import neighborhood_loss, weighted_unifrac
 
 
@@ -62,6 +63,8 @@ class MiCoFormer(nn.Module):
             config.d_model, config.mlm_head_hidden_dim
         )
         self.query_head = ConcatQueryHead(config.d_model)
+        if config.lora_rank > 0:
+            add_lora(self, config)
 
     def forward(
         self,

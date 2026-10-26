@@ -4,6 +4,13 @@ All notable changes to MiCoFormer will be documented in this file.
 
 The format is based on Keep a Changelog, adapted for the current research workflow.
 
+## [Unreleased]
+
+### Added
+- Added unlabeled LoRA+ domain adaptation through `scripts.finetune`, sharing the existing data, objectives, validation, and training loop.
+- Added low-rank updates to packed QKV, attention output, and both FFN projections, with separate A/B learning rates and optional prediction-head updates.
+- Saved LoRA structure and base-checkpoint provenance in self-contained checkpoints, supported by the existing loader, resumption, and embedding extraction APIs.
+
 ## [0.5.0] - 2026-10-26
 
 ### Added

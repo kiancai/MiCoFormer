@@ -32,6 +32,17 @@ class ModelConfig:
     mlm_head_hidden_dim: int = 64
     dropout: float = 0.1
     max_seq_len: int = field(default=512, init=False)
+    # Zero keeps the ordinary encoder; a positive rank adds LoRA projections.
+    # rank 为 0 时使用普通 encoder；大于 0 时添加 LoRA 投影。
+    lora_rank: int = 0
+    lora_alpha: float = 128.0
+    lora_dropout: float = 0.05
+
+    def for_finetuning(self) -> ModelConfig:
+        """Enable the reference adapter on the checkpoint's model structure.
+        在 checkpoint 的模型结构上启用参考微调配置。
+        """
+        return replace(self, lora_rank=64)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -43,7 +54,12 @@ class ModelConfig:
         for item in fields(cls):
             if not item.init and payload[item.name] != item.default:
                 raise ValueError(f"checkpoint {item.name} does not match the model structure")
-        return cls(**{item.name: payload[item.name] for item in fields(cls) if item.init})
+        # Pre-LoRA checkpoints omit these optional model fields.
+        # 接入 LoRA 前的 checkpoint 不含这三个可选结构字段。
+        values = dict(lora_rank=cls.lora_rank, lora_alpha=cls.lora_alpha, lora_dropout=cls.lora_dropout)
+        values.update(payload)
+        values = {item.name: values[item.name] for item in fields(cls) if item.init}
+        return cls(**values)
 
 
 @dataclass(frozen=True)
@@ -69,14 +85,34 @@ class TrainConfig:
     unifrac_teacher_temperature: float = 0.03
     unifrac_student_temperature: float = 0.05
     learning_rate: float = 3e-4
+    # LoRA+ uses this multiple of the A learning rate for B.
+    # LoRA+ 中 B 的学习率为 A 的此倍率；普通预训练不使用这些选项。
+    lora_lr_ratio: float = 16.0
+    # During adaptation, optionally update prediction heads at a separate rate.
+    # 微调时可选择额外更新预测头，使用单独的学习率。
+    train_heads: bool = False
+    head_learning_rate: float = 1e-5
     weight_decay: float = 1e-2
     gradient_clip: float = 1.0
     max_epochs: int = 100
     min_epochs: int = 10
     warmup_ratio: float = 0.02
     minimum_lr: float = 1e-6
-    early_stopping_patience: int = 5
+    early_stopping_patience: int | None = 5
     relative_min_improvement: float = 0.001
+
+    @classmethod
+    def for_finetuning(cls) -> TrainConfig:
+        """Reference LoRA+ schedule; share all other pretraining settings.
+        LoRA+ 参考日程，其余设置沿用预训练。
+        """
+        return cls(
+            batch_size_per_rank=128,
+            learning_rate=1e-4,
+            minimum_lr=2e-6,
+            max_epochs=50,
+            early_stopping_patience=None,
+        )
 
 
 @dataclass(frozen=True)
@@ -93,6 +129,9 @@ class RunConfig:
     output_root: Path
     training: TrainConfig
     model: ModelConfig
+    # Initialize weights for a new run; --resume restores the whole training state.
+    # 新训练阶段的权重来源；--resume 则恢复完整训练状态。
+    initialize_from: Path | None = None
 
     # Return a copy with absolute paths. / 返回路径转为绝对路径的副本。
     def normalized(self) -> RunConfig:
@@ -106,12 +145,14 @@ class RunConfig:
                 preparation_manifest=Path(self.data.preparation_manifest).resolve(),
             ),
             output_root=Path(self.output_root).resolve(),
+            initialize_from=Path(self.initialize_from).resolve() if self.initialize_from is not None else None,
         )
 
     # Convert configs and paths for JSON serialization. / 将配置和路径转换为可保存到 JSON 的形式。
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["output_root"] = str(value["output_root"])
+        value["initialize_from"] = str(self.initialize_from) if self.initialize_from is not None else None
         for key in ("corpus", "train_rows", "val_rows", "preparation_manifest"):
             value["data"][key] = str(value["data"][key])
         return value

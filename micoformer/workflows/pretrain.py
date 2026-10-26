@@ -1,27 +1,30 @@
-"""Run distributed pretraining, validation, and checkpointing.
-执行分布式预训练、验证与 checkpoint 保存。
+"""Run pretraining or domain adaptation with shared validation and checkpointing.
+执行预训练或领域适配，共用验证与 checkpoint 保存。
 """
 from __future__ import annotations
 
 import json
 import math
 import os
+from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from micoformer.config import RunConfig, REFERENCE_LAMBDAS
+from micoformer.config import RunConfig, TrainConfig, REFERENCE_LAMBDAS
 from micoformer.data.genus import load_genus_data
 from micoformer.data.unifrac import load_unifrac_assets
 from micoformer.models import MiCoFormer
+from micoformer.models.lora import LoRAProjection, add_lora
 from micoformer.data.collate import batch_to_device
 from micoformer.data.loaders import TrainingData
 
 from micoformer.workflows.checkpoints import (
     _load_resume,
     _save_training_checkpoint,
+    initialize_weights,
 )
 from micoformer.utils.io import (
     sha256_file,
@@ -90,7 +93,28 @@ def _make_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
 
-def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Path:
+def _make_optimizer(model: MiCoFormer, config: TrainConfig) -> torch.optim.AdamW:
+    """Update the whole model, or LoRA A/B and optional prediction heads.
+    普通预训练更新全模型；适配更新 LoRA A/B 及显式开启的预测头。
+    """
+    if model.config.lora_rank == 0:
+        groups = [{"params": list(model.parameters()), "lr": config.learning_rate, "name": "model"}]
+    else:
+        projections = [module for module in model.modules() if isinstance(module, LoRAProjection)]
+        groups = [
+            {"params": [module.lora_A for module in projections], "lr": config.learning_rate, "name": "lora_A"},
+            {"params": [module.lora_B for module in projections], "lr": config.learning_rate * config.lora_lr_ratio, "name": "lora_B"},
+        ]
+        if config.train_heads:
+            heads = [model.mlm_head, model.query_head]
+            for head in heads:
+                head.requires_grad_(True)
+            groups.append({"params": [p for head in heads for p in head.parameters()],
+                           "lr": config.head_learning_rate, "name": "heads"})
+    return torch.optim.AdamW(groups, lr=config.learning_rate, weight_decay=config.weight_decay)
+
+
+def run_training(config: RunConfig, *, resume: Path | None = None) -> Path:
     """Train or resume a run and return its completion-record path.
     开始或恢复训练，返回正常完成记录的路径。
     """
@@ -101,7 +125,6 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
         raise RuntimeError(
             "existing training checkpoint found; pass --resume explicitly"
         )
-
     # Preparation record: corpus/split hashes, saved in logs and checkpoints.
     # 准备记录：语料与划分指纹，将写入日志和 checkpoint。
     preparation = validate_preparation(
@@ -147,11 +170,21 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
         # 各进程使用相同种子建立模型初始权重。
         _seed_all(config.training.seed)
 
-        model = MiCoFormer(genus_data.prior_table, config.model, **model_options).to(device)
+        # Load the original model strictly before adding new low-rank parameters.
+        # 先严格加载原模型，再加入新的低秩参数；恢复任务直接由 resume 还原权重。
+        model = MiCoFormer(genus_data.prior_table, replace(config.model, lora_rank=0), **model_options)
 
         # Keep genus names with the model for checkpoint export.
         # 将菌属名称保存在模型中，供 checkpoint 导出。
         model.vocabulary = genus_data.vocabulary
+        if config.initialize_from is not None and resume is None:
+            initialize_weights(model, config.initialize_from)
+        if config.model.lora_rank > 0:
+            add_lora(model, config.model)
+        model.to(device)
+        # Enable any optional head parameters before DDP collects trainable tensors.
+        # 在 DDP 收集训练参数前处理预测头开关。
+        optimizer = _make_optimizer(model, config.training)
 
         # Separate subsequent random streams by rank.
         # 后续随机过程按进程编号区分。
@@ -177,14 +210,6 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
             find_unused_parameters=False,
             gradient_as_bucket_view=True,
             static_graph=True,
-        )
-
-        # AdamW updates trainable parameters using the configured learning rate and decay.
-        # AdamW 按配置的学习率和权重衰减更新可训练参数。
-        optimizer = torch.optim.AdamW(
-            ddp.parameters(),
-            lr=config.training.learning_rate,
-            weight_decay=config.training.weight_decay,
         )
 
         # One update per batch; early stopping may shorten the planned schedule.
@@ -255,6 +280,12 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
                     "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                     "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
                     "objective_notes": objective_notes,
+                    "initialization": getattr(model, "initialization", None),
+                    "optimizer_groups": [
+                        {"name": group.get("name", "model"), "initial_lr": group["initial_lr"],
+                         "parameters": sum(p.numel() for p in group["params"])}
+                        for group in optimizer.param_groups
+                    ],
                 },
             )
 
@@ -453,7 +484,8 @@ def run_full_pretraining(config: RunConfig, *, resume: Path | None = None) -> Pa
             # Stop only after the minimum epoch count and the patience limit are both reached.
             # 同时达到最少训练轮数和等待上限时，才提前结束。
             if (
-                epoch + 1 >= config.training.min_epochs
+                config.training.early_stopping_patience is not None
+                and epoch + 1 >= config.training.min_epochs
                 and stale_epochs >= config.training.early_stopping_patience
             ):
                 final_reason = "LABEL_FREE_SATURATION"

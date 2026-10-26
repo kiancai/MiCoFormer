@@ -78,8 +78,8 @@ def main() -> None:
         args.output_root,
     )
 
-    from micoformer.workflows.pretrain import run_full_pretraining
-    print(run_full_pretraining(config, resume=args.resume))
+    from micoformer.workflows.pretrain import run_training
+    print(run_training(config, resume=args.resume))
 
 
 if __name__ == "__main__":
