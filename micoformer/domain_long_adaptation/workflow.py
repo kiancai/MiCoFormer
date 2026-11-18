@@ -228,9 +228,9 @@ def train(arm, manifest, sha, device, *, resume=False):
         corpus=manifest["assets"]["corpus"]["path"]
         common._atomic_json(destination/"audit/formal_launch.json",dict(
             status="RUNNING",time=now(),manifest_sha256=sha,source_commit=manifest["source"]["commit"],
-            arm=arm["name"],slurm_job_id=None,
+            arm=arm["name"],slurm_job_id=os.environ.get("SLURM_JOB_ID"),
             slurm_step_id=os.environ.get("SLURM_STEP_ID"),pid=os.getpid(),uuid=EXPECTED_UUID,
-            machine="H100",world_size=1,batch_size=arm["microbatch"],accumulate=1,epochs=arm["epochs"],total_steps=arm["total_steps"]))
+            machine="CmlLab",world_size=1,batch_size=arm["microbatch"],accumulate=1,epochs=arm["epochs"],total_steps=arm["total_steps"]))
         if not last.exists():
             save(destination/"run/epoch00.pt")
             common._atomic_json(destination/"results/epoch00.json",dict(epoch=0,global_step=0,

@@ -134,9 +134,9 @@ def run(manifest,sha,device,arm_name):
     operations=[event.key for event in profiler.key_averages() if "attention" in event.key.lower()]
     del model,args
     gc.collect();torch.cuda.empty_cache()
-    print(f"{now()} numerical gradient gates PASS; testing real B128 and strict resume",flush=True)
+    print(f"{now()} numerical gradient gates PASS; testing configured real batch and strict resume",flush=True)
     # 前128条中强制包含最长输入，保持真实样本/原collator。
-    positions=np.r_[sorted_positions[-1],np.arange(len(rows))[np.arange(len(rows))!=sorted_positions[-1]][:127]]
+    positions=np.r_[sorted_positions[-1],np.arange(len(rows))[np.arange(len(rows))!=sorted_positions[-1]][:arm["microbatch"]-1]]
     full=collator([dataset[int(i)] for i in positions])
     tail=collator([dataset[int(i)] for i in positions[:20]])
     model=load_model(arm,manifest,device)
@@ -146,7 +146,7 @@ def run(manifest,sha,device,arm_name):
     statistics,_=update(model,optimizer,scheduler,full,arm,device)
     path=run_root/"audit/gate_resume.pt"
     save_checkpoint(model,optimizer,scheduler,arm,sha,device,0,1,1,float("inf"),statistics,path,
-                    dict(samples=128,tokens=int((~full["padding_mask"]).sum()),padded_positions=full["padding_mask"].numel()))
+                    dict(samples=arm["microbatch"],tokens=int((~full["padding_mask"]).sum()),padded_positions=full["padding_mask"].numel()))
     _,expected_record=update(model,optimizer,scheduler,tail,arm,device)
     expected=(cpu_clone(model.state_dict()),cpu_clone(optimizer.state_dict()),scheduler.state_dict())
     peak=torch.cuda.max_memory_allocated(device)/1024**3
@@ -156,7 +156,7 @@ def run(manifest,sha,device,arm_name):
     optimizer,scheduler=make_optimizer(model,arm)
     restored=restore(path,model,optimizer,scheduler,arm,sha,device)
     if (restored["next_batch"]!=1 or restored["global_step"]!=1
-            or restored["bucket_counters"]["samples"]!=128):
+            or restored["bucket_counters"]["samples"]!=arm["microbatch"]):
         raise RuntimeError("restored sampler cursor or coverage counters changed")
     del restored
     _,record=update(model,optimizer,scheduler,tail,arm,device)
@@ -171,7 +171,7 @@ def run(manifest,sha,device,arm_name):
         frozen_weights_unchanged=True,strict_restore_next_update_exact=True,
         selected_rows=rows[selected].tolist(),selected_lengths=lengths[selected].tolist(),
         split_parity=parity,sdpa_reference=backend_checks,attention_operations=operations,
-        full_batch=128,full_max_length=int(full["genus_ids"].shape[1]),tail_batch=20,
+        full_batch=arm["microbatch"],full_max_length=int(full["genus_ids"].shape[1]),tail_batch=20,
         peak_allocated_gib=peak,seconds=perf_counter()-started)
     common._atomic_json(run_root/"audit/cuda_gates.json",result)
     del model,optimizer,scheduler,expected
