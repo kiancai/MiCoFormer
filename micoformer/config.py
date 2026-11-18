@@ -71,7 +71,7 @@ class TrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     gradient_clip: float = 1.0
-    max_epochs: int = 100
+    max_epochs: int = 10
     min_epochs: int = 10
     warmup_ratio: float = 0.02
     minimum_lr: float = 1e-6
